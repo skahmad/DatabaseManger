@@ -1,6 +1,8 @@
 package com.forgesystem.dbmanager.service;
 
 import com.forgesystem.dbmanager.model.ColumnInfo;
+import com.forgesystem.dbmanager.model.ConnectionMode;
+import com.forgesystem.dbmanager.model.ConnectionProfile;
 import com.forgesystem.dbmanager.model.DbType;
 import com.forgesystem.dbmanager.model.QueryResult;
 import com.forgesystem.dbmanager.util.SqlUtils;
@@ -42,19 +44,12 @@ public class DatabaseService {
                 }
             }
             case POSTGRESQL -> {
-                // In PostgreSQL the connection is already to one database;
-                // explorer nodes are schemas (e.g. public), not other databases.
+                // Real PostgreSQL databases on the server (not schemas).
                 try (ResultSet rs = conn.createStatement().executeQuery(
-                        "SELECT nspname FROM pg_namespace " +
-                                "WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\' " +
-                                "AND nspname <> 'information_schema' " +
-                                "ORDER BY 1")) {
+                        "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1")) {
                     while (rs.next()) {
                         dbs.add(rs.getString(1));
                     }
-                }
-                if (dbs.isEmpty()) {
-                    dbs.add("public");
                 }
             }
             case SQLSERVER -> {
@@ -65,23 +60,323 @@ public class DatabaseService {
                     }
                 }
             }
+            case H2, H2_FILE -> dbs.addAll(listSchemas());
+            case SQLITE -> {
+                String db = connectionService.getProfile().getDatabase();
+                dbs.add(sqliteDisplayName(db));
+            }
+        }
+        return dbs;
+    }
+
+    public List<String> listSchemas() throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DbType type = connectionService.getProfile().getDbType();
+        List<String> schemas = new ArrayList<>();
+        switch (type) {
+            case POSTGRESQL -> {
+                try (ResultSet rs = conn.createStatement().executeQuery(
+                        "SELECT nspname FROM pg_namespace " +
+                                "WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\' " +
+                                "AND nspname <> 'information_schema' " +
+                                "ORDER BY 1")) {
+                    while (rs.next()) {
+                        schemas.add(rs.getString(1));
+                    }
+                }
+                if (schemas.isEmpty()) {
+                    schemas.add("public");
+                }
+            }
             case H2, H2_FILE -> {
                 DatabaseMetaData meta = conn.getMetaData();
                 try (ResultSet rs = meta.getSchemas()) {
                     while (rs.next()) {
-                        dbs.add(rs.getString("TABLE_SCHEM"));
+                        schemas.add(rs.getString("TABLE_SCHEM"));
                     }
                 }
-                if (dbs.isEmpty()) {
-                    dbs.add("PUBLIC");
+                if (schemas.isEmpty()) {
+                    schemas.add("PUBLIC");
                 }
             }
-            case SQLITE -> {
-                String db = connectionService.getProfile().getDatabase();
-                dbs.add(db == null || db.isBlank() ? "main" : db);
+            case MYSQL -> schemas.addAll(listDatabases());
+            case SQLSERVER -> {
+                try (ResultSet rs = conn.createStatement().executeQuery(
+                        "SELECT name FROM sys.schemas " +
+                                "WHERE name NOT IN ('guest','INFORMATION_SCHEMA','sys') " +
+                                "ORDER BY name")) {
+                    while (rs.next()) {
+                        schemas.add(rs.getString(1));
+                    }
+                } catch (SQLException e) {
+                    schemas.add("dbo");
+                }
+                if (schemas.isEmpty()) {
+                    schemas.add("dbo");
+                }
+            }
+            case SQLITE -> schemas.add("main");
+        }
+        return schemas;
+    }
+
+    /**
+     * Hierarchical explorer roots for the connected session.
+     * <ul>
+     *   <li>PostgreSQL / H2 — always 3-layer: database → schemas → tables</li>
+     *   <li>SQLite — always 2-layer: database → tables</li>
+     *   <li>MySQL — 2-layer: databases → tables (schema ≈ database)</li>
+     *   <li>Others — follow {@link ConnectionMode}</li>
+     * </ul>
+     */
+    public Map<String, Object> getExplorerTree() throws SQLException {
+        Connection conn = connectionService.getConnection();
+        ConnectionProfile profile = connectionService.getProfile();
+        DbType type = profile.getDbType();
+        ConnectionMode mode = effectiveHierarchy(profile);
+        boolean threeLayer = mode == ConnectionMode.THREE_LAYER;
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("engine", type.name());
+        out.put("displayEngine", type.getDisplayName());
+        out.put("connectionMode", mode.name());
+        out.put("hierarchy", threeLayer ? "database-schemas-tables" : "database-tables");
+
+        String catalog = null;
+        try {
+            catalog = conn.getCatalog();
+        } catch (SQLException ignored) {
+        }
+        if (catalog == null || catalog.isBlank()) {
+            catalog = profile.getDatabase();
+        }
+
+        if (type == DbType.SQLITE) {
+            String path = profile.getDatabase();
+            if (path == null || path.isBlank()) {
+                path = catalog;
+            }
+            String dbName = sqliteDisplayName(path);
+            out.put("layout", "file-database");
+            out.put("currentDatabase", dbName);
+            Map<String, Object> node = new LinkedHashMap<>();
+            node.put("name", dbName);
+            node.put("kind", "database");
+            node.put("schema", "main");
+            out.put("nodes", List.of(node));
+            return out;
+        }
+
+        // PostgreSQL (and H2): always database → schemas → tables
+        if (type == DbType.POSTGRESQL || type == DbType.H2 || type == DbType.H2_FILE
+                || (threeLayer && type == DbType.SQLSERVER)) {
+            String dbName = (catalog == null || catalog.isBlank()) ? "database" : catalog;
+            out.put("layout", "database-schemas");
+            out.put("currentDatabase", dbName);
+            out.put("connectionMode", ConnectionMode.THREE_LAYER.name());
+            out.put("hierarchy", "database-schemas-tables");
+            List<Map<String, Object>> schemas = new ArrayList<>();
+            for (String schema : listSchemas()) {
+                Map<String, Object> node = new LinkedHashMap<>();
+                node.put("name", schema);
+                node.put("kind", "schema");
+                node.put("schema", schema);
+                schemas.add(node);
+            }
+            Map<String, Object> dbNode = new LinkedHashMap<>();
+            dbNode.put("name", dbName);
+            dbNode.put("kind", "database");
+            dbNode.put("schema", dbName);
+            dbNode.put("children", schemas);
+            out.put("nodes", List.of(dbNode));
+            return out;
+        }
+
+        // MySQL / SQL Server (2-layer): databases → tables
+        out.put("layout", "server-databases");
+        out.put("currentDatabase", catalog);
+        List<Map<String, Object>> nodes = new ArrayList<>();
+        for (String db : listDatabases()) {
+            Map<String, Object> node = new LinkedHashMap<>();
+            node.put("name", db);
+            node.put("kind", "database");
+            node.put("schema", db);
+            nodes.add(node);
+        }
+        out.put("nodes", nodes);
+        return out;
+    }
+
+    /** Engine-enforced hierarchy (PostgreSQL is always 3-layer). */
+    private static ConnectionMode effectiveHierarchy(ConnectionProfile profile) {
+        DbType type = profile.getDbType();
+        if (type == DbType.POSTGRESQL || type == DbType.H2 || type == DbType.H2_FILE) {
+            return ConnectionMode.THREE_LAYER;
+        }
+        if (type == DbType.SQLITE || type == DbType.MYSQL) {
+            return ConnectionMode.TWO_LAYER;
+        }
+        return profile.getConnectionMode();
+    }
+
+    /**
+     * Returns display properties for a database (MySQL/SQL Server) or schema (PostgreSQL/H2).
+     */
+    public Map<String, Object> getDatabaseProperties(String name) throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DbType type = connectionService.getProfile().getDbType();
+        Map<String, Object> props = new LinkedHashMap<>();
+
+        props.put("name", type == DbType.SQLITE ? sqliteDisplayName(name) : name);
+        props.put("kind", switch (type) {
+            case POSTGRESQL, H2, H2_FILE -> "Schema";
+            case SQLITE -> "Database file";
+            default -> "Database";
+        });
+        props.put("engine", type.getDisplayName());
+
+        DatabaseMetaData meta = conn.getMetaData();
+        props.put("serverProduct", meta.getDatabaseProductName());
+        props.put("serverVersion", meta.getDatabaseProductVersion());
+        props.put("driverName", meta.getDriverName());
+        props.put("driverVersion", meta.getDriverVersion());
+        props.put("url", meta.getURL());
+        props.put("userName", meta.getUserName());
+
+        try {
+            props.put("tableCount", listTables(name).size());
+        } catch (SQLException e) {
+            props.put("tableCount", null);
+        }
+        try {
+            props.put("viewCount", listViews(name).size());
+        } catch (SQLException e) {
+            props.put("viewCount", null);
+        }
+        try {
+            props.put("procedureCount", listProcedures(name).size());
+        } catch (SQLException e) {
+            props.put("procedureCount", null);
+        }
+        try {
+            props.put("functionCount", listFunctions(name).size());
+        } catch (SQLException e) {
+            props.put("functionCount", null);
+        }
+
+        switch (type) {
+            case MYSQL -> fillMySqlDatabaseProperties(conn, name, props);
+            case POSTGRESQL -> fillPostgresSchemaProperties(conn, name, props);
+            case SQLSERVER -> fillSqlServerDatabaseProperties(conn, name, props);
+            case SQLITE -> fillSqliteDatabaseProperties(conn, props);
+            case H2, H2_FILE -> fillH2SchemaProperties(conn, name, props);
+        }
+
+        return props;
+    }
+
+    private void fillMySqlDatabaseProperties(Connection conn, String name, Map<String, Object> props)
+            throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME " +
+                        "FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    props.put("charset", rs.getString(1));
+                    props.put("collation", rs.getString(2));
+                }
             }
         }
-        return dbs;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb " +
+                        "FROM information_schema.TABLES WHERE table_schema = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    Object size = rs.getObject(1);
+                    if (size != null) {
+                        props.put("sizeMb", size);
+                    }
+                }
+            }
+        }
+    }
+
+    private void fillPostgresSchemaProperties(Connection conn, String name, Map<String, Object> props)
+            throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT pg_catalog.pg_get_userbyid(nspowner) AS owner " +
+                        "FROM pg_catalog.pg_namespace WHERE nspname = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    props.put("owner", rs.getString(1));
+                }
+            }
+        }
+        props.put("catalog", conn.getCatalog());
+    }
+
+    private void fillSqlServerDatabaseProperties(Connection conn, String name, Map<String, Object> props)
+            throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT collation_name, state_desc, recovery_model_desc, " +
+                        "compatibility_level, create_date " +
+                        "FROM sys.databases WHERE name = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    props.put("collation", rs.getString("collation_name"));
+                    props.put("state", rs.getString("state_desc"));
+                    props.put("recoveryModel", rs.getString("recovery_model_desc"));
+                    props.put("compatibilityLevel", rs.getObject("compatibility_level"));
+                    props.put("created", String.valueOf(rs.getTimestamp("create_date")));
+                }
+            }
+        }
+    }
+
+    private void fillSqliteDatabaseProperties(Connection conn, Map<String, Object> props)
+            throws SQLException {
+        String path = connectionService.getProfile().getDatabase();
+        if (path != null && !path.isBlank()) {
+            props.put("filePath", path);
+        }
+        try (ResultSet rs = conn.createStatement().executeQuery("PRAGMA page_count")) {
+            if (rs.next()) {
+                long pages = rs.getLong(1);
+                props.put("pageCount", pages);
+                try (ResultSet rs2 = conn.createStatement().executeQuery("PRAGMA page_size")) {
+                    if (rs2.next()) {
+                        long pageSize = rs2.getLong(1);
+                        props.put("pageSize", pageSize);
+                        props.put("sizeMb", Math.round((pages * pageSize) / 1024.0 / 1024.0 * 100.0) / 100.0);
+                    }
+                }
+            }
+        }
+        try (ResultSet rs = conn.createStatement().executeQuery("PRAGMA encoding")) {
+            if (rs.next()) {
+                props.put("encoding", rs.getString(1));
+            }
+        }
+    }
+
+    private void fillH2SchemaProperties(Connection conn, String name, Map<String, Object> props)
+            throws SQLException {
+        props.put("catalog", conn.getCatalog());
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT IS_DEFAULT FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    props.put("isDefault", rs.getObject(1));
+                }
+            }
+        } catch (SQLException ignored) {
+            // older H2 variants may differ
+        }
     }
 
     public List<String> listTables(String schema) throws SQLException {
@@ -404,14 +699,63 @@ public class DatabaseService {
     }
 
     public void createDatabase(String name) throws SQLException {
+        createDatabase(name, null, null);
+    }
+
+    public void createDatabase(String name, String charset, String collation) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
         String sql = switch (type) {
-            case MYSQL, H2, H2_FILE -> "CREATE DATABASE " + quoteIdent(name);
-            case POSTGRESQL -> "CREATE DATABASE " + quoteIdent(name);
-            case SQLSERVER -> "CREATE DATABASE " + quoteIdent(name);
+            case MYSQL -> {
+                StringBuilder sb = new StringBuilder("CREATE DATABASE ").append(quoteIdent(name));
+                if (charset != null && !charset.isBlank()) {
+                    sb.append(" CHARACTER SET ").append(charset.trim());
+                }
+                if (collation != null && !collation.isBlank()) {
+                    sb.append(" COLLATE ").append(collation.trim());
+                }
+                yield sb.toString();
+            }
+            case H2, H2_FILE, POSTGRESQL, SQLSERVER -> "CREATE DATABASE " + quoteIdent(name);
             case SQLITE -> throw new SQLException("SQLite uses a file path as the database");
         };
         execute(sql);
+    }
+
+    public void alterDatabase(String name, String newName, String charset, String collation) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        switch (type) {
+            case MYSQL -> {
+                if ((charset != null && !charset.isBlank()) || (collation != null && !collation.isBlank())) {
+                    StringBuilder sb = new StringBuilder("ALTER DATABASE ").append(quoteIdent(name));
+                    if (charset != null && !charset.isBlank()) {
+                        sb.append(" CHARACTER SET ").append(charset.trim());
+                    }
+                    if (collation != null && !collation.isBlank()) {
+                        sb.append(" COLLATE ").append(collation.trim());
+                    }
+                    execute(sb.toString());
+                }
+                if (newName != null && !newName.isBlank() && !newName.equals(name)) {
+                    throw new SQLException("MySQL does not support renaming databases; create a clone instead");
+                }
+            }
+            case POSTGRESQL -> {
+                if (newName != null && !newName.isBlank() && !newName.equals(name)) {
+                    execute("ALTER DATABASE " + quoteIdent(name) + " RENAME TO " + quoteIdent(newName));
+                } else {
+                    throw new SQLException("PostgreSQL database alter supports rename only; use schemas for other changes");
+                }
+            }
+            case SQLSERVER -> {
+                if (newName != null && !newName.isBlank() && !newName.equals(name)) {
+                    execute("ALTER DATABASE " + quoteIdent(name) + " MODIFY NAME = " + quoteIdent(newName));
+                } else {
+                    throw new SQLException("Provide a new name to rename the SQL Server database");
+                }
+            }
+            case H2, H2_FILE -> throw new SQLException("H2 does not support ALTER DATABASE rename here");
+            case SQLITE -> throw new SQLException("Cannot alter SQLite database file from here");
+        }
     }
 
     public void dropDatabase(String name) throws SQLException {
@@ -422,12 +766,149 @@ public class DatabaseService {
         execute("DROP DATABASE " + quoteIdent(name));
     }
 
+    public void createSchema(String name) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        switch (type) {
+            case POSTGRESQL, H2, H2_FILE -> execute("CREATE SCHEMA " + quoteIdent(name));
+            case MYSQL, SQLSERVER -> createDatabase(name);
+            case SQLITE -> throw new SQLException("SQLite does not support CREATE SCHEMA");
+        }
+    }
+
+    public void dropSchema(String name) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        switch (type) {
+            case POSTGRESQL -> execute("DROP SCHEMA " + quoteIdent(name) + " CASCADE");
+            case H2, H2_FILE -> execute("DROP SCHEMA IF EXISTS " + quoteIdent(name) + " CASCADE");
+            case MYSQL, SQLSERVER -> dropDatabase(name);
+            case SQLITE -> throw new SQLException("SQLite does not support DROP SCHEMA");
+        }
+    }
+
     public void dropTable(String schema, String table) throws SQLException {
         execute("DROP TABLE " + qualify(schema, table));
     }
 
+    public void renameTable(String schema, String table, String newName) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        String sql = switch (type) {
+            case MYSQL -> "RENAME TABLE " + qualify(schema, table) + " TO " + qualify(schema, newName);
+            case POSTGRESQL, H2, H2_FILE -> "ALTER TABLE " + qualify(schema, table) + " RENAME TO " + quoteIdent(newName);
+            case SQLSERVER -> "EXEC sp_rename '" + schema + "." + table + "', '" + newName + "'";
+            case SQLITE -> "ALTER TABLE " + quoteIdent(table) + " RENAME TO " + quoteIdent(newName);
+        };
+        execute(sql);
+    }
+
     public void dropView(String schema, String view) throws SQLException {
         execute("DROP VIEW " + qualify(schema, view));
+    }
+
+    public void createView(String schema, String viewName, String selectSql, boolean replace) throws SQLException {
+        if (selectSql == null || selectSql.isBlank()) {
+            throw new SQLException("View definition SQL is required");
+        }
+        String select = selectSql.trim();
+        if (select.endsWith(";")) {
+            select = select.substring(0, select.length() - 1).trim();
+        }
+        DbType type = connectionService.getProfile().getDbType();
+        String verb = replace
+                ? (type == DbType.POSTGRESQL ? "CREATE OR REPLACE VIEW " : "CREATE OR REPLACE VIEW ")
+                : "CREATE VIEW ";
+        if (type == DbType.SQLSERVER && replace) {
+            try {
+                dropView(schema, viewName);
+            } catch (SQLException ignored) {
+            }
+            verb = "CREATE VIEW ";
+        }
+        if (type == DbType.MYSQL && replace) {
+            try {
+                dropView(schema, viewName);
+            } catch (SQLException ignored) {
+            }
+            verb = "CREATE VIEW ";
+        }
+        execute(verb + qualify(schema, viewName) + " AS " + select);
+    }
+
+    public List<Map<String, Object>> listIndexes(String schema, String table) throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DatabaseMetaData meta = conn.getMetaData();
+        String catalog = resolveCatalog(schema);
+        String schemaPattern = resolveSchemaPattern(schema);
+        Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
+        try (ResultSet rs = meta.getIndexInfo(catalog, schemaPattern, table, false, false)) {
+            while (rs.next()) {
+                String indexName = rs.getString("INDEX_NAME");
+                if (indexName == null) {
+                    continue;
+                }
+                Map<String, Object> idx = byName.computeIfAbsent(indexName, k -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", k);
+                    m.put("unique", false);
+                    m.put("columns", new ArrayList<String>());
+                    return m;
+                });
+                boolean nonUnique = rs.getBoolean("NON_UNIQUE");
+                idx.put("unique", !nonUnique);
+                @SuppressWarnings("unchecked")
+                List<String> cols = (List<String>) idx.get("columns");
+                String col = rs.getString("COLUMN_NAME");
+                if (col != null && !cols.contains(col)) {
+                    cols.add(col);
+                }
+            }
+        }
+        return new ArrayList<>(byName.values());
+    }
+
+    public void createIndex(String schema, String table, String indexName, List<String> columns, boolean unique)
+            throws SQLException {
+        if (columns == null || columns.isEmpty()) {
+            throw new SQLException("Index requires at least one column");
+        }
+        String cols = columns.stream().map(this::quoteIdent).collect(Collectors.joining(", "));
+        String name = (indexName == null || indexName.isBlank())
+                ? "idx_" + table + "_" + String.join("_", columns)
+                : indexName;
+        String sql = (unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ")
+                + quoteIdent(name) + " ON " + qualify(schema, table) + " (" + cols + ")";
+        execute(sql);
+    }
+
+    public void dropIndex(String schema, String table, String indexName) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        String sql = switch (type) {
+            case MYSQL -> "DROP INDEX " + quoteIdent(indexName) + " ON " + qualify(schema, table);
+            case SQLSERVER -> "DROP INDEX " + quoteIdent(indexName) + " ON " + qualify(schema, table);
+            case SQLITE -> "DROP INDEX IF EXISTS " + quoteIdent(indexName);
+            default -> "DROP INDEX " + quoteIdent(indexName);
+        };
+        execute(sql);
+    }
+
+    public void addColumn(String schema, String table, ColumnDefinition column) throws SQLException {
+        StringBuilder sb = new StringBuilder("ALTER TABLE ")
+                .append(qualify(schema, table))
+                .append(" ADD ")
+                .append(quoteIdent(column.name()))
+                .append(" ")
+                .append(column.sqlType());
+        if (!column.nullable()) {
+            sb.append(" NOT NULL");
+        }
+        execute(sb.toString());
+    }
+
+    public void dropColumn(String schema, String table, String column) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        if (type == DbType.SQLITE) {
+            throw new SQLException("SQLite versions before 3.35 have limited DROP COLUMN support; try a newer SQLite");
+        }
+        execute("ALTER TABLE " + qualify(schema, table) + " DROP COLUMN " + quoteIdent(column));
     }
 
     public void createTable(String schema, String tableName, List<ColumnDefinition> columns) throws SQLException {
@@ -554,7 +1035,7 @@ public class DatabaseService {
         };
     }
 
-    private String qualify(String schema, String name) {
+    public String qualify(String schema, String name) {
         DbType type = connectionService.getProfile().getDbType();
         if (schema == null || schema.isBlank() || type == DbType.SQLITE) {
             return quoteIdent(name);
@@ -565,13 +1046,35 @@ public class DatabaseService {
         return quoteIdent(schema) + "." + quoteIdent(name);
     }
 
-    private String quoteIdent(String ident) {
+    public String quoteIdent(String ident) {
         DbType type = connectionService.getProfile().getDbType();
         return switch (type) {
             case MYSQL -> "`" + ident.replace("`", "``") + "`";
             case SQLSERVER -> "[" + ident.replace("]", "]]") + "]";
             default -> "\"" + ident.replace("\"", "\"\"") + "\"";
         };
+    }
+
+    /** File basename for SQLite labels (hide full path in the tree). */
+    static String sqliteDisplayName(String pathOrName) {
+        if (pathOrName == null || pathOrName.isBlank()) {
+            return "main";
+        }
+        String normalized = pathOrName.replace('\\', '/');
+        int slash = normalized.lastIndexOf('/');
+        String name = slash >= 0 ? normalized.substring(slash + 1) : normalized;
+        return name.isBlank() ? "main" : name;
+    }
+
+    public String sqlLiteral(Object value) {
+        if (value == null) {
+            return "NULL";
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return String.valueOf(value);
+        }
+        String s = String.valueOf(value);
+        return "'" + s.replace("'", "''") + "'";
     }
 
     public record ColumnDefinition(String name, String sqlType, boolean nullable,

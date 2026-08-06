@@ -1,6 +1,8 @@
 package com.forgesystem.dbmanager.service;
 
+import com.forgesystem.dbmanager.model.ConnectionMode;
 import com.forgesystem.dbmanager.model.ConnectionProfile;
+import com.forgesystem.dbmanager.model.DbType;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
@@ -32,8 +34,19 @@ public class ConnectionStore {
                 return new ArrayList<>();
             }
             for (ConnectionProfile p : list) {
+                p.migrateLegacySshAsThreeLayer();
+                // PostgreSQL is always 3-layer: database → schemas → tables
+                if (p.getDbType() == DbType.POSTGRESQL
+                        || p.getDbType() == DbType.H2
+                        || p.getDbType() == DbType.H2_FILE) {
+                    p.setConnectionMode(ConnectionMode.THREE_LAYER);
+                }
                 if (!p.isSavePassword()) {
                     p.setPassword("");
+                }
+                if (!p.isSaveSshPassword()) {
+                    p.setSshPassword("");
+                    p.setSshPassphrase("");
                 }
             }
             return list;
@@ -49,6 +62,10 @@ public class ConnectionStore {
             ConnectionProfile copy = p.copy();
             if (!copy.isSavePassword()) {
                 copy.setPassword("");
+            }
+            if (!copy.isSaveSshPassword()) {
+                copy.setSshPassword("");
+                copy.setSshPassphrase("");
             }
             toSave.add(copy);
         }

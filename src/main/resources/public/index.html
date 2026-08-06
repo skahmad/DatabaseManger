@@ -11,80 +11,27 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 </head>
 <body>
-  <!-- Connect gate -->
-  <div id="gate" class="gate">
-    <div class="gate-bg"></div>
-    <div class="gate-card">
-      <div class="gate-brand">
-        <div class="logo-mark" aria-hidden="true"></div>
-        <div>
-          <h1>Forge</h1>
-          <p class="gate-tag">Database Manager</p>
-        </div>
-      </div>
-      <p class="gate-lead">Connect to MySQL, PostgreSQL, SQLite, H2, or SQL Server.</p>
-
-      <div class="gate-section">
-        <div class="section-head">
-          <span>Saved connections</span>
-          <button type="button" class="btn ghost" id="btn-refresh-profiles">Refresh</button>
-        </div>
-        <div id="profile-list" class="profile-list"></div>
-      </div>
-
-      <div class="gate-actions">
-        <button type="button" class="btn primary" id="btn-connect-selected" disabled>Connect</button>
-        <button type="button" class="btn" id="btn-new-connection">New connection</button>
-      </div>
-      <p id="gate-error" class="error-text" hidden></p>
-
-      <div class="prefs-bar">
-        <label>View
-          <select class="input pref-density" aria-label="View density">
-            <option value="comfortable">Comfortable</option>
-            <option value="compact">Compact</option>
-          </select>
-        </label>
-        <label>Theme
-          <select class="input pref-theme" aria-label="Theme colors">
-            <option value="teal">Teal</option>
-            <option value="ocean">Ocean</option>
-            <option value="ember">Ember</option>
-            <option value="violet">Violet</option>
-            <option value="slate">Slate</option>
-            <option value="light">Light</option>
-          </select>
-        </label>
-      </div>
-    </div>
-  </div>
-
-  <!-- Main app (hidden until connected) -->
-  <div id="app" class="app" hidden>
-    <aside class="sidebar">
+  <div id="app" class="app">
+    <aside class="sidebar" id="sidebar">
       <div class="sidebar-top">
         <div class="logo-mark sm"></div>
         <div class="sidebar-title">
-          <strong>Forge</strong>
-          <span id="conn-pill" class="pill">connected</span>
+          <strong>Database Manager</strong>
+          <span id="conn-pill" class="pill idle">offline</span>
+        </div>
+        <div class="sidebar-top-actions">
+          <button type="button" class="icon-btn" id="btn-refresh-profiles" title="Refresh">↻</button>
+          <button type="button" class="icon-btn" id="btn-new-connection" title="New connection">+</button>
         </div>
       </div>
-      <div class="sidebar-actions">
-        <button type="button" class="btn primary block" id="btn-disconnect">Disconnect</button>
-      </div>
+
       <div class="explorer-head">
-        <span>Explorer</span>
-        <button type="button" class="icon-btn" id="btn-refresh-tree" title="Refresh">↻</button>
+        <span>Connections</span>
       </div>
-      <input type="search" id="explorer-filter" class="input" placeholder="Filter objects…" />
-      <div id="tree" class="tree"></div>
+      <div id="conn-tree" class="conn-tree"></div>
+      <p id="sidebar-error" class="error-text sidebar-error" hidden></p>
+
       <div class="prefs-bar sidebar-prefs">
-        <label>View
-          <select class="input pref-density" aria-label="View density">
-            <option value="comfortable">Comfortable</option>
-            <option value="compact">Compact</option>
-          </select>
-        </label>
         <label>Theme
           <select class="input pref-theme" aria-label="Theme colors">
             <option value="teal">Teal</option>
@@ -96,6 +43,7 @@
           </select>
         </label>
       </div>
+      <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize"></div>
     </aside>
 
     <main class="main">
@@ -105,7 +53,7 @@
           <h2 id="context-title">SQL Editor</h2>
         </div>
         <p id="context-meta" class="context-meta" hidden></p>
-        <div class="topbar-meta" id="session-meta"></div>
+        <div class="topbar-meta" id="session-meta">Select a connection to begin</div>
       </header>
 
       <nav class="tabs" role="tablist">
@@ -176,7 +124,7 @@
 
   <!-- Modal: new / edit connection -->
   <dialog id="modal-connection" class="modal">
-    <form method="dialog" id="form-connection" class="modal-card">
+    <form method="dialog" id="form-connection" class="modal-card modal-card-wide">
       <h3 id="modal-conn-title">New connection</h3>
       <input type="hidden" name="id" id="conn-id" value="" />
       <div class="form-grid">
@@ -184,16 +132,40 @@
         <label>Type
           <select name="dbType" id="db-type" class="input"></select>
         </label>
+        <label class="span-2">Object hierarchy
+          <select name="connectionMode" id="connection-mode" class="input">
+            <option value="TWO_LAYER">2-layer — database → tables</option>
+            <option value="THREE_LAYER">3-layer — database → schemas → tables</option>
+          </select>
+        </label>
+        <p class="form-hint span-2" id="connection-mode-hint">Explorer shows databases with tables directly underneath.</p>
         <label class="host-field">Host <input name="host" class="input" value="localhost" /></label>
         <label class="port-field">Port <input name="port" type="number" class="input" value="3306" /></label>
-        <label class="db-field">Database / file <input name="database" class="input" placeholder="database name or file path" /></label>
+        <label class="db-field span-2">Database / file <input name="database" class="input" placeholder="database name or file path" /></label>
         <label>Username <input name="username" class="input" value="root" /></label>
         <label>Password <input name="password" type="password" class="input" autocomplete="current-password" placeholder="Leave blank to keep existing" /></label>
-        <label class="check"><input type="checkbox" name="savePassword" /> Save password</label>
+        <label class="check span-2"><input type="checkbox" name="savePassword" /> Save password</label>
+        <label class="check span-2 ssh-toggle-field" id="ssh-toggle-wrap">
+          <input type="checkbox" name="useSshTunnel" id="use-ssh-tunnel" /> Use SSH tunnel
+        </label>
       </div>
+
+      <fieldset id="ssh-fields" class="ssh-fields" hidden>
+        <legend>SSH tunnel</legend>
+        <div class="form-grid">
+          <label>SSH host <input name="sshHost" class="input" placeholder="bastion.example.com" /></label>
+          <label>SSH port <input name="sshPort" type="number" class="input" value="22" /></label>
+          <label>SSH username <input name="sshUsername" class="input" placeholder="ubuntu" /></label>
+          <label>SSH password <input name="sshPassword" type="password" class="input" autocomplete="off" placeholder="Leave blank to keep existing" /></label>
+          <label class="span-2">Private key path <input name="sshPrivateKeyPath" class="input" placeholder="~/.ssh/id_rsa (optional)" /></label>
+          <label class="span-2">Key passphrase <input name="sshPassphrase" type="password" class="input" autocomplete="off" placeholder="Leave blank to keep existing" /></label>
+          <label class="check span-2"><input type="checkbox" name="saveSshPassword" /> Save SSH password / passphrase</label>
+        </div>
+      </fieldset>
+
       <div class="modal-actions">
         <button type="button" class="btn ghost" id="btn-cancel-conn">Cancel</button>
-        <button type="submit" class="btn primary" id="btn-submit-conn">Connect</button>
+        <button type="submit" class="btn primary" id="btn-submit-conn">Save</button>
       </div>
     </form>
   </dialog>
@@ -206,9 +178,250 @@
       <label>Username <input name="username" class="input" /></label>
       <label>Password <input name="password" type="password" class="input" autofocus /></label>
       <label class="check"><input type="checkbox" name="savePassword" /> Save password</label>
+      <div id="password-ssh-fields" class="password-ssh-fields" hidden>
+        <label>SSH username <input name="sshUsername" class="input" /></label>
+        <label>SSH password <input name="sshPassword" type="password" class="input" autocomplete="off" /></label>
+        <label class="check"><input type="checkbox" name="saveSshPassword" /> Save SSH password</label>
+      </div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" id="btn-cancel-pw">Cancel</button>
         <button type="submit" class="btn primary">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Context menu: connection -->
+  <div id="ctx-menu-conn" class="ctx-menu" hidden role="menu">
+    <button type="button" class="ctx-item" data-action="conn-properties" role="menuitem">Properties</button>
+    <button type="button" class="ctx-item" data-action="conn-connect" role="menuitem">Connect…</button>
+    <button type="button" class="ctx-item" data-action="conn-disconnect" role="menuitem">Disconnect</button>
+    <button type="button" class="ctx-item" data-action="conn-edit" role="menuitem">Edit…</button>
+    <hr class="ctx-sep conn-admin-sep" />
+    <button type="button" class="ctx-item conn-admin" data-action="create-db" role="menuitem">Create database…</button>
+    <button type="button" class="ctx-item conn-admin" data-action="create-schema" role="menuitem">Create schema…</button>
+    <button type="button" class="ctx-item conn-admin" data-action="import-sql" role="menuitem">Import SQL…</button>
+    <hr class="ctx-sep" />
+    <button type="button" class="ctx-item danger" data-action="conn-delete" role="menuitem">Delete…</button>
+  </div>
+
+  <!-- Context menu: database -->
+  <div id="ctx-menu-db" class="ctx-menu" hidden role="menu">
+    <button type="button" class="ctx-item" data-action="properties" role="menuitem">Properties</button>
+    <button type="button" class="ctx-item" data-action="create-db" role="menuitem">Create database…</button>
+    <button type="button" class="ctx-item" data-action="create-schema" role="menuitem">Create schema…</button>
+    <button type="button" class="ctx-item" data-action="create-table" role="menuitem">Create table…</button>
+    <button type="button" class="ctx-item" data-action="create-view" role="menuitem">Create view…</button>
+    <button type="button" class="ctx-item" data-action="modify-db" role="menuitem">Modify…</button>
+    <button type="button" class="ctx-item" data-action="clone-db" role="menuitem">Clone / migrate…</button>
+    <button type="button" class="ctx-item" data-action="export-db" role="menuitem">Export SQL…</button>
+    <button type="button" class="ctx-item" data-action="import-sql" role="menuitem">Import SQL…</button>
+    <button type="button" class="ctx-item" data-action="import-table" role="menuitem">Import data…</button>
+    <hr class="ctx-sep" />
+    <button type="button" class="ctx-item danger" data-action="drop-db" role="menuitem">Drop database…</button>
+    <button type="button" class="ctx-item danger" data-action="drop-schema" role="menuitem">Drop schema…</button>
+  </div>
+
+  <!-- Context menu: tables folder -->
+  <div id="ctx-menu-folder" class="ctx-menu" hidden role="menu">
+    <button type="button" class="ctx-item" data-action="create-table" role="menuitem">Create table…</button>
+    <button type="button" class="ctx-item" data-action="create-view" role="menuitem">Create view…</button>
+    <button type="button" class="ctx-item" data-action="import-table" role="menuitem">Import data…</button>
+  </div>
+
+  <!-- Context menu: table -->
+  <div id="ctx-menu-table" class="ctx-menu" hidden role="menu">
+    <button type="button" class="ctx-item" data-action="open-table" role="menuitem">Open</button>
+    <button type="button" class="ctx-item" data-action="export-table" role="menuitem">Export…</button>
+    <button type="button" class="ctx-item" data-action="import-table" role="menuitem">Import…</button>
+    <button type="button" class="ctx-item" data-action="manage-indexes" role="menuitem">Indexes…</button>
+    <button type="button" class="ctx-item" data-action="add-column" role="menuitem">Add column…</button>
+    <button type="button" class="ctx-item" data-action="rename-table" role="menuitem">Rename…</button>
+    <hr class="ctx-sep" />
+    <button type="button" class="ctx-item danger" data-action="drop-table" role="menuitem">Drop table…</button>
+  </div>
+
+  <!-- Context menu: view -->
+  <div id="ctx-menu-view" class="ctx-menu" hidden role="menu">
+    <button type="button" class="ctx-item" data-action="open-view" role="menuitem">Open</button>
+    <hr class="ctx-sep" />
+    <button type="button" class="ctx-item danger" data-action="drop-view" role="menuitem">Drop view…</button>
+  </div>
+
+  <!-- Modal: database properties -->
+  <dialog id="modal-db-props" class="modal">
+    <div class="modal-card modal-card-wide">
+      <h3 id="db-props-title">Database properties</h3>
+      <p class="gate-lead" id="db-props-subtitle"></p>
+      <div id="db-props-body" class="props-grid"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn primary" id="btn-close-db-props">Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Modal: create / modify database -->
+  <dialog id="modal-db-admin" class="modal">
+    <form method="dialog" id="form-db-admin" class="modal-card">
+      <h3 id="db-admin-title">Create database</h3>
+      <input type="hidden" name="mode" id="db-admin-mode" value="create" />
+      <input type="hidden" name="originalName" id="db-admin-original" value="" />
+      <label>Name <input name="name" class="input" required /></label>
+      <label>Charset <input name="charset" class="input" placeholder="utf8mb4 (MySQL optional)" /></label>
+      <label>Collation <input name="collation" class="input" placeholder="optional" /></label>
+      <label id="db-admin-newname-wrap" hidden>New name <input name="newName" class="input" placeholder="rename target" /></label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-db-admin">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: create schema -->
+  <dialog id="modal-schema" class="modal">
+    <form method="dialog" id="form-schema" class="modal-card">
+      <h3>Create schema</h3>
+      <label>Name <input name="name" class="input" required /></label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-schema">Cancel</button>
+        <button type="submit" class="btn primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: create table -->
+  <dialog id="modal-create-table" class="modal">
+    <form method="dialog" id="form-create-table" class="modal-card modal-card-wide">
+      <h3>Create table</h3>
+      <input type="hidden" name="schema" id="create-table-schema" />
+      <label>Table name <input name="name" class="input" required /></label>
+      <div class="section-head"><span>Columns</span>
+        <button type="button" class="btn ghost sm" id="btn-add-col-row">Add column</button>
+      </div>
+      <div id="create-table-cols" class="col-builder"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-create-table">Cancel</button>
+        <button type="submit" class="btn primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: create view -->
+  <dialog id="modal-create-view" class="modal">
+    <form method="dialog" id="form-create-view" class="modal-card modal-card-wide">
+      <h3>Create view</h3>
+      <input type="hidden" name="schema" id="create-view-schema" />
+      <label>View name <input name="name" class="input" required /></label>
+      <label>SELECT SQL
+        <textarea name="selectSql" class="input sql-mini" rows="6" required placeholder="SELECT * FROM users WHERE active = 1"></textarea>
+      </label>
+      <label class="check"><input type="checkbox" name="replace" /> Replace if exists</label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-create-view">Cancel</button>
+        <button type="submit" class="btn primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: indexes -->
+  <dialog id="modal-indexes" class="modal">
+    <div class="modal-card modal-card-wide">
+      <h3 id="indexes-title">Indexes</h3>
+      <div id="indexes-list" class="indexes-list"></div>
+      <form id="form-create-index" class="index-form">
+        <input type="hidden" name="schema" id="index-schema" />
+        <input type="hidden" name="table" id="index-table" />
+        <label>Index name <input name="name" class="input" placeholder="idx_name" /></label>
+        <label>Columns (comma-separated) <input name="columns" class="input" required placeholder="email, created_at" /></label>
+        <label class="check"><input type="checkbox" name="unique" /> Unique</label>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" id="btn-close-indexes">Close</button>
+          <button type="submit" class="btn primary">Create index</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- Modal: add column -->
+  <dialog id="modal-add-column" class="modal">
+    <form method="dialog" id="form-add-column" class="modal-card">
+      <h3>Add column</h3>
+      <input type="hidden" name="schema" id="add-col-schema" />
+      <input type="hidden" name="table" id="add-col-table" />
+      <label>Name <input name="name" class="input" required /></label>
+      <label>SQL type <input name="sqlType" class="input" value="VARCHAR(255)" required /></label>
+      <label class="check"><input type="checkbox" name="nullable" checked /> Nullable</label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-add-col">Cancel</button>
+        <button type="submit" class="btn primary">Add</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: clone / migrate -->
+  <dialog id="modal-clone" class="modal">
+    <form method="dialog" id="form-clone" class="modal-card">
+      <h3>Clone / migrate</h3>
+      <p class="gate-lead">Copy a database or schema to a new name on the same server.</p>
+      <input type="hidden" name="source" id="clone-source" />
+      <label>Source <input name="sourceDisplay" class="input" disabled /></label>
+      <label>Target name <input name="targetName" class="input" required /></label>
+      <label class="check"><input type="checkbox" name="includeData" checked /> Include data</label>
+      <label class="check"><input type="checkbox" name="includeViews" checked /> Include views</label>
+      <label class="check"><input type="checkbox" name="includeIndexes" checked /> Include indexes</label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-clone">Cancel</button>
+        <button type="submit" class="btn primary">Clone</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: export -->
+  <dialog id="modal-export" class="modal">
+    <form method="dialog" id="form-export" class="modal-card">
+      <h3 id="export-title">Export</h3>
+      <input type="hidden" name="schema" id="export-schema" />
+      <input type="hidden" name="table" id="export-table" />
+      <input type="hidden" name="scope" id="export-scope" value="table" />
+      <label>Format
+        <select name="format" class="input">
+          <option value="csv">CSV</option>
+          <option value="json">JSON</option>
+          <option value="sql">SQL</option>
+          <option value="xlsx">Excel (XLSX)</option>
+        </select>
+      </label>
+      <label>Row limit <input name="limit" type="number" class="input" value="100000" min="1" /></label>
+      <label class="check" id="export-include-data-wrap" hidden>
+        <input type="checkbox" name="includeData" checked /> Include data (database SQL export)
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-export">Cancel</button>
+        <button type="submit" class="btn primary">Export</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: import -->
+  <dialog id="modal-import" class="modal">
+    <form method="dialog" id="form-import" class="modal-card modal-card-wide">
+      <h3 id="import-title">Import data</h3>
+      <input type="hidden" name="schema" id="import-schema" />
+      <input type="hidden" name="table" id="import-table" />
+      <input type="hidden" name="mode" id="import-mode" value="table" />
+      <label>Format
+        <select name="format" id="import-format" class="input">
+          <option value="csv">CSV</option>
+          <option value="json">JSON</option>
+          <option value="sql">SQL</option>
+          <option value="xlsx">Excel (XLSX)</option>
+        </select>
+      </label>
+      <label>File <input name="file" type="file" class="input" id="import-file" accept=".csv,.json,.sql,.xlsx,.xls,text/csv,application/json" /></label>
+      <label class="check" id="import-header-wrap"><input type="checkbox" name="headerRow" checked /> First row is header</label>
+      <label class="check" id="import-truncate-wrap"><input type="checkbox" name="truncate" /> Truncate table before import</label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-import">Cancel</button>
+        <button type="submit" class="btn primary">Import</button>
       </div>
     </form>
   </dialog>
