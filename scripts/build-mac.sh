@@ -97,10 +97,15 @@ jpackage \
   --java-options "-Djdk.gtk.version=3"
 
 DMG="$(ls -1 "$DIST_DIR"/*.dmg | head -1)"
+BINARY_DIR="$ROOT/binary/mac"
+mkdir -p "$BINARY_DIR"
+cp "$DMG" "$BINARY_DIR/"
+BINARY_DMG="$BINARY_DIR/$(basename "$DMG")"
+
 echo
 echo "Installable created:"
-echo "  $DMG"
-ls -lh "$DMG"
+echo "  $BINARY_DMG"
+ls -lh "$BINARY_DMG"
 echo
 echo "Open the DMG and drag \"$APP_NAME\" into Applications."
 echo "If Gatekeeper blocks it: right-click the app → Open (once)."

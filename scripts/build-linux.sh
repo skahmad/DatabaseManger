@@ -69,7 +69,7 @@ run_docker_build() {
       apt-get update -qq
       apt-get install -y -qq fakeroot rpm binutils >/dev/null
       bash scripts/build-linux.sh --in-container --type='"$PACKAGE_TYPE"'
-      chown -R "${HOST_UID}:${HOST_GID}" /work/dist /work/target /work/packaging/linux || true
+      chown -R "${HOST_UID}:${HOST_GID}" /work/dist /work/binary /work/target /work/packaging/linux || true
     '
 }
 
@@ -85,7 +85,7 @@ if [[ "$(uname -s)" != "Linux" && "$IN_CONTAINER" != "true" ]]; then
     run_docker_build "linux/amd64"
     run_docker_build "linux/arm64"
     echo
-    echo "Both architectures built under dist/linux/amd64 and dist/linux/arm64"
+    echo "Both architectures built under binary/linux/amd64 and binary/linux/arm64"
     exit 0
   fi
 
@@ -214,12 +214,21 @@ if [[ "$PACKAGE_TYPE" == "deb" || "$PACKAGE_TYPE" == "rpm" ]]; then
   )
 fi
 
+BINARY_DIR="$ROOT/binary/linux/$ARCH_DIR"
+mkdir -p "$BINARY_DIR"
+# Copy installers only (skip app-image/ build tree)
+shopt -s nullglob
+for artifact in "$DIST_DIR"/*.{deb,rpm,tar.gz}; do
+  [[ -f "$artifact" ]] && cp "$artifact" "$BINARY_DIR/"
+done
+shopt -u nullglob
+
 echo
 echo "Linux $ARCH_DIR package(s) created in:"
-echo "  $DIST_DIR"
-ls -lh "$DIST_DIR" | sed 's/^/  /'
+echo "  $BINARY_DIR"
+ls -lh "$BINARY_DIR" | sed 's/^/  /'
 echo
 echo "On the Linux machine, confirm arch first:"
 echo "  dpkg --print-architecture   # expect: $ARCH_DIR"
 echo "Then install:"
-echo "  sudo apt install ./dist/linux/$ARCH_DIR/*.deb"
+echo "  sudo apt install ./binary/linux/$ARCH_DIR/*.deb"
