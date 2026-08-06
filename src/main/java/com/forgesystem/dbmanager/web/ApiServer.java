@@ -79,6 +79,7 @@ public class ApiServer {
         // Metadata
         app.get("/api/databases", this::databases);
         app.get("/api/explorer", this::explorer);
+        app.get("/api/details", this::details);
         app.get("/api/databases/{schema}/properties", this::databaseProperties);
         app.get("/api/databases/{schema}/tables", this::tables);
         app.get("/api/databases/{schema}/views", this::views);
@@ -428,6 +429,17 @@ public class ApiServer {
     private void explorer(Context ctx) throws Exception {
         requireConnected(ctx);
         ctx.json(databaseService.getExplorerTree());
+    }
+
+    private void details(Context ctx) throws Exception {
+        requireConnected(ctx);
+        String scope = ctx.queryParam("scope");
+        if (scope == null || scope.isBlank()) {
+            scope = "connection";
+        }
+        String schema = ctx.queryParam("schema");
+        String table = ctx.queryParam("table");
+        ctx.json(databaseService.getDetails(scope, schema, table));
     }
 
     private void databaseProperties(Context ctx) throws Exception {

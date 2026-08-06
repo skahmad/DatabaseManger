@@ -53,12 +53,12 @@
           <h2 id="context-title">SQL Editor</h2>
         </div>
         <p id="context-meta" class="context-meta" hidden></p>
-        <div class="topbar-meta" id="session-meta">Select a connection to begin</div>
       </header>
 
       <nav class="tabs" role="tablist">
         <div class="tabs-left">
-          <button type="button" class="tab active" data-tab="sql">SQL</button>
+          <button type="button" class="tab active" data-tab="details">Details</button>
+          <button type="button" class="tab" data-tab="sql">SQL</button>
           <button type="button" class="tab" data-tab="data">Data</button>
           <button type="button" class="tab" data-tab="structure">Structure</button>
           <button type="button" class="tab" data-tab="ddl">DDL</button>
@@ -75,9 +75,20 @@
         </div>
       </nav>
 
-      <section id="panel-sql" class="panel active">
+      <section id="panel-details" class="panel active">
+        <div class="details-panel">
+          <div class="details-head">
+            <h3 id="details-title">Details</h3>
+            <p id="details-subtitle" class="details-subtitle">Connect to a database to see object counts.</p>
+          </div>
+          <div id="details-grid" class="details-grid"></div>
+          <div id="details-empty" class="empty">No connection selected.</div>
+        </div>
+      </section>
+
+      <section id="panel-sql" class="panel">
         <div class="toolbar">
-          <button type="button" class="btn primary" id="btn-run">▶ Run</button>
+          <button type="button" class="btn primary" id="btn-run" disabled title="Select a table to run SQL">▶ Run</button>
           <button type="button" class="btn ghost" id="btn-clear-sql">Clear</button>
           <label class="inline-field">Limit <input type="number" id="row-limit" class="input narrow" value="500" min="1" /></label>
           <span class="hint">⌘/Ctrl + Enter</span>
