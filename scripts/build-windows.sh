@@ -159,7 +159,6 @@ JPACKAGE_ARGS=(
   --main-class "$MAIN_CLASS"
   --dest "$DIST_DIR"
   --java-options "-Dfile.encoding=UTF-8"
-  --java-options "--enable-native-access=ALL-UNNAMED"
 )
 if [[ ${#ICON_ARGS[@]} -gt 0 ]]; then
   JPACKAGE_ARGS+=("${ICON_ARGS[@]}")

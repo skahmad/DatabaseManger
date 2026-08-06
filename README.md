@@ -5,21 +5,23 @@ Desktop database manager for **macOS, Windows, and Linux** with an embedded HTML
 ## Features
 
 - Native desktop window (no browser tab)
-- Saved connections in the left sidebar; password prompt when opening one
-- **2-layer** (direct JDBC) and **3-layer** (SSH tunnel → database) connection modes
-- Database administration: create / modify / drop databases and schemas
-- Manage tables, views, indexes (create, rename, drop, add columns)
+- Multiple live connections at once (switch without disconnecting)
+- Saved connections in a resizable sidebar; password prompt when opening one
+- **Object hierarchy**
+  - **2-layer** — database → tables (MySQL / SQLite)
+  - **3-layer** — database → schemas → tables (PostgreSQL always; H2 / SQL Server by default)
+- Optional **SSH tunnel** (independent of hierarchy)
+- **Details** tab with counts for connection / database / schema / table
+- Admin actions via tree context menus (create, clone, export, import, drop, indexes, …)
+- SQL editor, Data / Structure / DDL tabs
 - Import / export CSV, Excel (XLSX), SQL, and JSON
-- Clone / migrate databases and schemas on the same server
-- Explorer for databases / schemas, tables, views, procedures, functions
-- SQL editor with results grid
-- Data / Structure / DDL tabs
 - MySQL, PostgreSQL, SQLite, H2, SQL Server
 
 ## Requirements
 
 - JDK 21+
 - Maven 3.8+
+- Docker (only when building Linux packages from macOS)
 
 ## Run
 
@@ -29,22 +31,22 @@ Desktop database manager for **macOS, Windows, and Linux** with an embedded HTML
 mvn javafx:run
 ```
 
-A desktop window opens with the UI rendered inside the app. The local API binds to `127.0.0.1` only.
+Use JDK 21+ (`JAVA_HOME`). The desktop window embeds the UI; the local API binds to `127.0.0.1` only.
 
-## Connection modes
+## Object hierarchy
 
-| Mode | Path | When to use |
-|------|------|-------------|
-| **2-layer** | App → database | Direct network access to the DB host |
-| **3-layer** | App → SSH bastion → database | DB is only reachable from a jump host |
+| Mode | Explorer tree | Typical engines |
+|------|---------------|-----------------|
+| **2-layer** | database → tables | MySQL, SQLite |
+| **3-layer** | database → schemas → tables | PostgreSQL (always), H2, SQL Server |
 
-For 3-layer, set the database host/port as seen **from the SSH host** (often `127.0.0.1` if MySQL/Postgres listens locally on the bastion). Authenticate SSH with password and/or a private key path.
+SSH tunnel is a separate checkbox on the connection form (not the same as 3-layer hierarchy). When using SSH, set the database host/port as seen **from the bastion**.
 
-File databases (SQLite / H2 file) always use 2-layer.
+## Build installers
 
-## macOS installer
+Outputs are copied under `binary/` (gitignored).
 
-Build a drag-to-Applications `.dmg` (requires JDK 21+ with `jpackage`):
+### macOS
 
 ```bash
 ./scripts/build-mac.sh
@@ -52,11 +54,11 @@ Build a drag-to-Applications `.dmg` (requires JDK 21+ with `jpackage`):
 
 Output: `binary/mac/Forge Database Manager-1.0.0.dmg`
 
-Open the DMG and drag **Forge Database Manager** into **Applications**. If macOS Gatekeeper blocks an unsigned build, right-click the app → **Open**.
+Open the DMG and drag the app into **Applications**. If Gatekeeper blocks it: right-click → **Open**.
 
-## Linux installer
+### Linux (amd64 / arm64)
 
-Build packages with Docker (from macOS) or natively on Linux:
+From macOS (Docker) or natively on Linux:
 
 ```bash
 # Intel/AMD Linux (most PCs/VMs) — default from macOS
@@ -69,40 +71,33 @@ Build packages with Docker (from macOS) or natively on Linux:
 ./scripts/build-linux.sh --all
 ```
 
-**Arch must match the install machine.** Check on Linux:
+| Machine | Package |
+|---------|---------|
+| Intel/AMD PC or VM | `binary/linux/amd64/*.deb` (+ portable `.tar.gz`) |
+| ARM Linux | `binary/linux/arm64/*.deb` |
 
 ```bash
 dpkg --print-architecture   # amd64 or arm64
-```
-
-| Machine | Use package |
-|---------|-------------|
-| Intel/AMD PC or VM | `binary/linux/amd64/*.deb` |
-| ARM / Apple Silicon Linux VM | `binary/linux/arm64/*.deb` |
-
-Install:
-
-```bash
 sudo apt install ./binary/linux/amd64/forge-database-manager_1.0.0_amd64.deb
 # or
 tar -xzf binary/linux/amd64/forge-database-manager-1.0.0-linux-x86_64.tar.gz
 ./"Forge Database Manager"/bin/"Forge Database Manager"
 ```
 
-Requires a desktop Linux environment with GTK (for JavaFX WebView).
+Requires a desktop Linux environment with GTK (JavaFX WebView).
 
-## Windows installer
+### Windows
 
-Build on a **Windows** machine with JDK 21+ (`jpackage`). Cross-building from macOS/Linux is not supported.
+**Native installer / app-image** (must run on Windows with JDK 21+):
 
 ```powershell
-# Portable app folder + zip (default, no WiX needed)
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Type exe   # needs WiX
+```
 
-# Installer (.exe) — requires WiX Toolset 3.x
-powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Type exe
+Or Git Bash on Windows:
 
-# Or from Git Bash:
+```bash
 ./scripts/build-windows.sh
 ./scripts/build-windows.sh --type=exe
 ```
@@ -111,23 +106,27 @@ Output: `binary/windows/amd64/` (or `arm64` on ARM Windows)
 
 | Artifact | Notes |
 |----------|--------|
-| App folder / `.zip` | Portable — run `Forge Database Manager.exe` inside |
+| App folder / `.zip` | Portable app-image from jpackage |
 | `.exe` / `.msi` | Installer — needs [WiX Toolset](https://wixtoolset.org/) |
 
-Optional: ImageMagick for a custom `.ico` (`packaging/windows/AppIcon.ico`).
+**Portable JAR zip** (can be assembled on macOS; needs JDK 21 on the Windows PC):
+
+```text
+binary/windows/amd64/forge-database-manager-1.0.0-windows-x86_64-portable.zip
+```
+
+Unzip and run `Forge Database Manager.bat`.
 
 ## Demo
 
-1. Start the app
-2. Click **New connection**
-3. Choose **SQLite**, set database path e.g. `/tmp/forge-demo.db`
-4. Connect — main UI appears
-5. Run in SQL:
+1. Start the app (`./run.sh`)
+2. Click **+** → new connection (e.g. SQLite → `/tmp/forge-demo.db`)
+3. Connect — **Details** shows object counts
+4. Expand the connection tree → open a database / schema
+5. Open a table (or use **SQL** after a table is selected — **Run** stays disabled until then)
 
 ```sql
 CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT);
 INSERT INTO users (name, email) VALUES ('Ada', 'ada@example.com'), ('Grace', 'grace@example.com');
 SELECT * FROM users;
 ```
-
-6. Expand the explorer → Tables → `users` to browse data

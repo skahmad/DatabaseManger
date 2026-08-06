@@ -180,7 +180,6 @@ JPACKAGE_ARGS=(
   --linux-package-name "forge-database-manager"
   --linux-app-category "Development"
   --java-options "-Dfile.encoding=UTF-8"
-  --java-options "--enable-native-access=ALL-UNNAMED"
   --java-options "-Djdk.gtk.version=3"
 )
 
@@ -206,7 +205,6 @@ if [[ "$PACKAGE_TYPE" == "deb" || "$PACKAGE_TYPE" == "rpm" ]]; then
     --dest "$APP_IMAGE_DIR" \
     --icon "$LINUX_ICON" \
     --java-options "-Dfile.encoding=UTF-8" \
-    --java-options "--enable-native-access=ALL-UNNAMED" \
     --java-options "-Djdk.gtk.version=3"
   (
     cd "$APP_IMAGE_DIR"
