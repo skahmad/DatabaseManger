@@ -527,7 +527,8 @@ async function loadTreeInto(container, connectionId) {
 
 function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
   const kind = node.kind || "database";
-  const databaseName = layout === "database-schemas" && kind === "database"
+  // MySQL: database node name is the DB; PostgreSQL: parent DB for schema children.
+  const databaseName = kind === "database"
     ? (node.name || null)
     : (parentDatabase || null);
   const wrap = document.createElement("div");
@@ -853,7 +854,7 @@ const PROP_LABELS = {
   id: "Connection ID",
 };
 
-const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view"];
+const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view", "#ctx-menu-wstab"];
 let suppressMenuHideUntil = 0;
 
 function hideAllContextMenus() {
@@ -1329,6 +1330,18 @@ async function handleContextAction(action) {
           openImportModal({ schema, table, mode: "table" });
         }
         break;
+      case "ws-pin":
+        hideAllContextMenus();
+        if (target.tabId) setWorkspaceTabPinned(target.tabId, true);
+        break;
+      case "ws-unpin":
+        hideAllContextMenus();
+        if (target.tabId) setWorkspaceTabPinned(target.tabId, false);
+        break;
+      case "ws-close":
+        hideAllContextMenus();
+        if (target.tabId) closeWorkspaceTab(target.tabId);
+        break;
       case "open-table":
         hideAllContextMenus();
         await openTable(target.schema, target.table);
@@ -1496,14 +1509,13 @@ function isThreeLayerProfile(profile) {
     || ["POSTGRESQL", "H2", "H2_FILE"].includes(profile.dbType);
 }
 
-/** Hover tooltip: for PostgreSQL — connection · database · schema */
+/** Hover tooltip — MySQL: connection · database; PostgreSQL: connection · database · schema */
 function workspaceTabTooltip(tab) {
   const profile = profileById(tab.connectionId || state.activeConnectionId);
   const connName = (profile?.name || "").trim() || profile?.displayType || "Connection";
-  const database = tab.database
-    || tab.detailFocus?.database
-    || profileDatabaseName(tab.connectionId || state.activeConnectionId)
-    || "";
+  const threeLayer = !!(profile && (isThreeLayerProfile(profile) || profile.dbType === "POSTGRESQL"));
+  const mysqlLike = !!(profile && (profile.dbType === "MYSQL" || (!threeLayer && !profile.fileBased)));
+
   let schema = "";
   if (tab.kind === "table") {
     schema = tab.schema || "";
@@ -1514,16 +1526,27 @@ function workspaceTabTooltip(tab) {
     }
   }
 
-  if (profile && (isThreeLayerProfile(profile) || profile.dbType === "POSTGRESQL")) {
+  // MySQL 2-layer: schema slot is the database name.
+  const database = tab.database
+    || tab.detailFocus?.database
+    || (mysqlLike || !threeLayer ? (schema || profileDatabaseName(tab.connectionId)) : "")
+    || profileDatabaseName(tab.connectionId || state.activeConnectionId)
+    || "";
+
+  if (threeLayer) {
     const parts = [connName];
     if (database) parts.push(database);
     if (schema && schema !== database) parts.push(schema);
     return parts.join(" · ");
   }
 
-  if (tab.kind === "table" && tab.schema) {
-    return database ? `${connName} · ${database} · ${tab.schema}.${tab.table}` : `${tab.schema}.${tab.table}`;
+  // MySQL / 2-layer: connection · database
+  if (mysqlLike || profile?.dbType === "MYSQL" || tab.kind === "table" || tab.kind === "context") {
+    const parts = [connName];
+    if (database) parts.push(database);
+    return parts.join(" · ");
   }
+
   return tab.title || connName;
 }
 
@@ -1553,7 +1576,37 @@ function contextTabBadge(tab) {
 }
 
 function removeContextTabs() {
-  state.workspaceTabs = state.workspaceTabs.filter((t) => t.kind !== "context" && t.kind !== "home");
+  // Keep pinned DB/SCH tabs; drop unpinned context tabs when opening a table.
+  state.workspaceTabs = state.workspaceTabs.filter(
+    (t) => ((t.kind !== "context" && t.kind !== "home") || t.pinned)
+  );
+}
+
+function sortWorkspaceTabs() {
+  state.workspaceTabs.sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
+}
+
+function setWorkspaceTabPinned(tabId, pinned) {
+  const tab = state.workspaceTabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  tab.pinned = !!pinned;
+  tab.closable = !tab.pinned;
+  sortWorkspaceTabs();
+  renderWorkspaceTabs();
+  setStatus(tab.pinned ? `Pinned “${tab.title}”` : `Unpinned “${tab.title}”`);
+}
+
+function showWsTabContextMenu(x, y, tab) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextTarget = { type: "wstab", tabId: tab.id };
+  const menu = $("#ctx-menu-wstab");
+  menu.querySelector('[data-action="ws-pin"]').hidden = !!tab.pinned;
+  menu.querySelector('[data-action="ws-unpin"]').hidden = !tab.pinned;
+  menu.querySelector('[data-action="ws-close"]').hidden = !!tab.pinned;
+  positionContextMenu(menu, x, y);
 }
 
 function ensureContextTab(focus) {
@@ -1569,6 +1622,7 @@ function ensureContextTab(focus) {
       kind: "context",
       title: contextTabTitle(normalized),
       closable: true,
+      pinned: false,
       viewMode: "details",
       connectionId: normalized.connectionId,
       database: normalized.database || "",
@@ -1579,13 +1633,14 @@ function ensureContextTab(focus) {
   } else {
     tab.id = "context";
     tab.kind = "context";
-    tab.closable = true;
+    tab.closable = !tab.pinned;
     tab.detailFocus = { ...normalized };
     tab.connectionId = normalized.connectionId;
     tab.database = normalized.database || "";
     tab.viewMode = "details";
     tab.title = contextTabTitle(normalized);
   }
+  sortWorkspaceTabs();
   return tab;
 }
 
@@ -1632,15 +1687,19 @@ function renderWorkspaceTabs() {
   const root = $("#workspace-tabs");
   if (!root) return;
   root.innerHTML = "";
+  sortWorkspaceTabs();
   for (const tab of state.workspaceTabs) {
+    const canClose = !tab.pinned && tab.closable !== false;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "ws-tab"
       + (tab.id === state.activeWorkspaceTabId ? " active" : "")
-      + (tab.closable !== false ? " closable" : "");
+      + (canClose ? " closable" : "")
+      + (tab.pinned ? " pinned" : "");
     btn.role = "tab";
     btn.dataset.tabId = tab.id;
-    btn.title = workspaceTabTooltip(tab);
+    const tip = workspaceTabTooltip(tab);
+    btn.title = tab.pinned ? `${tip} (pinned — double-click to unpin)` : `${tip} (double-click to pin)`;
     btn.innerHTML =
       `<span class="ws-tab-kind">${escapeHtml(contextTabBadge(tab))}</span>`
       + `<span class="ws-tab-label">${escapeHtml(tab.title)}</span>`
@@ -1655,8 +1714,19 @@ function renderWorkspaceTabs() {
       }
       activateWorkspaceTab(tab.id).catch((err) => alert(err.message));
     };
+    btn.ondblclick = (e) => {
+      if (e.target.closest("[data-close-tab]")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setWorkspaceTabPinned(tab.id, !tab.pinned);
+    };
+    btn.oncontextmenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showWsTabContextMenu(e.clientX, e.clientY, tab);
+    };
     btn.onauxclick = (e) => {
-      if (e.button === 1 && tab.closable !== false) {
+      if (e.button === 1 && canClose) {
         e.preventDefault();
         closeWorkspaceTab(tab.id);
       }
@@ -1782,7 +1852,10 @@ function closeWorkspaceTab(tabId) {
   const idx = state.workspaceTabs.findIndex((t) => t.id === tabId);
   if (idx < 0) return;
   const tab = state.workspaceTabs[idx];
-  if (tab.closable === false) return;
+  if (tab.pinned || tab.closable === false) {
+    setStatus("Unpin the tab before closing it");
+    return;
+  }
 
   const wasActive = state.activeWorkspaceTabId === tabId;
   state.workspaceTabs.splice(idx, 1);
@@ -1807,7 +1880,13 @@ async function openTable(schema, table, connectionId, database = null) {
   if (connectionId) state.activeConnectionId = connectionId;
   const cid = connectionId || state.activeConnectionId;
   const id = tableTabId(schema, table, cid);
-  const dbName = database || state.detailFocus?.database || profileDatabaseName(cid) || "";
+  const profile = profileById(cid);
+  // MySQL 2-layer: the explorer "schema" is the database name.
+  const dbName = database
+    || (!isThreeLayerProfile(profile) ? schema : null)
+    || state.detailFocus?.database
+    || profileDatabaseName(cid)
+    || "";
   snapshotActiveWorkspaceTab();
   // Opening a table replaces the DB/SCH context tab.
   removeContextTabs();
@@ -1823,6 +1902,7 @@ async function openTable(schema, table, connectionId, database = null) {
       database: dbName,
       connectionId: cid,
       closable: true,
+      pinned: false,
       viewMode: "data",
     };
     state.workspaceTabs.push(tab);

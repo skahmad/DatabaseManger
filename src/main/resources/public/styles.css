@@ -505,6 +505,16 @@ body.resizing-sidebar * {
   flex-shrink: 0;
 }
 .ws-tab.active .ws-tab-kind { color: var(--accent); }
+.ws-tab.pinned .ws-tab-kind::before {
+  content: "";
+  display: inline-block;
+  width: 0.35rem;
+  height: 0.35rem;
+  margin-right: 0.28rem;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+}
 .ws-tab-close {
   appearance: none;
   border: none;
@@ -528,6 +538,7 @@ body.resizing-sidebar * {
   color: var(--text);
 }
 .ws-tab:not(.closable) .ws-tab-close { visibility: hidden; width: 0.35rem; }
+.ws-tab.pinned .ws-tab-close { visibility: hidden; width: 0.2rem; }
 
 .tabs {
   display: flex;
