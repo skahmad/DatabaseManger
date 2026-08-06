@@ -26,6 +26,8 @@ const state = {
   pendingExpandProfileId: null,
   connectedIds: {},
   activeConnectionId: null,
+  detailFocus: { scope: "connection", schema: null, table: null, database: null },
+  currentTab: "details",
 };
 
 async function api(path, options = {}) {
@@ -69,11 +71,19 @@ function setConnectedUi(connected) {
   pill.textContent = any ? (count > 1 ? `${count} connected` : "connected") : "offline";
   pill.classList.toggle("idle", !any);
   if (!any) {
-    $("#session-meta").textContent = "Select a connection to begin";
     state.currentSchema = null;
     state.currentTable = null;
   }
+  updateRunButton();
   renderProfiles();
+}
+
+function updateRunButton() {
+  const btn = $("#btn-run");
+  if (!btn) return;
+  const enabled = !!state.currentTable;
+  btn.disabled = !enabled;
+  btn.title = enabled ? "Run SQL (⌘/Ctrl + Enter)" : "Select a table to run SQL";
 }
 
 /* ── Preferences (view + theme) ──────────────────── */
@@ -307,20 +317,23 @@ function renderProfiles() {
 async function toggleConnectionNode(profile) {
   showError($("#sidebar-error"), "");
 
-  // Already live: toggle expand only (never disconnect siblings)
+  // Already live: activate + show connection details; toggle expand
   if (isLiveProfile(profile)) {
-    if (isExpanded(profile.id)) {
-      setExpanded(profile.id, false);
-      renderProfiles();
-      return;
-    }
     await api("/api/session/active", {
       method: "POST",
       body: JSON.stringify({ id: profile.id }),
     });
     state.activeConnectionId = profile.id;
-    setExpanded(profile.id, true);
+    state.currentTable = null;
+    updateRunButton();
+    setDetailFocus({ scope: "connection" });
+    if (isExpanded(profile.id)) {
+      setExpanded(profile.id, false);
+    } else {
+      setExpanded(profile.id, true);
+    }
     renderProfiles();
+    switchTab("details");
     return;
   }
 
@@ -369,12 +382,11 @@ async function onConnected() {
     state.activeConnectionId = expandId;
   }
   setConnectedUi(true);
-  const p = session.profile;
-  $("#session-meta").textContent = p
-    ? `${p.displayType}${p.connectionModeLabel ? " · " + p.connectionModeLabel : ""} · ${p.username}@${p.host || "file"} / ${p.database || ""}${p.sshTunnel && p.sshHost ? " via " + p.sshHost : ""}`
-    : "";
   const count = Object.keys(state.connectedIds).length;
   setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
+  setDetailFocus({ scope: "connection" });
+  switchTab("details");
+  await refreshDetails();
   await loadProfiles();
 }
 
@@ -389,9 +401,12 @@ async function resetSession() {
   state.result = null;
   state.page = 1;
   state.expandedProfileIds = {};
+  setDetailFocus({ scope: "connection" });
   updateContextMeta("");
-  $("#context-title").textContent = "SQL Editor";
+  $("#context-title").textContent = "Details";
   setConnectedUi(false);
+  updateRunButton();
+  refreshDetails().catch(() => {});
 }
 
 async function disconnectCurrent(profileId) {
@@ -409,10 +424,6 @@ async function disconnectCurrent(profileId) {
   } else {
     await syncSessionState();
     setConnectedUi(true);
-    const p = state.session?.profile;
-    $("#session-meta").textContent = p
-      ? `${p.displayType} · ${p.username}@${p.host || "file"} / ${p.database || ""}`
-      : "";
   }
   setStatus("Disconnected");
   await loadProfiles();
@@ -515,8 +526,18 @@ function renderExplorerNode(node, layout, connectionId) {
     if (kind === "schema" || (kind === "database" && layout !== "database-schemas")) {
       state.currentSchema = node.schema || node.name;
       state.currentTable = null;
+      updateRunButton();
+      setDetailFocus({ scope: "schema", schema: node.schema || node.name });
+      if (state.currentTab === "details") refreshDetails().catch(console.error);
+      else {
+        switchTab("details");
+      }
     } else if (kind === "database" && layout === "database-schemas") {
       state.currentTable = null;
+      updateRunButton();
+      setDetailFocus({ scope: "database", database: node.name, schema: node.schema || node.name });
+      if (state.currentTab === "details") refreshDetails().catch(console.error);
+      else switchTab("details");
     }
 
     kids.hidden = !kids.hidden;
@@ -1395,6 +1416,8 @@ async function openTable(schema, table, connectionId) {
   if (connectionId) state.activeConnectionId = connectionId;
   state.currentSchema = schema;
   state.currentTable = table;
+  setDetailFocus({ scope: "table", schema, table });
+  updateRunButton();
   state.page = 1;
   $("#data-context").textContent = `${schema} · ${table}`;
   $("#context-title").textContent = table;
@@ -1418,7 +1441,11 @@ async function openTable(schema, table, connectionId) {
     $("#ddl-view").textContent = "DDL unavailable";
   }
   $("#sql-editor").value = `SELECT * FROM ${quoteIdent(table)} LIMIT ${limit}`;
-  switchTab("data");
+  if (state.currentTab === "details") {
+    await refreshDetails();
+  } else {
+    switchTab("data");
+  }
   setStatus(rows.message || `Loaded ${table}`);
 }
 
@@ -1428,6 +1455,7 @@ function quoteIdent(name) {
 
 function updateContextMeta(text) {
   const el = $("#context-meta");
+  if (!el) return;
   if (!text) {
     el.textContent = "";
     el.hidden = true;
@@ -1437,20 +1465,101 @@ function updateContextMeta(text) {
   el.textContent = text;
 }
 
+function setDetailFocus({ scope = "connection", schema = null, table = null, database = null } = {}) {
+  state.detailFocus = { scope, schema, table, database };
+}
+
+async function refreshDetails() {
+  const title = $("#details-title");
+  const subtitle = $("#details-subtitle");
+  const grid = $("#details-grid");
+  const empty = $("#details-empty");
+  if (!title || !grid) return;
+
+  if (!state.connected && !Object.keys(state.connectedIds || {}).length) {
+    title.textContent = "Details";
+    subtitle.textContent = "Connect to a database to see object counts.";
+    grid.innerHTML = "";
+    if (empty) empty.hidden = false;
+    return;
+  }
+
+  const focus = state.detailFocus || { scope: "connection" };
+  const params = new URLSearchParams({ scope: focus.scope || "connection" });
+  if (focus.schema) params.set("schema", focus.schema);
+  if (focus.database && focus.scope === "database") params.set("schema", focus.database);
+  if (focus.table) params.set("table", focus.table);
+  const cid = state.activeConnectionId;
+  grid.innerHTML = `<div class="hint">Loading…</div>`;
+  if (empty) empty.hidden = true;
+  try {
+    const data = await api(withConnectionId(`/api/details?${params}`, cid));
+    title.textContent = data.title || "Details";
+    subtitle.textContent = data.subtitle || data.hierarchy || data.engine || "";
+    renderDetailsItems(data.items || []);
+  } catch (e) {
+    title.textContent = "Details";
+    subtitle.textContent = e.message || "Failed to load details";
+    grid.innerHTML = "";
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = e.message || "Failed to load details";
+    }
+  }
+}
+
+function renderDetailsItems(items) {
+  const grid = $("#details-grid");
+  const empty = $("#details-empty");
+  grid.innerHTML = "";
+  if (!items.length) {
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = "No details available.";
+    }
+    return;
+  }
+  if (empty) empty.hidden = true;
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = "details-card";
+    card.innerHTML =
+      `<div class="details-value">${escapeHtml(String(item.value ?? 0))}</div>`
+      + `<div class="details-label">${escapeHtml(item.label || "")}</div>`;
+    grid.appendChild(card);
+  }
+}
+
 /* ── Tabs / data grid ────────────────────────────── */
 
 function switchTab(name) {
+  state.currentTab = name;
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
-  const titles = { sql: "SQL Editor", data: "Data", structure: "Structure", ddl: "DDL" };
+  const titles = {
+    details: "Details",
+    sql: "SQL Editor",
+    data: "Data",
+    structure: "Structure",
+    ddl: "DDL",
+  };
   if (state.currentTable) {
     $("#context-title").textContent = state.currentTable;
     if (state.currentSchema) {
       updateContextMeta(`${state.currentSchema} · ${state.currentTable}`);
     }
+  } else if (state.detailFocus?.scope === "schema" && state.detailFocus.schema) {
+    $("#context-title").textContent = state.detailFocus.schema;
+    updateContextMeta(titles[name] || "");
+  } else if (state.detailFocus?.scope === "database" && state.detailFocus.database) {
+    $("#context-title").textContent = state.detailFocus.database;
+    updateContextMeta(titles[name] || "");
   } else {
     $("#context-title").textContent = titles[name] || "Workspace";
     updateContextMeta("");
+  }
+  if (name === "details") {
+    refreshDetails().catch((e) => console.error(e));
   }
 }
 
@@ -1557,6 +1666,10 @@ function renderStructure(cols) {
 }
 
 async function runSql() {
+  if (!state.currentTable) {
+    setStatus("Select a table first");
+    return;
+  }
   const sql = $("#sql-editor").value.trim();
   if (!sql) return;
   setStatus("Executing…");
@@ -1564,10 +1677,6 @@ async function runSql() {
     const result = await api("/api/query", { method: "POST", body: JSON.stringify({ sql }) });
     state.result = result;
     state.page = 1;
-    if (!state.currentTable) {
-      $("#context-title").textContent = "Query result";
-      $("#data-context").textContent = "Query result";
-    }
     renderData(result);
     switchTab("data");
     setStatus(result.message);
@@ -1972,9 +2081,11 @@ function wire() {
   $("#sql-editor").addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
+      if (!state.currentTable) return;
       runSql();
     }
   });
+  updateRunButton();
   $("#data-search").oninput = () => {
     state.page = 1;
     renderData(state.result);
@@ -1995,6 +2106,7 @@ function wire() {
 async function boot() {
   wire();
   setConnectedUi(false);
+  updateRunButton();
   await loadDbTypes();
   await loadProfiles();
   const session = await syncSessionState();
@@ -2010,15 +2122,15 @@ async function boot() {
       setExpanded(session.profile.id, true);
     }
     setConnectedUi(true);
-    const p = session.profile;
-    $("#session-meta").textContent = p
-      ? `${p.displayType}${p.connectionModeLabel ? " · " + p.connectionModeLabel : ""} · ${p.username}@${p.host || "file"} / ${p.database || ""}`
-      : "";
+    setDetailFocus({ scope: "connection" });
     renderProfiles();
     const count = Object.keys(state.connectedIds).length;
     setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
+    switchTab("details");
   } else {
     setStatus("Ready");
+    switchTab("details");
+    refreshDetails().catch(() => {});
   }
 }
 

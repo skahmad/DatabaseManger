@@ -220,6 +220,230 @@ public class DatabaseService {
     }
 
     /**
+     * Contextual object counts for the Details tab.
+     * scope: connection | database | schema | table
+     */
+    public Map<String, Object> getDetails(String scope, String schema, String table) throws SQLException {
+        ConnectionProfile profile = connectionService.getProfile();
+        DbType type = profile.getDbType();
+        ConnectionMode mode = effectiveHierarchy(profile);
+        String normalized = scope == null ? "connection" : scope.trim().toLowerCase();
+
+        return switch (normalized) {
+            case "table" -> tableDetails(schema, table);
+            case "schema" -> schemaDetails(schema);
+            case "database" -> databaseLevelDetails(schema);
+            default -> connectionDetails(profile, type, mode);
+        };
+    }
+
+    private Map<String, Object> connectionDetails(ConnectionProfile profile, DbType type, ConnectionMode mode)
+            throws SQLException {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("scope", "connection");
+        out.put("title", profile.getName() == null || profile.getName().isBlank()
+                ? type.getDisplayName() : profile.getName());
+        out.put("subtitle", type.getDisplayName() + " · " + mode.getDisplayName());
+        out.put("engine", type.getDisplayName());
+        out.put("hierarchy", mode.getDescription());
+
+        List<Map<String, Object>> items = new ArrayList<>();
+        if (type == DbType.SQLITE) {
+            items.add(stat("Databases", 1));
+            items.add(stat("Tables", safeSize(() -> listTables("main"))));
+            items.add(stat("Views", safeSize(() -> listViews("main"))));
+        } else if (mode == ConnectionMode.THREE_LAYER) {
+            items.add(stat("Databases", safeSize(this::listDatabases)));
+            items.add(stat("Schemas", safeSize(this::listSchemas)));
+            int tables = 0;
+            int views = 0;
+            int procs = 0;
+            int funcs = 0;
+            for (String schema : listSchemas()) {
+                tables += safeSize(() -> listTables(schema));
+                views += safeSize(() -> listViews(schema));
+                procs += safeSize(() -> listProcedures(schema));
+                funcs += safeSize(() -> listFunctions(schema));
+            }
+            items.add(stat("Tables", tables));
+            items.add(stat("Views", views));
+            items.add(stat("Procedures", procs));
+            items.add(stat("Functions", funcs));
+        } else {
+            List<String> dbs = listDatabases();
+            items.add(stat("Databases", dbs.size()));
+            int tables = 0;
+            int views = 0;
+            int procs = 0;
+            int funcs = 0;
+            for (String db : dbs) {
+                tables += safeSize(() -> listTables(db));
+                views += safeSize(() -> listViews(db));
+                procs += safeSize(() -> listProcedures(db));
+                funcs += safeSize(() -> listFunctions(db));
+            }
+            items.add(stat("Tables", tables));
+            items.add(stat("Views", views));
+            items.add(stat("Procedures", procs));
+            items.add(stat("Functions", funcs));
+        }
+        out.put("items", items);
+        return out;
+    }
+
+    private Map<String, Object> databaseLevelDetails(String databaseName) throws SQLException {
+        ConnectionProfile profile = connectionService.getProfile();
+        DbType type = profile.getDbType();
+        ConnectionMode mode = effectiveHierarchy(profile);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("scope", "database");
+        String name = databaseName == null || databaseName.isBlank()
+                ? (profile.getDatabase() == null ? "database" : profile.getDatabase())
+                : databaseName;
+        out.put("title", type == DbType.SQLITE ? sqliteDisplayName(name) : name);
+        out.put("subtitle", "Database");
+        out.put("engine", type.getDisplayName());
+
+        List<Map<String, Object>> items = new ArrayList<>();
+        if (mode == ConnectionMode.THREE_LAYER
+                && (type == DbType.POSTGRESQL || type == DbType.H2 || type == DbType.H2_FILE
+                || type == DbType.SQLSERVER)) {
+            List<String> schemas = listSchemas();
+            items.add(stat("Schemas", schemas.size()));
+            int tables = 0;
+            int views = 0;
+            int procs = 0;
+            int funcs = 0;
+            for (String schema : schemas) {
+                tables += safeSize(() -> listTables(schema));
+                views += safeSize(() -> listViews(schema));
+                procs += safeSize(() -> listProcedures(schema));
+                funcs += safeSize(() -> listFunctions(schema));
+            }
+            items.add(stat("Tables", tables));
+            items.add(stat("Views", views));
+            items.add(stat("Procedures", procs));
+            items.add(stat("Functions", funcs));
+        } else {
+            // 2-layer database node behaves like a schema/catalog
+            return schemaDetails(name);
+        }
+        out.put("items", items);
+        return out;
+    }
+
+    private Map<String, Object> schemaDetails(String schema) throws SQLException {
+        if (schema == null || schema.isBlank()) {
+            throw new SQLException("Schema/database name is required");
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("scope", "schema");
+        out.put("title", schema);
+        DbType type = connectionService.getProfile().getDbType();
+        out.put("subtitle", switch (type) {
+            case POSTGRESQL, H2, H2_FILE -> "Schema";
+            default -> "Database";
+        });
+        out.put("engine", type.getDisplayName());
+        List<Map<String, Object>> items = new ArrayList<>();
+        items.add(stat("Tables", safeSize(() -> listTables(schema))));
+        items.add(stat("Views", safeSize(() -> listViews(schema))));
+        items.add(stat("Procedures", safeSize(() -> listProcedures(schema))));
+        items.add(stat("Functions", safeSize(() -> listFunctions(schema))));
+        out.put("items", items);
+        return out;
+    }
+
+    private Map<String, Object> tableDetails(String schema, String table) throws SQLException {
+        if (schema == null || schema.isBlank() || table == null || table.isBlank()) {
+            throw new SQLException("Schema and table are required");
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("scope", "table");
+        out.put("title", table);
+        out.put("subtitle", schema + " · table");
+        out.put("engine", connectionService.getProfile().getDbType().getDisplayName());
+
+        List<ColumnInfo> columns = getColumns(schema, table);
+        List<Map<String, Object>> indexes = listIndexes(schema, table);
+        int pkCols = 0;
+        for (ColumnInfo c : columns) {
+            if (c.isPrimaryKey()) {
+                pkCols++;
+            }
+        }
+        int fkCount = countForeignKeys(schema, table);
+        int uniqueIndexes = 0;
+        for (Map<String, Object> idx : indexes) {
+            if (Boolean.TRUE.equals(idx.get("unique"))) {
+                uniqueIndexes++;
+            }
+        }
+
+        List<Map<String, Object>> items = new ArrayList<>();
+        items.add(stat("Rows", countTableRows(schema, table)));
+        items.add(stat("Columns", columns.size()));
+        items.add(stat("Indexes", indexes.size()));
+        items.add(stat("Primary key columns", pkCols));
+        items.add(stat("Foreign keys", fkCount));
+        items.add(stat("Unique indexes", uniqueIndexes));
+        items.add(stat("Constraints", pkCols > 0 ? 1 + fkCount + uniqueIndexes : fkCount + uniqueIndexes));
+        out.put("items", items);
+        return out;
+    }
+
+    private long countTableRows(String schema, String table) {
+        try {
+            String sql = "SELECT COUNT(*) AS c FROM " + qualify(schema, table);
+            QueryResult result = execute(sql);
+            if (result.getRows() != null && !result.getRows().isEmpty()) {
+                Object c = result.getRows().get(0).get("c");
+                if (c == null) {
+                    c = result.getRows().get(0).values().iterator().next();
+                }
+                return Long.parseLong(String.valueOf(c));
+            }
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+
+    private int countForeignKeys(String schema, String table) throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DatabaseMetaData meta = conn.getMetaData();
+        String catalog = resolveCatalog(schema);
+        String schemaPattern = resolveSchemaPattern(schema);
+        Set<String> keys = new LinkedHashSet<>();
+        try (ResultSet rs = meta.getImportedKeys(catalog, schemaPattern, table)) {
+            while (rs.next()) {
+                String fk = rs.getString("FK_NAME");
+                if (fk == null || fk.isBlank()) {
+                    fk = rs.getString("PKTABLE_NAME") + "." + rs.getString("FKCOLUMN_NAME");
+                }
+                keys.add(fk);
+            }
+        } catch (SQLException ignored) {
+        }
+        return keys.size();
+    }
+
+    private static Map<String, Object> stat(String label, long value) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("label", label);
+        m.put("value", value);
+        return m;
+    }
+
+    private static int safeSize(java.util.concurrent.Callable<List<?>> op) {
+        try {
+            List<?> list = op.call();
+            return list == null ? 0 : list.size();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /**
      * Returns display properties for a database (MySQL/SQL Server) or schema (PostgreSQL/H2).
      */
     public Map<String, Object> getDatabaseProperties(String name) throws SQLException {
