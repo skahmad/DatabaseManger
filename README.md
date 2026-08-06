@@ -35,7 +35,7 @@ Build a drag-to-Applications `.dmg` (requires JDK 21+ with `jpackage`):
 ./scripts/build-mac.sh
 ```
 
-Output: `dist/Forge Database Manager-1.0.0.dmg`
+Output: `binary/mac/Forge Database Manager-1.0.0.dmg`
 
 Open the DMG and drag **Forge Database Manager** into **Applications**. If macOS Gatekeeper blocks an unsigned build, right-click the app → **Open**.
 
@@ -62,15 +62,15 @@ dpkg --print-architecture   # amd64 or arm64
 
 | Machine | Use package |
 |---------|-------------|
-| Intel/AMD PC or VM | `dist/linux/amd64/*.deb` |
-| ARM / Apple Silicon Linux VM | `dist/linux/arm64/*.deb` |
+| Intel/AMD PC or VM | `binary/linux/amd64/*.deb` |
+| ARM / Apple Silicon Linux VM | `binary/linux/arm64/*.deb` |
 
 Install:
 
 ```bash
-sudo apt install ./dist/linux/amd64/forge-database-manager_1.0.0_amd64.deb
+sudo apt install ./binary/linux/amd64/forge-database-manager_1.0.0_amd64.deb
 # or
-tar -xzf dist/linux/amd64/forge-database-manager-1.0.0-linux-x86_64.tar.gz
+tar -xzf binary/linux/amd64/forge-database-manager-1.0.0-linux-x86_64.tar.gz
 ./"Forge Database Manager"/bin/"Forge Database Manager"
 ```
 
