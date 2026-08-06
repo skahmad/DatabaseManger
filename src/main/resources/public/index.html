@@ -49,7 +49,6 @@
     <main class="main">
       <div class="workspace-tabbar" aria-label="Open workspace tabs">
         <div id="workspace-tabs" class="workspace-tabs" role="tablist"></div>
-        <p id="context-meta" class="context-meta workspace-meta" hidden></p>
       </div>
 
       <nav class="tabs" role="tablist" aria-label="View">
@@ -61,12 +60,23 @@
           <button type="button" class="tab" data-tab="ddl">DDL</button>
         </div>
         <div class="tabs-right">
+          <input type="text" id="data-search" class="input tabs-search" placeholder="Search rows…" autocomplete="off" spellcheck="false" />
           <div class="pager-controls" aria-label="Pagination">
             <button type="button" class="btn ghost pager-btn" id="btn-page-prev" title="Previous page" aria-label="Previous page" disabled>←</button>
             <span id="page-info" class="page-info">0 / 0</span>
             <button type="button" class="btn ghost pager-btn" id="btn-page-next" title="Next page" aria-label="Next page" disabled>→</button>
           </div>
-          <input type="search" id="data-search" class="input tabs-search" placeholder="Search rows…" />
+          <div class="col-vis-wrap">
+            <button type="button" class="btn ghost" id="btn-columns" title="Show or hide columns">Columns</button>
+            <div id="col-visibility-menu" class="col-vis-menu" hidden role="menu" aria-label="Column visibility">
+              <div class="col-vis-actions">
+                <button type="button" class="btn ghost sm" id="btn-columns-show-all">Show all</button>
+                <button type="button" class="btn ghost sm" id="btn-columns-hide-all">Hide all</button>
+              </div>
+              <div id="col-visibility-list" class="col-vis-list"></div>
+            </div>
+          </div>
+          <button type="button" class="btn ghost" id="btn-clear-filters" title="Clear all column filters" hidden>Clear filters</button>
           <button type="button" class="btn ghost" id="btn-export-csv">CSV</button>
           <button type="button" class="btn ghost" id="btn-export-json">JSON</button>
         </div>
@@ -441,6 +451,22 @@
       </div>
     </form>
   </dialog>
+
+  <div id="col-filter-popup" class="col-filter-popup" hidden role="dialog" aria-label="Column filter">
+    <div class="col-filter-head">
+      <span id="col-filter-title" class="col-filter-title">Filter column</span>
+    </div>
+    <label class="col-filter-field">Condition
+      <select id="col-filter-op" class="col-filter-op"></select>
+    </label>
+    <label class="col-filter-field">Value
+      <input type="text" id="col-filter-value" class="col-filter-value" placeholder="Value…" autocomplete="off" spellcheck="false" />
+    </label>
+    <div class="col-filter-actions">
+      <button type="button" class="btn ghost sm" id="col-filter-clear">Clear</button>
+      <button type="button" class="btn primary sm" id="col-filter-apply">Filter</button>
+    </div>
+  </div>
 
   <script src="/app.js" type="module"></script>
 </body>
