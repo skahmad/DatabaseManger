@@ -20,12 +20,27 @@ const state = {
   result: null,
   page: 1,
   pageSize: 50,
+  contextDb: null,
+  contextTarget: null,
+  expandedProfileIds: {},
+  pendingExpandProfileId: null,
+  connectedIds: {},
+  activeConnectionId: null,
 };
 
 async function api(path, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  // Prefer explicit connection from query; also send header for nested/admin calls.
+  const q = path.match(/[?&]connectionId=([^&]+)/);
+  if (q) {
+    headers["X-Connection-Id"] = decodeURIComponent(q[1]);
+  } else if (options.connectionId) {
+    headers["X-Connection-Id"] = options.connectionId;
+  }
+  const { connectionId: _cid, headers: _h, ...rest } = options;
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
+    headers,
+    ...rest,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || res.statusText || "Request failed");
@@ -36,12 +51,8 @@ function setStatus(msg) {
   $("#status").textContent = msg;
 }
 
-function showGate(show) {
-  $("#gate").hidden = !show;
-  $("#app").hidden = show;
-}
-
 function showError(el, msg) {
+  if (!el) return;
   if (!msg) {
     el.hidden = true;
     el.textContent = "";
@@ -49,6 +60,20 @@ function showError(el, msg) {
   }
   el.hidden = false;
   el.textContent = msg;
+}
+
+function setConnectedUi(connected) {
+  const pill = $("#conn-pill");
+  const count = Object.keys(state.connectedIds || {}).length;
+  const any = connected || count > 0;
+  pill.textContent = any ? (count > 1 ? `${count} connected` : "connected") : "offline";
+  pill.classList.toggle("idle", !any);
+  if (!any) {
+    $("#session-meta").textContent = "Select a connection to begin";
+    state.currentSchema = null;
+    state.currentTable = null;
+  }
+  renderProfiles();
 }
 
 /* ── Preferences (view + theme) ──────────────────── */
@@ -70,11 +95,65 @@ function savePrefs(partial) {
 function applyPrefs() {
   const prefs = loadPrefs();
   const theme = THEMES.includes(prefs.theme) ? prefs.theme : "teal";
-  const density = DENSITIES.includes(prefs.density) ? prefs.density : "comfortable";
+  const density = DENSITIES.includes(prefs.density) ? prefs.density : "compact";
   document.documentElement.dataset.theme = theme;
   document.documentElement.dataset.density = density;
   $$(".pref-theme").forEach((el) => { el.value = theme; });
   $$(".pref-density").forEach((el) => { el.value = density; });
+  applySidebarWidth(prefs.sidebarWidth);
+}
+
+function applySidebarWidth(width) {
+  const app = $("#app");
+  if (!app) return;
+  const n = Number(width);
+  const w = Number.isFinite(n) ? Math.min(560, Math.max(180, Math.round(n))) : 280;
+  app.style.setProperty("--sidebar-width", `${w}px`);
+}
+
+function wireSidebarResize() {
+  const handle = $("#sidebar-resizer");
+  const app = $("#app");
+  if (!handle || !app) return;
+
+  let dragging = false;
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    const rect = app.getBoundingClientRect();
+    applySidebarWidth(e.clientX - rect.left);
+  };
+
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("active");
+    document.body.classList.remove("resizing-sidebar");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+    const raw = getComputedStyle(app).getPropertyValue("--sidebar-width").trim();
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n)) savePrefs({ sidebarWidth: n });
+  };
+
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragging = true;
+    handle.classList.add("active");
+    document.body.classList.add("resizing-sidebar");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+  });
+
+  handle.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    applySidebarWidth(280);
+    savePrefs({ sidebarWidth: 280 });
+  });
 }
 
 function wirePrefs() {
@@ -91,116 +170,412 @@ function wirePrefs() {
     };
   });
   applyPrefs();
+  wireSidebarResize();
 }
 
-/* ── Profiles / connect gate ─────────────────────── */
+/* ── Profiles / sidebar connection tree ──────────── */
 
 async function loadProfiles() {
   state.profiles = await api("/api/profiles");
   renderProfiles();
 }
 
+function fileBaseName(path) {
+  if (!path) return "";
+  const parts = String(path).replace(/\\/g, "/").split("/");
+  return parts[parts.length - 1] || path;
+}
+
+function profileDetail(p) {
+  if (p.fileBased || ["SQLITE", "H2_FILE"].includes(p.dbType)) {
+    return `${p.displayType} · ${fileBaseName(p.database) || ""}`;
+  }
+  const hierarchy = p.connectionMode === "THREE_LAYER" ? "3-layer" : "2-layer";
+  if (p.useSshTunnel || p.sshTunnel) {
+    return `${p.displayType} · ${hierarchy} · ${p.host} via ${p.sshHost || "SSH"}`;
+  }
+  return `${p.displayType} · ${hierarchy} · ${p.host}${p.database ? " / " + p.database : ""}`;
+}
+
+function isLiveProfile(p) {
+  return !!(p && state.connectedIds && state.connectedIds[p.id]);
+}
+
+function isExpanded(profileId) {
+  return !!(state.expandedProfileIds && state.expandedProfileIds[profileId]);
+}
+
+function setExpanded(profileId, on) {
+  if (!state.expandedProfileIds) state.expandedProfileIds = {};
+  if (on) state.expandedProfileIds[profileId] = true;
+  else delete state.expandedProfileIds[profileId];
+}
+
+async function syncSessionState() {
+  const session = await api("/api/session");
+  state.session = session;
+  state.activeConnectionId = session.activeId || null;
+  state.connectedIds = {};
+  for (const s of session.sessions || []) {
+    if (s.id) state.connectedIds[s.id] = true;
+  }
+  // Back-compat if older server shape
+  if (session.profile?.id) {
+    state.connectedIds[session.profile.id] = true;
+    if (!state.activeConnectionId) state.activeConnectionId = session.profile.id;
+  }
+  state.connected = Object.keys(state.connectedIds).length > 0;
+  return session;
+}
+
 function renderProfiles() {
-  const list = $("#profile-list");
-  list.innerHTML = "";
+  const tree = $("#conn-tree");
+  if (!tree) return;
+  tree.innerHTML = "";
   if (!state.profiles.length) {
-    list.innerHTML = `<div class="profile-empty">No saved connections yet. Create one to begin.</div>`;
-    $("#btn-connect-selected").disabled = true;
+    tree.innerHTML = `<div class="profile-empty">No connections. Click + to add one.</div>`;
     return;
   }
+
   for (const p of state.profiles) {
+    const wrap = document.createElement("div");
+    wrap.className = "tree-node conn-node";
+    wrap.dataset.profileId = p.id;
+
     const row = document.createElement("div");
-    row.className = "profile-item" + (p.id === state.selectedProfileId ? " active" : "");
-    row.dataset.id = p.id;
+    const live = isLiveProfile(p);
+    const expanded = live && isExpanded(p.id);
+    row.className = "tree-row conn-row"
+      + (p.id === state.selectedProfileId ? " active" : "")
+      + (live ? " connected" : "")
+      + (p.id === state.activeConnectionId ? " active-session" : "");
 
-    const detail = p.fileBased || ["SQLITE", "H2_FILE"].includes(p.dbType)
-      ? `${p.displayType} · ${p.database || ""}`
-      : `${p.displayType} · ${p.host}${p.database ? " / " + p.database : ""}`;
+    const caret = document.createElement("span");
+    caret.className = "tree-caret";
+    caret.textContent = expanded ? "▾" : "▸";
 
-    const main = document.createElement("div");
-    main.className = "profile-main";
-    main.innerHTML = `<strong>${escapeHtml(p.name || "Untitled")}</strong><div class="profile-detail">${escapeHtml(detail)}</div>`;
-    main.onclick = () => {
+    row.appendChild(caret);
+    const label = document.createElement("span");
+    label.className = "tree-label";
+    label.innerHTML = `<strong>${escapeHtml(p.name || "Untitled")}</strong>`
+      + `<span class="conn-meta">${escapeHtml(profileDetail(p))}${live ? " · live" : ""}</span>`;
+    row.appendChild(label);
+
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "tree-more";
+    more.title = "Connection actions";
+    more.textContent = "⋯";
+    more.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = more.getBoundingClientRect();
+      showConnContextMenu(rect.left, rect.bottom + 4, p);
+    };
+    row.appendChild(more);
+
+    const kids = document.createElement("div");
+    kids.className = "tree-children conn-children";
+    kids.hidden = !expanded;
+
+    row.onclick = async (e) => {
+      if (e.target.closest(".tree-more")) return;
       state.selectedProfileId = p.id;
-      renderProfiles();
-      $("#btn-connect-selected").disabled = false;
+      try {
+        await toggleConnectionNode(p);
+      } catch (err) {
+        showError($("#sidebar-error"), err.message);
+      }
     };
-    main.ondblclick = () => connectSelected();
-
-    const actions = document.createElement("div");
-    actions.className = "profile-actions";
-
-    const editBtn = document.createElement("button");
-    editBtn.type = "button";
-    editBtn.className = "btn ghost sm";
-    editBtn.textContent = "Edit";
-    editBtn.onclick = (e) => {
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
       e.stopPropagation();
-      openEditConnection(p);
+      showConnContextMenu(e.clientX, e.clientY, p);
     };
 
-    const delBtn = document.createElement("button");
-    delBtn.type = "button";
-    delBtn.className = "btn ghost sm danger";
-    delBtn.textContent = "Delete";
-    delBtn.onclick = (e) => {
-      e.stopPropagation();
-      deleteConnection(p).catch((err) => showError($("#gate-error"), err.message));
-    };
+    wrap.append(row, kids);
+    tree.appendChild(wrap);
 
-    actions.append(editBtn, delBtn);
-    row.append(main, actions);
-    list.appendChild(row);
+    if (expanded) {
+      loadTreeInto(kids, p.id).catch((err) => {
+        kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
+      });
+    }
   }
-  $("#btn-connect-selected").disabled = !state.selectedProfileId;
 }
 
-async function deleteConnection(profile) {
-  const ok = confirm(`Delete connection “${profile.name || "Untitled"}”?`);
-  if (!ok) return;
-  await api("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" });
-  if (state.selectedProfileId === profile.id) state.selectedProfileId = null;
-  showError($("#gate-error"), "");
-  await loadProfiles();
-}
+async function toggleConnectionNode(profile) {
+  showError($("#sidebar-error"), "");
 
-async function connectSelected() {
-  const profile = state.profiles.find((p) => p.id === state.selectedProfileId);
-  if (!profile) return;
-  showError($("#gate-error"), "");
-  try {
-    const fileBased = ["SQLITE", "H2_FILE"].includes(profile.dbType);
-    if (!fileBased && !profile.hasPassword) {
-      openPasswordModal(profile);
+  // Already live: toggle expand only (never disconnect siblings)
+  if (isLiveProfile(profile)) {
+    if (isExpanded(profile.id)) {
+      setExpanded(profile.id, false);
+      renderProfiles();
       return;
     }
+    await api("/api/session/active", {
+      method: "POST",
+      body: JSON.stringify({ id: profile.id }),
+    });
+    state.activeConnectionId = profile.id;
+    setExpanded(profile.id, true);
+    renderProfiles();
+    return;
+  }
+
+  // Not connected yet — ask password / connect without touching others
+  state.pendingExpandProfileId = profile.id;
+  await accessConnection(profile);
+}
+
+/** Open a saved connection — prompts for password unless already live. */
+async function accessConnection(profile) {
+  showError($("#sidebar-error"), "");
+  state.selectedProfileId = profile.id;
+  renderProfiles();
+
+  if (isLiveProfile(profile)) {
+    await api("/api/session/active", {
+      method: "POST",
+      body: JSON.stringify({ id: profile.id }),
+    });
+    state.activeConnectionId = profile.id;
+    setExpanded(profile.id, true);
+    await onConnected({ reused: true });
+    return;
+  }
+
+  const fileBased = profile.fileBased || ["SQLITE", "H2_FILE"].includes(profile.dbType);
+  if (fileBased) {
     setStatus("Connecting…");
     await api("/api/connect/" + encodeURIComponent(profile.id), {
       method: "POST",
       body: "{}",
     });
-    await enterApp();
-  } catch (e) {
-    if (/Access denied|password|authentication|fe_sendauth/i.test(e.message)) {
-      openPasswordModal(profile);
-      showError($("#gate-error"), "Password required or incorrect.");
+    await onConnected();
+    return;
+  }
+
+  openPasswordModal(profile);
+}
+
+async function onConnected() {
+  const session = await syncSessionState();
+  const expandId = state.pendingExpandProfileId || state.selectedProfileId || session.activeId;
+  state.pendingExpandProfileId = null;
+  if (expandId) {
+    setExpanded(expandId, true);
+    state.activeConnectionId = expandId;
+  }
+  setConnectedUi(true);
+  const p = session.profile;
+  $("#session-meta").textContent = p
+    ? `${p.displayType}${p.connectionModeLabel ? " · " + p.connectionModeLabel : ""} · ${p.username}@${p.host || "file"} / ${p.database || ""}${p.sshTunnel && p.sshHost ? " via " + p.sshHost : ""}`
+    : "";
+  const count = Object.keys(state.connectedIds).length;
+  setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
+  await loadProfiles();
+}
+
+async function resetSession() {
+  // Full reset used only when no sessions remain
+  state.connected = false;
+  state.session = null;
+  state.connectedIds = {};
+  state.activeConnectionId = null;
+  state.currentSchema = null;
+  state.currentTable = null;
+  state.result = null;
+  state.page = 1;
+  state.expandedProfileIds = {};
+  updateContextMeta("");
+  $("#context-title").textContent = "SQL Editor";
+  setConnectedUi(false);
+}
+
+async function disconnectCurrent(profileId) {
+  const id = profileId || state.activeConnectionId || state.selectedProfileId;
+  if (!id) return;
+  await api("/api/disconnect/" + encodeURIComponent(id), { method: "POST", body: "{}" });
+  delete state.connectedIds[id];
+  setExpanded(id, false);
+  if (state.activeConnectionId === id) {
+    state.activeConnectionId = Object.keys(state.connectedIds)[0] || null;
+  }
+  state.connected = Object.keys(state.connectedIds).length > 0;
+  if (!state.connected) {
+    await resetSession();
+  } else {
+    await syncSessionState();
+    setConnectedUi(true);
+    const p = state.session?.profile;
+    $("#session-meta").textContent = p
+      ? `${p.displayType} · ${p.username}@${p.host || "file"} / ${p.database || ""}`
+      : "";
+  }
+  setStatus("Disconnected");
+  await loadProfiles();
+}
+
+async function deleteConnection(profile) {
+  const ok = confirm(`Delete connection “${profile.name || "Untitled"}”?`);
+  if (!ok) return;
+  const wasLive = isLiveProfile(profile);
+  if (wasLive) {
+    await api("/api/disconnect/" + encodeURIComponent(profile.id), { method: "POST", body: "{}" });
+    delete state.connectedIds[profile.id];
+    setExpanded(profile.id, false);
+  }
+  await api("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" });
+  if (state.selectedProfileId === profile.id) state.selectedProfileId = null;
+  showError($("#sidebar-error"), "");
+  state.connected = Object.keys(state.connectedIds).length > 0;
+  if (!state.connected) {
+    await resetSession();
+  } else {
+    await syncSessionState();
+  }
+  await loadProfiles();
+}
+
+/* ── Explorer tree (under a connection) ──────────── */
+
+function withConnectionId(path, connectionId) {
+  if (!connectionId) return path;
+  const join = path.includes("?") ? "&" : "?";
+  return `${path}${join}connectionId=${encodeURIComponent(connectionId)}`;
+}
+
+async function loadTree() {
+  renderProfiles();
+}
+
+async function loadTreeInto(container, connectionId) {
+  if (!container) return;
+  container.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
+  container.hidden = false;
+  try {
+    // Use connectionId on the request — do not steal active session from siblings.
+    const explorer = await api(withConnectionId("/api/explorer", connectionId));
+    container.innerHTML = "";
+    const nodes = explorer.nodes || [];
+    if (!nodes.length) {
+      container.innerHTML = `<div class="profile-empty">No databases/schemas found.</div>`;
       return;
     }
-    showError($("#gate-error"), e.message);
+    for (const node of nodes) {
+      container.appendChild(renderExplorerNode(node, explorer.layout, connectionId));
+    }
+  } catch (e) {
+    container.innerHTML = `<div class="error-text">${escapeHtml(e.message)}</div>`;
   }
 }
 
-async function enterApp() {
-  state.session = await api("/api/session");
-  state.connected = !!state.session.connected;
-  showGate(false);
-  const p = state.session.profile;
-  $("#session-meta").textContent = p
-    ? `${p.displayType} · ${p.username}@${p.host || "file"} / ${p.database || ""}`
-    : "";
-  $("#conn-pill").textContent = "connected";
-  setStatus("Connected");
-  await loadTree();
+function renderExplorerNode(node, layout, connectionId) {
+  const kind = node.kind || "database";
+  const wrap = document.createElement("div");
+  wrap.className = "tree-node";
+
+  const row = document.createElement("div");
+  row.className = "tree-row";
+  const badge = kind === "schema" ? "SCH" : "DB";
+  const badgeClass = kind === "schema" ? "vw" : "db";
+  row.innerHTML = `<span class="badge ${badgeClass}">${badge}</span><span class="tree-label">${escapeHtml(node.name)}</span>`;
+
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "tree-more";
+  more.title = "Actions";
+  more.textContent = "⋯";
+  more.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = more.getBoundingClientRect();
+    state.activeConnectionId = connectionId;
+    showDbContextMenu(rect.left, rect.bottom + 4, node.schema || node.name);
+  };
+  row.appendChild(more);
+
+  const kids = document.createElement("div");
+  kids.className = "tree-children";
+  kids.hidden = true;
+  let loaded = false;
+  const childSchemas = Array.isArray(node.children) ? node.children : null;
+
+  row.onclick = async (e) => {
+    if (e.target.closest(".tree-more")) return;
+    if (connectionId) {
+      state.activeConnectionId = connectionId;
+      await api("/api/session/active", {
+        method: "POST",
+        body: JSON.stringify({ id: connectionId }),
+      }).catch(() => {});
+    }
+    if (kind === "schema" || (kind === "database" && layout !== "database-schemas")) {
+      state.currentSchema = node.schema || node.name;
+      state.currentTable = null;
+    } else if (kind === "database" && layout === "database-schemas") {
+      state.currentTable = null;
+    }
+
+    kids.hidden = !kids.hidden;
+    if (kids.hidden || loaded) return;
+    loaded = true;
+    kids.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
+    try {
+      if (childSchemas) {
+        kids.innerHTML = "";
+        for (const schemaNode of childSchemas) {
+          kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId));
+        }
+        return;
+      }
+      const schema = node.schema || node.name;
+      const base = `/api/databases/${encodeURIComponent(schema)}`;
+      const [tables, views, procs, funcs] = await Promise.all([
+        api(withConnectionId(`${base}/tables`, connectionId)),
+        api(withConnectionId(`${base}/views`, connectionId)),
+        api(withConnectionId(`${base}/procedures`, connectionId)),
+        api(withConnectionId(`${base}/functions`, connectionId)),
+      ]);
+      kids.innerHTML = "";
+      kids.appendChild(folder("Tables", "tbl", schema, tables, "table", connectionId));
+      kids.appendChild(folder("Views", "vw", schema, views, "view", connectionId));
+      kids.appendChild(folder("Procedures", "db", schema, procs, "proc", connectionId));
+      kids.appendChild(folder("Functions", "db", schema, funcs, "func", connectionId));
+    } catch (err) {
+      kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
+      loaded = false;
+    }
+  };
+
+  row.oncontextmenu = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    state.activeConnectionId = connectionId;
+    showDbContextMenu(e.clientX, e.clientY, node.schema || node.name);
+  };
+
+  wrap.append(row, kids);
+  return wrap;
+}
+
+function showConnContextMenu(x, y, profile) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextTarget = { type: "connection", profile };
+  state.selectedProfileId = profile.id;
+  const menu = $("#ctx-menu-conn");
+  const live = isLiveProfile(profile);
+  menu.querySelector('[data-action="conn-connect"]').hidden = live;
+  menu.querySelector('[data-action="conn-disconnect"]').hidden = !live;
+  menu.querySelectorAll(".conn-admin, .conn-admin-sep").forEach((el) => {
+    el.hidden = !live;
+  });
+  positionContextMenu(menu, x, y);
 }
 
 /* ── Connection modal ────────────────────────────── */
@@ -211,6 +586,12 @@ async function loadDbTypes() {
   sel.innerHTML = state.dbTypes.map((t) =>
     `<option value="${t.id}">${t.name}</option>`).join("");
   sel.onchange = () => updateConnFormForType();
+  $("#connection-mode").onchange = () => updateConnFormForMode();
+  $("#use-ssh-tunnel").onchange = () => updateConnFormForMode();
+}
+
+function defaultHierarchyForType(typeId) {
+  return ["POSTGRESQL", "H2", "H2_FILE", "SQLSERVER"].includes(typeId) ? "THREE_LAYER" : "TWO_LAYER";
 }
 
 function updateConnFormForType() {
@@ -219,26 +600,83 @@ function updateConnFormForType() {
   const form = $("#form-connection");
   if (!state.editingProfileId) {
     form.port.value = type.defaultPort || 0;
+    form.connectionMode.value = defaultHierarchyForType(type.id);
   }
   const fileBased = type.fileBased;
+  const alwaysThree = ["POSTGRESQL", "H2", "H2_FILE"].includes(type.id);
+  const alwaysTwo = fileBased || type.id === "MYSQL";
   form.querySelector(".host-field").style.display = fileBased ? "none" : "";
   form.querySelector(".port-field").style.display = fileBased ? "none" : "";
   form.querySelector(".db-field").querySelector("input").placeholder =
     fileBased ? "/path/to/database.db" : "database name";
+
+  const modeSel = $("#connection-mode");
+  const threeOpt = modeSel.querySelector('option[value="THREE_LAYER"]');
+  const twoOpt = modeSel.querySelector('option[value="TWO_LAYER"]');
+  const sshToggle = $("#use-ssh-tunnel");
+  const sshWrap = $("#ssh-toggle-wrap");
+  if (fileBased) {
+    modeSel.value = "TWO_LAYER";
+    modeSel.disabled = true;
+    if (threeOpt) threeOpt.disabled = true;
+    if (twoOpt) twoOpt.disabled = false;
+    if (sshToggle) sshToggle.checked = false;
+    if (sshWrap) sshWrap.hidden = true;
+  } else if (alwaysThree) {
+    modeSel.value = "THREE_LAYER";
+    modeSel.disabled = true;
+    if (threeOpt) threeOpt.disabled = false;
+    if (twoOpt) twoOpt.disabled = true;
+    if (sshWrap) sshWrap.hidden = false;
+  } else if (alwaysTwo) {
+    modeSel.value = "TWO_LAYER";
+    modeSel.disabled = true;
+    if (threeOpt) threeOpt.disabled = true;
+    if (twoOpt) twoOpt.disabled = false;
+    if (sshWrap) sshWrap.hidden = false;
+  } else {
+    modeSel.disabled = false;
+    if (threeOpt) threeOpt.disabled = false;
+    if (twoOpt) twoOpt.disabled = false;
+    if (sshWrap) sshWrap.hidden = false;
+  }
+  updateConnFormForMode();
+}
+
+function updateConnFormForMode() {
+  const form = $("#form-connection");
+  const type = state.dbTypes.find((t) => t.id === $("#db-type").value);
+  const fileBased = type && type.fileBased;
+  const three = form.connectionMode.value === "THREE_LAYER";
+  const useSsh = !fileBased && $("#use-ssh-tunnel")?.checked;
+  $("#ssh-fields").hidden = !useSsh;
+  if (type && ["POSTGRESQL", "H2", "H2_FILE"].includes(type.id)) {
+    $("#connection-mode-hint").textContent =
+      "PostgreSQL always uses 3-layer: database → schemas → tables.";
+  } else {
+    $("#connection-mode-hint").textContent = three
+      ? "Explorer: database → schemas → tables."
+      : "Explorer: database → tables (typical for MySQL / SQLite).";
+  }
 }
 
 function openNewConnection() {
   state.editingProfileId = null;
   $("#modal-conn-title").textContent = "New connection";
-  $("#btn-submit-conn").textContent = "Connect";
+  $("#btn-submit-conn").textContent = "Save";
   const form = $("#form-connection");
   form.reset();
   form.id.value = "";
   form.dbType.value = "MYSQL";
+  form.connectionMode.value = "TWO_LAYER";
   form.host.value = "localhost";
   form.port.value = 3306;
   form.username.value = "root";
   form.password.placeholder = "";
+  form.useSshTunnel.checked = false;
+  form.sshPort.value = 22;
+  form.sshPassword.placeholder = "";
+  form.sshPassphrase.placeholder = "";
   updateConnFormForType();
   $("#modal-connection").showModal();
 }
@@ -252,6 +690,7 @@ function openEditConnection(profile) {
   form.id.value = profile.id;
   form.name.value = profile.name || "";
   form.dbType.value = profile.dbType || "MYSQL";
+  form.connectionMode.value = profile.connectionMode || defaultHierarchyForType(profile.dbType);
   form.host.value = profile.host || "localhost";
   form.port.value = profile.port || 0;
   form.database.value = profile.database || "";
@@ -259,17 +698,38 @@ function openEditConnection(profile) {
   form.password.value = "";
   form.password.placeholder = profile.hasPassword ? "Leave blank to keep existing" : "";
   form.savePassword.checked = !!profile.savePassword;
+  form.useSshTunnel.checked = !!profile.useSshTunnel;
+  form.sshHost.value = profile.sshHost || "";
+  form.sshPort.value = profile.sshPort || 22;
+  form.sshUsername.value = profile.sshUsername || "";
+  form.sshPassword.value = "";
+  form.sshPassword.placeholder = profile.hasSshPassword ? "Leave blank to keep existing" : "";
+  form.sshPrivateKeyPath.value = profile.sshPrivateKeyPath || "";
+  form.sshPassphrase.value = "";
+  form.sshPassphrase.placeholder = profile.hasSshPassphrase ? "Leave blank to keep existing" : "";
+  form.saveSshPassword.checked = !!profile.saveSshPassword;
   updateConnFormForType();
+  form.connectionMode.value = profile.connectionMode || defaultHierarchyForType(profile.dbType);
+  form.useSshTunnel.checked = !!profile.useSshTunnel;
+  updateConnFormForMode();
   $("#modal-connection").showModal();
 }
 
 function openPasswordModal(profile) {
   state.pendingProfile = profile;
-  $("#password-lead").textContent = `Password required for “${profile.name}”.`;
+  $("#password-lead").textContent = `Enter password to open “${profile.name || "Untitled"}”.`;
   const form = $("#form-password");
   form.username.value = profile.username || "";
   form.password.value = "";
+  form.password.placeholder = profile.hasPassword ? "Leave blank to use saved password" : "";
   form.savePassword.checked = false;
+  const showSsh = !!profile.useSshTunnel;
+  $("#password-ssh-fields").hidden = !showSsh;
+  if (showSsh) {
+    form.sshUsername.value = profile.sshUsername || "";
+    form.sshPassword.value = "";
+    form.saveSshPassword.checked = false;
+  }
   $("#modal-password").showModal();
 }
 
@@ -277,93 +737,649 @@ function readConnectionForm(form) {
   const profile = {
     name: form.name.value.trim() || undefined,
     dbType: form.dbType.value,
+    connectionMode: form.connectionMode.value || "TWO_LAYER",
     host: form.host.value.trim(),
     port: Number(form.port.value) || 0,
     database: form.database.value.trim(),
     username: form.username.value.trim(),
     password: form.password.value,
     savePassword: form.savePassword.checked,
+    useSshTunnel: !!form.useSshTunnel?.checked,
+    sshHost: form.sshHost.value.trim(),
+    sshPort: Number(form.sshPort.value) || 22,
+    sshUsername: form.sshUsername.value.trim(),
+    sshPassword: form.sshPassword.value,
+    sshPrivateKeyPath: form.sshPrivateKeyPath.value.trim(),
+    sshPassphrase: form.sshPassphrase.value,
+    saveSshPassword: form.saveSshPassword.checked,
   };
   if (form.id.value) profile.id = form.id.value;
+  // Engine-enforced hierarchy
+  if (["POSTGRESQL", "H2", "H2_FILE"].includes(profile.dbType)) {
+    profile.connectionMode = "THREE_LAYER";
+  } else if (profile.dbType === "MYSQL" || profile.dbType === "SQLITE") {
+    profile.connectionMode = "TWO_LAYER";
+  }
   return profile;
 }
 
-/* ── Explorer tree ───────────────────────────────── */
+/* ── Context menus / admin dialogs ───────────────── */
 
-async function loadTree() {
-  const filter = ($("#explorer-filter").value || "").toLowerCase();
-  const dbs = await api("/api/databases");
-  const tree = $("#tree");
-  tree.innerHTML = "";
-  for (const db of dbs) {
-    if (filter && !db.toLowerCase().includes(filter)) continue;
-    tree.appendChild(renderDbNode(db));
+const PROP_LABELS = {
+  name: "Name",
+  kind: "Type",
+  engine: "Engine",
+  status: "Status",
+  host: "Host",
+  port: "Port",
+  database: "Database",
+  username: "Username",
+  connectionMode: "Hierarchy",
+  connectionModeLabel: "Hierarchy",
+  useSshTunnel: "SSH tunnel enabled",
+  sshHost: "SSH host",
+  sshPort: "SSH port",
+  sshUsername: "SSH username",
+  sshPrivateKeyPath: "SSH private key",
+  sshTunnel: "SSH tunnel",
+  serverProduct: "Server product",
+  serverVersion: "Server version",
+  driverName: "Driver",
+  driverVersion: "Driver version",
+  url: "JDBC URL",
+  userName: "Connected user",
+  tableCount: "Tables",
+  viewCount: "Views",
+  procedureCount: "Procedures",
+  functionCount: "Functions",
+  charset: "Character set",
+  collation: "Collation",
+  sizeMb: "Size (MB)",
+  owner: "Owner",
+  catalog: "Catalog",
+  state: "State",
+  recoveryModel: "Recovery model",
+  compatibilityLevel: "Compatibility level",
+  created: "Created",
+  filePath: "File path",
+  pageCount: "Page count",
+  pageSize: "Page size",
+  encoding: "Encoding",
+  isDefault: "Default schema",
+  liveError: "Live error",
+  displayType: "Engine",
+  id: "Connection ID",
+};
+
+const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view"];
+let suppressMenuHideUntil = 0;
+
+function hideAllContextMenus() {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
   }
-  if (!dbs.length) {
-    tree.innerHTML = `<div class="profile-empty">No schemas/databases found.</div>`;
+  state.contextDb = null;
+  state.contextTarget = null;
+}
+
+function positionContextMenu(menu, x, y) {
+  suppressMenuHideUntil = Date.now() + 350;
+  menu.hidden = false;
+  // Measure after showing so width/height are available
+  requestAnimationFrame(() => {
+    const pad = 8;
+    const maxX = window.innerWidth - menu.offsetWidth - pad;
+    const maxY = window.innerHeight - menu.offsetHeight - pad;
+    menu.style.left = `${Math.max(pad, Math.min(x, maxX))}px`;
+    menu.style.top = `${Math.max(pad, Math.min(y, maxY))}px`;
+  });
+}
+
+function showDbContextMenu(x, y, db) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextDb = db;
+  state.contextTarget = { type: "db", schema: db };
+  positionContextMenu($("#ctx-menu-db"), x, y);
+}
+
+function showFolderContextMenu(x, y, schema, kind) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextTarget = { type: "folder", schema, kind };
+  const menu = $("#ctx-menu-folder");
+  menu.querySelector('[data-action="create-table"]').hidden = kind !== "table";
+  menu.querySelector('[data-action="create-view"]').hidden = kind !== "view";
+  menu.querySelector('[data-action="import-table"]').hidden = kind !== "table";
+  positionContextMenu(menu, x, y);
+}
+
+function showTableContextMenu(x, y, schema, table) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextTarget = { type: "table", schema, table };
+  positionContextMenu($("#ctx-menu-table"), x, y);
+}
+
+function showViewContextMenu(x, y, schema, view) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextTarget = { type: "view", schema, view };
+  positionContextMenu($("#ctx-menu-view"), x, y);
+}
+
+async function openDatabaseProperties(db) {
+  hideAllContextMenus();
+  const title = $("#db-props-title");
+  const subtitle = $("#db-props-subtitle");
+  const body = $("#db-props-body");
+  title.textContent = "Database properties";
+  subtitle.textContent = `Loading properties for “${db}”…`;
+  body.innerHTML = `<div class="prop-key">Status</div><div class="prop-val">Loading…</div>`;
+  $("#modal-db-props").showModal();
+  try {
+    const props = await api(`/api/databases/${encodeURIComponent(db)}/properties`);
+    fillPropertiesModal(props, db);
+  } catch (e) {
+    subtitle.textContent = db;
+    body.innerHTML = `<div class="prop-key">Error</div><div class="prop-val">${escapeHtml(e.message)}</div>`;
   }
 }
 
-function renderDbNode(db) {
-  const wrap = document.createElement("div");
-  wrap.className = "tree-node";
+async function openConnectionProperties(profile) {
+  hideAllContextMenus();
+  if (!profile?.id) return;
+  const title = $("#db-props-title");
+  const subtitle = $("#db-props-subtitle");
+  const body = $("#db-props-body");
+  const label = profile.name || "Connection";
+  title.textContent = "Connection properties";
+  subtitle.textContent = `Loading properties for “${label}”…`;
+  body.innerHTML = `<div class="prop-key">Status</div><div class="prop-val">Loading…</div>`;
+  $("#modal-db-props").showModal();
+  try {
+    const props = await api(`/api/profiles/${encodeURIComponent(profile.id)}/properties`);
+    fillPropertiesModal(props, label);
+  } catch (e) {
+    subtitle.textContent = label;
+    body.innerHTML = `<div class="prop-key">Error</div><div class="prop-val">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function fillPropertiesModal(props, fallbackName) {
+  const title = $("#db-props-title");
+  const subtitle = $("#db-props-subtitle");
+  const body = $("#db-props-body");
+  const kind = props.kind || "Properties";
+  title.textContent = `${kind} properties`;
+  subtitle.textContent = props.name || fallbackName || "";
+  body.innerHTML = "";
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === "") continue;
+    if (key === "kind") continue;
+    const label = PROP_LABELS[key] || key;
+    const keyEl = document.createElement("div");
+    keyEl.className = "prop-key";
+    keyEl.textContent = label;
+    const valEl = document.createElement("div");
+    valEl.className = "prop-val";
+    valEl.textContent = typeof value === "boolean" ? (value ? "Yes" : "No") : String(value);
+    body.append(keyEl, valEl);
+  }
+  if (!body.children.length) {
+    body.innerHTML = `<div class="prop-key">Info</div><div class="prop-val">No properties available.</div>`;
+  }
+}
+
+function openCreateDatabaseModal() {
+  hideAllContextMenus();
+  $("#db-admin-title").textContent = "Create database";
+  $("#db-admin-mode").value = "create";
+  $("#db-admin-original").value = "";
+  $("#db-admin-newname-wrap").hidden = true;
+  const form = $("#form-db-admin");
+  form.reset();
+  $("#modal-db-admin").showModal();
+}
+
+function openModifyDatabaseModal(name) {
+  hideAllContextMenus();
+  $("#db-admin-title").textContent = "Modify database";
+  $("#db-admin-mode").value = "modify";
+  $("#db-admin-original").value = name;
+  $("#db-admin-newname-wrap").hidden = false;
+  const form = $("#form-db-admin");
+  form.name.value = name;
+  form.newName.value = "";
+  form.charset.value = "";
+  form.collation.value = "";
+  $("#modal-db-admin").showModal();
+}
+
+function openCloneModal(source) {
+  hideAllContextMenus();
+  const form = $("#form-clone");
+  form.source.value = source;
+  form.sourceDisplay.value = source;
+  form.targetName.value = `${source}_copy`;
+  form.includeData.checked = true;
+  form.includeViews.checked = true;
+  form.includeIndexes.checked = true;
+  $("#modal-clone").showModal();
+}
+
+function openExportModal({ schema, table = "", scope = "table" }) {
+  hideAllContextMenus();
+  $("#export-title").textContent = scope === "database" ? "Export database SQL" : `Export ${table}`;
+  $("#export-schema").value = schema;
+  $("#export-table").value = table;
+  $("#export-scope").value = scope;
+  const form = $("#form-export");
+  form.format.value = scope === "database" ? "sql" : "csv";
+  $("#export-include-data-wrap").hidden = scope !== "database";
+  form.format.querySelector('option[value="csv"]').disabled = scope === "database";
+  form.format.querySelector('option[value="json"]').disabled = scope === "database";
+  form.format.querySelector('option[value="xlsx"]').disabled = scope === "database";
+  $("#modal-export").showModal();
+}
+
+function openImportModal({ schema, table = "", mode = "table" }) {
+  hideAllContextMenus();
+  $("#import-title").textContent = mode === "sql" ? "Import SQL script" : `Import into ${table}`;
+  $("#import-schema").value = schema || "";
+  $("#import-table").value = table || "";
+  $("#import-mode").value = mode;
+  const form = $("#form-import");
+  form.reset();
+  $("#import-schema").value = schema || "";
+  $("#import-table").value = table || "";
+  $("#import-mode").value = mode;
+  if (mode === "sql") {
+    form.format.value = "sql";
+    form.format.disabled = true;
+    $("#import-header-wrap").hidden = true;
+    $("#import-truncate-wrap").hidden = true;
+  } else {
+    form.format.disabled = false;
+    $("#import-header-wrap").hidden = false;
+    $("#import-truncate-wrap").hidden = false;
+  }
+  $("#modal-import").showModal();
+}
+
+function addCreateTableColumnRow(defaults = {}) {
   const row = document.createElement("div");
-  row.className = "tree-row";
-  row.innerHTML = `<span class="badge db">DB</span><span>${escapeHtml(db)}</span>`;
-  const kids = document.createElement("div");
-  kids.className = "tree-children";
-  kids.hidden = true;
-  let loaded = false;
-  row.onclick = async () => {
-    kids.hidden = !kids.hidden;
-    if (!kids.hidden && !loaded) {
-      loaded = true;
-      kids.innerHTML = `<div class="hint" style="padding:.4rem">Loading…</div>`;
-      try {
-        const [tables, views, procs, funcs] = await Promise.all([
-          api(`/api/databases/${encodeURIComponent(db)}/tables`),
-          api(`/api/databases/${encodeURIComponent(db)}/views`),
-          api(`/api/databases/${encodeURIComponent(db)}/procedures`),
-          api(`/api/databases/${encodeURIComponent(db)}/functions`),
-        ]);
-        kids.innerHTML = "";
-        kids.appendChild(folder("Tables", "tbl", db, tables, "table"));
-        kids.appendChild(folder("Views", "vw", db, views, "view"));
-        kids.appendChild(folder("Procedures", "db", db, procs, "proc"));
-        kids.appendChild(folder("Functions", "db", db, funcs, "func"));
-      } catch (e) {
-        kids.innerHTML = `<div class="error-text">${escapeHtml(e.message)}</div>`;
-        loaded = false;
-      }
+  row.className = "col-row";
+  row.innerHTML = `
+    <input class="input col-name" placeholder="name" value="${escapeHtml(defaults.name || "")}" required />
+    <input class="input col-type" placeholder="VARCHAR(255)" value="${escapeHtml(defaults.sqlType || "VARCHAR(255)")}" />
+    <label class="check"><input type="checkbox" class="col-null" ${defaults.nullable === false ? "" : "checked"} /> Null</label>
+    <label class="check"><input type="checkbox" class="col-pk" ${defaults.primaryKey ? "checked" : ""} /> PK</label>
+    <label class="check"><input type="checkbox" class="col-ai" ${defaults.autoIncrement ? "checked" : ""} /> AI</label>
+    <button type="button" class="btn ghost sm col-remove">✕</button>
+  `;
+  row.querySelector(".col-remove").onclick = () => row.remove();
+  $("#create-table-cols").appendChild(row);
+}
+
+function openCreateTableModal(schema) {
+  hideAllContextMenus();
+  $("#create-table-schema").value = schema;
+  $("#form-create-table").name.value = "";
+  $("#create-table-cols").innerHTML = "";
+  addCreateTableColumnRow({ name: "id", sqlType: "INTEGER", nullable: false, primaryKey: true, autoIncrement: true });
+  addCreateTableColumnRow({ name: "name", sqlType: "VARCHAR(255)", nullable: true });
+  $("#modal-create-table").showModal();
+}
+
+function openCreateViewModal(schema) {
+  hideAllContextMenus();
+  const form = $("#form-create-view");
+  form.reset();
+  $("#create-view-schema").value = schema;
+  $("#modal-create-view").showModal();
+}
+
+async function openIndexesModal(schema, table) {
+  hideAllContextMenus();
+  $("#indexes-title").textContent = `Indexes · ${schema}.${table}`;
+  $("#index-schema").value = schema;
+  $("#index-table").value = table;
+  $("#form-create-index").reset();
+  $("#index-schema").value = schema;
+  $("#index-table").value = table;
+  await refreshIndexesList(schema, table);
+  $("#modal-indexes").showModal();
+}
+
+async function refreshIndexesList(schema, table) {
+  const list = $("#indexes-list");
+  list.innerHTML = `<div class="hint">Loading…</div>`;
+  try {
+    const indexes = await api(`/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/indexes`);
+    list.innerHTML = "";
+    if (!indexes.length) {
+      list.innerHTML = `<div class="profile-empty">No indexes found.</div>`;
+      return;
     }
-  };
-  wrap.append(row, kids);
-  return wrap;
+    for (const idx of indexes) {
+      const item = document.createElement("div");
+      item.className = "index-item";
+      const cols = Array.isArray(idx.columns) ? idx.columns.join(", ") : "";
+      item.innerHTML = `<div><strong>${escapeHtml(idx.name)}</strong><div class="profile-detail">${idx.unique ? "UNIQUE · " : ""}${escapeHtml(cols)}</div></div>`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn ghost sm danger";
+      del.textContent = "Drop";
+      del.onclick = async () => {
+        if (!confirm(`Drop index “${idx.name}”?`)) return;
+        await api(`/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/indexes/${encodeURIComponent(idx.name)}`, { method: "DELETE" });
+        await refreshIndexesList(schema, table);
+        setStatus(`Dropped index ${idx.name}`);
+      };
+      item.appendChild(del);
+      list.appendChild(item);
+    }
+  } catch (e) {
+    list.innerHTML = `<div class="error-text">${escapeHtml(e.message)}</div>`;
+  }
 }
 
-function folder(label, badge, schema, items, kind) {
+function openAddColumnModal(schema, table) {
+  hideAllContextMenus();
+  const form = $("#form-add-column");
+  form.reset();
+  $("#add-col-schema").value = schema;
+  $("#add-col-table").value = table;
+  form.sqlType.value = "VARCHAR(255)";
+  form.nullable.checked = true;
+  $("#modal-add-column").showModal();
+}
+
+async function downloadExportPayload(payload) {
+  let blob;
+  if (payload.base64) {
+    const bin = atob(payload.content);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    blob = new Blob([bytes], { type: payload.contentType || "application/octet-stream" });
+  } else {
+    blob = new Blob([payload.content], { type: payload.contentType || "text/plain" });
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = payload.filename || "export";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsText(file);
+  });
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const base64 = result.includes(",") ? result.split(",")[1] : result;
+      resolve(base64);
+    };
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleContextAction(action) {
+  const target = state.contextTarget || {};
+  const schema = target.schema || state.contextDb;
+  try {
+    switch (action) {
+      case "conn-connect":
+        hideAllContextMenus();
+        if (target.profile) {
+          state.pendingExpandProfileId = target.profile.id;
+          await accessConnection(target.profile);
+        }
+        break;
+      case "conn-disconnect":
+        hideAllContextMenus();
+        await disconnectCurrent(target.profile?.id);
+        break;
+      case "conn-edit":
+        hideAllContextMenus();
+        if (target.profile) openEditConnection(target.profile);
+        break;
+      case "conn-delete":
+        hideAllContextMenus();
+        if (target.profile) await deleteConnection(target.profile);
+        break;
+      case "conn-properties":
+        if (target.profile) await openConnectionProperties(target.profile);
+        break;
+      case "properties":
+        await openDatabaseProperties(schema);
+        break;
+      case "create-db":
+        if (target.profile) {
+          state.activeConnectionId = target.profile.id;
+          await api("/api/session/active", {
+            method: "POST",
+            body: JSON.stringify({ id: target.profile.id }),
+          }).catch(() => {});
+        }
+        openCreateDatabaseModal();
+        break;
+      case "create-schema":
+        if (target.profile) {
+          state.activeConnectionId = target.profile.id;
+          await api("/api/session/active", {
+            method: "POST",
+            body: JSON.stringify({ id: target.profile.id }),
+          }).catch(() => {});
+        }
+        hideAllContextMenus();
+        $("#form-schema").reset();
+        $("#modal-schema").showModal();
+        break;
+      case "modify-db":
+        openModifyDatabaseModal(schema);
+        break;
+      case "clone-db":
+        openCloneModal(schema);
+        break;
+      case "export-db":
+        openExportModal({ schema, scope: "database" });
+        break;
+      case "import-sql":
+        if (target.profile) {
+          state.activeConnectionId = target.profile.id;
+          await api("/api/session/active", {
+            method: "POST",
+            body: JSON.stringify({ id: target.profile.id }),
+          }).catch(() => {});
+        }
+        openImportModal({ schema: schema || "", mode: "sql" });
+        break;
+      case "drop-db":
+        hideAllContextMenus();
+        if (!confirm(`Drop database “${schema}”? This cannot be undone.`)) return;
+        await api(`/api/databases/${encodeURIComponent(schema)}`, { method: "DELETE" });
+        await loadTree();
+        setStatus(`Dropped database ${schema}`);
+        break;
+      case "drop-schema":
+        hideAllContextMenus();
+        if (!confirm(`Drop schema “${schema}”? This cannot be undone.`)) return;
+        await api(`/api/schemas/${encodeURIComponent(schema)}`, { method: "DELETE" });
+        await loadTree();
+        setStatus(`Dropped schema ${schema}`);
+        break;
+      case "create-table":
+        if (!schema) {
+          alert("Select a database/schema first");
+          return;
+        }
+        openCreateTableModal(schema);
+        break;
+      case "create-view":
+        if (!schema) {
+          alert("Select a database/schema first");
+          return;
+        }
+        openCreateViewModal(schema);
+        break;
+      case "import-table":
+        if (target.type === "table") {
+          openImportModal({ schema: target.schema, table: target.table, mode: "table" });
+        } else {
+          const table = prompt("Import into which table?");
+          if (!table) return;
+          openImportModal({ schema, table, mode: "table" });
+        }
+        break;
+      case "open-table":
+        hideAllContextMenus();
+        await openTable(target.schema, target.table);
+        break;
+      case "export-table":
+        openExportModal({ schema: target.schema, table: target.table, scope: "table" });
+        break;
+      case "manage-indexes":
+        await openIndexesModal(target.schema, target.table);
+        break;
+      case "add-column":
+        openAddColumnModal(target.schema, target.table);
+        break;
+      case "rename-table": {
+        hideAllContextMenus();
+        const newName = prompt("New table name:", target.table);
+        if (!newName || newName === target.table) return;
+        await api(`/api/databases/${encodeURIComponent(target.schema)}/tables/${encodeURIComponent(target.table)}/rename`, {
+          method: "POST",
+          body: JSON.stringify({ newName }),
+        });
+        await loadTree();
+        setStatus(`Renamed to ${newName}`);
+        break;
+      }
+      case "drop-table":
+        hideAllContextMenus();
+        if (!confirm(`Drop table “${target.schema}.${target.table}”?`)) return;
+        await api(`/api/databases/${encodeURIComponent(target.schema)}/tables/${encodeURIComponent(target.table)}`, { method: "DELETE" });
+        await loadTree();
+        setStatus(`Dropped table ${target.table}`);
+        break;
+      case "open-view":
+        hideAllContextMenus();
+        await openTable(target.schema, target.view);
+        break;
+      case "drop-view":
+        hideAllContextMenus();
+        if (!confirm(`Drop view “${target.schema}.${target.view}”?`)) return;
+        await api(`/api/databases/${encodeURIComponent(target.schema)}/views/${encodeURIComponent(target.view)}`, { method: "DELETE" });
+        await loadTree();
+        setStatus(`Dropped view ${target.view}`);
+        break;
+      default:
+        break;
+    }
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+function folder(label, badge, schema, items, kind, connectionId) {
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
   const row = document.createElement("div");
   row.className = "tree-row";
-  row.innerHTML = `<span class="badge ${badge}">${badge.toUpperCase()}</span><span>${label} (${items.length})</span>`;
+  row.innerHTML = `<span class="badge ${badge}">${badge.toUpperCase()}</span><span class="tree-label">${label} (${items.length})</span>`;
+  if (kind === "table" || kind === "view") {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "tree-more";
+    more.title = `${label} actions`;
+    more.textContent = "⋯";
+    more.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = more.getBoundingClientRect();
+      if (connectionId) state.activeConnectionId = connectionId;
+      showFolderContextMenu(rect.left, rect.bottom + 4, schema, kind);
+    };
+    row.appendChild(more);
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (connectionId) state.activeConnectionId = connectionId;
+      showFolderContextMenu(e.clientX, e.clientY, schema, kind);
+    };
+  }
   const kids = document.createElement("div");
   kids.className = "tree-children";
   kids.hidden = true;
   row.onclick = (e) => {
+    if (e.target.closest(".tree-more")) return;
     e.stopPropagation();
     kids.hidden = !kids.hidden;
   };
   for (const name of items) {
     const item = document.createElement("div");
     item.className = "tree-row";
-    item.innerHTML = `<span>${escapeHtml(name)}</span>`;
+    item.innerHTML = `<span class="tree-label">${escapeHtml(name)}</span>`;
+    if (kind === "table" || kind === "view") {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "tree-more";
+      more.title = "Actions";
+      more.textContent = "⋯";
+      more.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const rect = more.getBoundingClientRect();
+        if (connectionId) state.activeConnectionId = connectionId;
+        if (kind === "table") showTableContextMenu(rect.left, rect.bottom + 4, schema, name);
+        else showViewContextMenu(rect.left, rect.bottom + 4, schema, name);
+      };
+      item.appendChild(more);
+      item.oncontextmenu = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (connectionId) state.activeConnectionId = connectionId;
+        if (kind === "table") showTableContextMenu(e.clientX, e.clientY, schema, name);
+        if (kind === "view") showViewContextMenu(e.clientX, e.clientY, schema, name);
+      };
+    }
     item.onclick = async (e) => {
+      if (e.target.closest(".tree-more")) return;
       e.stopPropagation();
       $$(".tree-row.active").forEach((el) => el.classList.remove("active"));
       item.classList.add("active");
       if (kind === "table" || kind === "view") {
-        await openTable(schema, name);
+        if (connectionId) {
+          state.activeConnectionId = connectionId;
+          await api("/api/session/active", {
+            method: "POST",
+            body: JSON.stringify({ id: connectionId }),
+          }).catch(() => {});
+        }
+        await openTable(schema, name, connectionId);
       }
     };
     kids.appendChild(item);
@@ -375,7 +1391,8 @@ function folder(label, badge, schema, items, kind) {
   return wrap;
 }
 
-async function openTable(schema, table) {
+async function openTable(schema, table, connectionId) {
+  if (connectionId) state.activeConnectionId = connectionId;
   state.currentSchema = schema;
   state.currentTable = table;
   state.page = 1;
@@ -384,16 +1401,18 @@ async function openTable(schema, table) {
   updateContextMeta("Loading…");
   setStatus(`Loading ${table}…`);
   const limit = Number($("#row-limit").value) || 500;
+  const cid = connectionId || state.activeConnectionId;
+  const base = `/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}`;
   const [cols, rows] = await Promise.all([
-    api(`/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/columns`),
-    api(`/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/rows?limit=${limit}`),
+    api(withConnectionId(`${base}/columns`, cid)),
+    api(withConnectionId(`${base}/rows?limit=${limit}`, cid)),
   ]);
   state.columns = cols;
   state.result = rows;
   renderStructure(cols);
   renderData(rows);
   try {
-    const ddl = await api(`/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/ddl`);
+    const ddl = await api(withConnectionId(`${base}/ddl`, cid));
     $("#ddl-view").textContent = ddl.ddl || "";
   } catch {
     $("#ddl-view").textContent = "DDL unavailable";
@@ -424,16 +1443,14 @@ function switchTab(name) {
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
   const titles = { sql: "SQL Editor", data: "Data", structure: "Structure", ddl: "DDL" };
-  if (state.currentTable && name !== "sql") {
+  if (state.currentTable) {
     $("#context-title").textContent = state.currentTable;
-    if (state.result && !state.result.update) {
-      // keep latest meta from last render
-    } else if (state.currentSchema) {
+    if (state.currentSchema) {
       updateContextMeta(`${state.currentSchema} · ${state.currentTable}`);
     }
   } else {
-    $("#context-title").textContent = titles[name];
-    if (name === "sql") updateContextMeta("");
+    $("#context-title").textContent = titles[name] || "Workspace";
+    updateContextMeta("");
   }
 }
 
@@ -561,6 +1578,11 @@ async function runSql() {
 }
 
 function exportCsv() {
+  if (state.currentSchema && state.currentTable) {
+    openExportModal({ schema: state.currentSchema, table: state.currentTable, scope: "table" });
+    $("#form-export").format.value = "csv";
+    return;
+  }
   const result = state.result;
   if (!result?.columns?.length) return;
   const lines = [result.columns.join(",")];
@@ -571,6 +1593,11 @@ function exportCsv() {
 }
 
 function exportJson() {
+  if (state.currentSchema && state.currentTable) {
+    openExportModal({ schema: state.currentSchema, table: state.currentTable, scope: "table" });
+    $("#form-export").format.value = "json";
+    return;
+  }
   const result = state.result;
   if (!result?.columns?.length) return;
   const rows = (result.rows || []).map((row) => {
@@ -619,32 +1646,295 @@ function escapeHtml(s) {
 function wire() {
   wirePrefs();
   $("#btn-refresh-profiles").onclick = () => loadProfiles().catch(console.error);
-  $("#btn-connect-selected").onclick = () => connectSelected().catch((e) => showError($("#gate-error"), e.message));
   $("#btn-new-connection").onclick = openNewConnection;
   $("#btn-cancel-conn").onclick = () => {
     state.editingProfileId = null;
     $("#modal-connection").close();
   };
   $("#btn-cancel-pw").onclick = () => $("#modal-password").close();
+  $("#btn-close-db-props").onclick = () => $("#modal-db-props").close();
+  $("#btn-cancel-db-admin").onclick = () => $("#modal-db-admin").close();
+  $("#btn-cancel-schema").onclick = () => $("#modal-schema").close();
+  $("#btn-cancel-create-table").onclick = () => $("#modal-create-table").close();
+  $("#btn-cancel-create-view").onclick = () => $("#modal-create-view").close();
+  $("#btn-close-indexes").onclick = () => $("#modal-indexes").close();
+  $("#btn-cancel-add-col").onclick = () => $("#modal-add-column").close();
+  $("#btn-cancel-clone").onclick = () => $("#modal-clone").close();
+  $("#btn-cancel-export").onclick = () => $("#modal-export").close();
+  $("#btn-cancel-import").onclick = () => $("#modal-import").close();
+  $("#btn-add-col-row").onclick = () => addCreateTableColumnRow();
+
+  for (const sel of CTX_MENUS) {
+    $(sel).onclick = (e) => {
+      const btn = e.target.closest("[data-action]");
+      if (!btn) return;
+      handleContextAction(btn.dataset.action).catch((err) => alert(err.message));
+    };
+  }
+
+  document.addEventListener("pointerdown", (e) => {
+    if (Date.now() < suppressMenuHideUntil) return;
+    if (e.target.closest(".ctx-menu") || e.target.closest(".tree-more")) return;
+    hideAllContextMenus();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hideAllContextMenus();
+  });
+  window.addEventListener("blur", () => {
+    if (Date.now() < suppressMenuHideUntil) return;
+    hideAllContextMenus();
+  });
+
+  $("#form-db-admin").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      if (form.mode.value === "create") {
+        await api("/api/databases", {
+          method: "POST",
+          body: JSON.stringify({
+            name: form.name.value.trim(),
+            charset: form.charset.value.trim() || undefined,
+            collation: form.collation.value.trim() || undefined,
+          }),
+        });
+        setStatus(`Created database ${form.name.value.trim()}`);
+      } else {
+        await api(`/api/databases/${encodeURIComponent(form.originalName.value)}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            newName: form.newName.value.trim() || undefined,
+            charset: form.charset.value.trim() || undefined,
+            collation: form.collation.value.trim() || undefined,
+          }),
+        });
+        setStatus(`Modified database ${form.originalName.value}`);
+      }
+      $("#modal-db-admin").close();
+      await loadTree();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-schema").onsubmit = async (e) => {
+    e.preventDefault();
+    const name = e.target.name.value.trim();
+    try {
+      await api("/api/schemas", { method: "POST", body: JSON.stringify({ name }) });
+      $("#modal-schema").close();
+      await loadTree();
+      setStatus(`Created schema ${name}`);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-create-table").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const schema = form.schema.value;
+    const columns = [...$("#create-table-cols").querySelectorAll(".col-row")].map((row) => ({
+      name: row.querySelector(".col-name").value.trim(),
+      sqlType: row.querySelector(".col-type").value.trim() || "VARCHAR(255)",
+      nullable: row.querySelector(".col-null").checked,
+      primaryKey: row.querySelector(".col-pk").checked,
+      autoIncrement: row.querySelector(".col-ai").checked,
+    })).filter((c) => c.name);
+    try {
+      await api(`/api/databases/${encodeURIComponent(schema)}/tables`, {
+        method: "POST",
+        body: JSON.stringify({ name: form.name.value.trim(), columns }),
+      });
+      $("#modal-create-table").close();
+      await loadTree();
+      setStatus(`Created table ${form.name.value.trim()}`);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-create-view").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      await api(`/api/databases/${encodeURIComponent(form.schema.value)}/views`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.name.value.trim(),
+          selectSql: form.selectSql.value,
+          replace: form.replace.checked,
+        }),
+      });
+      $("#modal-create-view").close();
+      await loadTree();
+      setStatus(`Created view ${form.name.value.trim()}`);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-create-index").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const columns = form.columns.value.split(",").map((s) => s.trim()).filter(Boolean);
+    try {
+      await api(`/api/databases/${encodeURIComponent(form.schema.value)}/tables/${encodeURIComponent(form.table.value)}/indexes`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.name.value.trim() || undefined,
+          columns,
+          unique: form.unique.checked,
+        }),
+      });
+      form.name.value = "";
+      form.columns.value = "";
+      form.unique.checked = false;
+      await refreshIndexesList(form.schema.value, form.table.value);
+      setStatus("Index created");
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-add-column").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      await api(`/api/databases/${encodeURIComponent(form.schema.value)}/tables/${encodeURIComponent(form.table.value)}/columns`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.name.value.trim(),
+          sqlType: form.sqlType.value.trim(),
+          nullable: form.nullable.checked,
+        }),
+      });
+      $("#modal-add-column").close();
+      if (state.currentSchema === form.schema.value && state.currentTable === form.table.value) {
+        await openTable(form.schema.value, form.table.value);
+      }
+      setStatus(`Added column ${form.name.value.trim()}`);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-clone").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      setStatus("Cloning…");
+      const result = await api(`/api/databases/${encodeURIComponent(form.source.value)}/clone`, {
+        method: "POST",
+        body: JSON.stringify({
+          targetName: form.targetName.value.trim(),
+          includeData: form.includeData.checked,
+          includeViews: form.includeViews.checked,
+          includeIndexes: form.includeIndexes.checked,
+        }),
+      });
+      $("#modal-clone").close();
+      await loadTree();
+      setStatus(`Cloned ${result.tablesCopied || 0} table(s) to ${form.targetName.value.trim()}`);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-export").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      setStatus("Exporting…");
+      let payload;
+      if (form.scope.value === "database") {
+        const qs = new URLSearchParams({
+          includeData: String(!!form.includeData.checked),
+          limit: String(Number(form.limit.value) || 100000),
+        });
+        payload = await api(`/api/databases/${encodeURIComponent(form.schema.value)}/export?${qs}`);
+      } else {
+        const qs = new URLSearchParams({
+          format: form.format.value,
+          limit: String(Number(form.limit.value) || 100000),
+        });
+        payload = await api(`/api/databases/${encodeURIComponent(form.schema.value)}/tables/${encodeURIComponent(form.table.value)}/export?${qs}`);
+      }
+      await downloadExportPayload(payload);
+      $("#modal-export").close();
+      setStatus(`Exported ${payload.filename}`);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $("#form-import").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const file = form.file.files?.[0];
+    if (!file) {
+      alert("Choose a file to import");
+      return;
+    }
+    try {
+      setStatus("Importing…");
+      const format = form.format.value;
+      const isExcel = format === "xlsx" || format === "excel";
+      const content = isExcel ? await readFileAsBase64(file) : await readFileAsText(file);
+      if (form.mode.value === "sql" || format === "sql") {
+        const result = await api("/api/import/sql", {
+          method: "POST",
+          body: JSON.stringify({ sql: content }),
+        });
+        $("#modal-import").close();
+        await loadTree();
+        setStatus(result.message || "SQL imported");
+        return;
+      }
+      const result = await api(`/api/databases/${encodeURIComponent(form.schema.value)}/tables/${encodeURIComponent(form.table.value)}/import`, {
+        method: "POST",
+        body: JSON.stringify({
+          format,
+          content,
+          base64: isExcel,
+          truncate: form.truncate.checked,
+          headerRow: form.headerRow.checked,
+        }),
+      });
+      $("#modal-import").close();
+      if (state.currentSchema === form.schema.value && state.currentTable === form.table.value) {
+        await openTable(form.schema.value, form.table.value);
+      }
+      setStatus(`Imported ${result.imported || 0} row(s)` + (result.failed ? `, ${result.failed} failed` : ""));
+      if (result.errors?.length) {
+        alert(`Import completed with errors:\n${result.errors.slice(0, 5).join("\n")}`);
+      }
+    } catch (err) {
+      alert(err.message);
+    }
+  };
 
   $("#form-connection").onsubmit = async (e) => {
     e.preventDefault();
     const form = e.target;
     const profile = readConnectionForm(form);
+    const wasEdit = !!state.editingProfileId;
     try {
-      showError($("#gate-error"), "");
-      if (state.editingProfileId) {
-        await api("/api/profiles", { method: "POST", body: JSON.stringify(profile) });
-        state.editingProfileId = null;
-        $("#modal-connection").close();
-        await loadProfiles();
-        setStatus("Connection saved");
-        return;
-      }
-      await api("/api/connect", { method: "POST", body: JSON.stringify(profile) });
+      showError($("#sidebar-error"), "");
+      const result = await api("/api/profiles", { method: "POST", body: JSON.stringify(profile) });
+      const savedId = result.id || profile.id;
+      state.editingProfileId = null;
       $("#modal-connection").close();
       await loadProfiles();
-      await enterApp();
+      setStatus("Connection saved");
+      if (!wasEdit) {
+        const saved = state.profiles.find((p) => p.id === savedId);
+        if (saved) {
+          state.selectedProfileId = saved.id;
+          renderProfiles();
+          await accessConnection(saved);
+        }
+      }
     } catch (err) {
       alert(err.message);
     }
@@ -656,38 +1946,27 @@ function wire() {
     const base = state.pendingProfile;
     if (!base) return;
     try {
+      setStatus("Connecting…");
       await api("/api/connect/" + encodeURIComponent(base.id), {
         method: "POST",
         body: JSON.stringify({
           username: form.username.value.trim(),
           password: form.password.value,
           savePassword: form.savePassword.checked,
+          sshUsername: form.sshUsername ? form.sshUsername.value.trim() : undefined,
+          sshPassword: form.sshPassword ? form.sshPassword.value : undefined,
+          saveSshPassword: form.saveSshPassword ? form.saveSshPassword.checked : undefined,
         }),
       });
       $("#modal-password").close();
-      await loadProfiles();
-      await enterApp();
+      showError($("#sidebar-error"), "");
+      await onConnected();
     } catch (err) {
+      setStatus("Connection failed");
       alert(err.message);
     }
   };
 
-  $("#btn-disconnect").onclick = async () => {
-    await api("/api/disconnect", { method: "POST", body: "{}" });
-    state.connected = false;
-    state.currentSchema = null;
-    state.currentTable = null;
-    state.result = null;
-    state.page = 1;
-    updateContextMeta("");
-    $("#context-title").textContent = "SQL Editor";
-    showGate(true);
-    await loadProfiles();
-    setStatus("Disconnected");
-  };
-
-  $("#btn-refresh-tree").onclick = () => loadTree().catch((e) => setStatus(e.message));
-  $("#explorer-filter").oninput = () => loadTree().catch(console.error);
   $("#btn-run").onclick = () => runSql();
   $("#btn-clear-sql").onclick = () => { $("#sql-editor").value = ""; };
   $("#sql-editor").addEventListener("keydown", (e) => {
@@ -715,22 +1994,35 @@ function wire() {
 
 async function boot() {
   wire();
+  setConnectedUi(false);
   await loadDbTypes();
-  const session = await api("/api/session");
-  if (session.connected) {
-    state.session = session;
-    showGate(false);
-    $("#session-meta").textContent = session.profile
-      ? `${session.profile.displayType} · ${session.profile.username}`
+  await loadProfiles();
+  const session = await syncSessionState();
+  if (session.connected || (session.sessions || []).length) {
+    for (const s of session.sessions || []) {
+      if (s.id) setExpanded(s.id, true);
+    }
+    if (session.activeId) {
+      state.selectedProfileId = session.activeId;
+      setExpanded(session.activeId, true);
+    } else if (session.profile?.id) {
+      state.selectedProfileId = session.profile.id;
+      setExpanded(session.profile.id, true);
+    }
+    setConnectedUi(true);
+    const p = session.profile;
+    $("#session-meta").textContent = p
+      ? `${p.displayType}${p.connectionModeLabel ? " · " + p.connectionModeLabel : ""} · ${p.username}@${p.host || "file"} / ${p.database || ""}`
       : "";
-    await loadTree();
+    renderProfiles();
+    const count = Object.keys(state.connectedIds).length;
+    setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
   } else {
-    showGate(true);
-    await loadProfiles();
+    setStatus("Ready");
   }
 }
 
 boot().catch((e) => {
   console.error(e);
-  showError($("#gate-error"), e.message);
+  showError($("#sidebar-error"), e.message);
 });
