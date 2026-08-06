@@ -28,6 +28,7 @@ const state = {
   activeConnectionId: null,
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
+  importPicked: null,
 };
 
 async function api(path, options = {}) {
@@ -38,6 +39,8 @@ async function api(path, options = {}) {
     headers["X-Connection-Id"] = decodeURIComponent(q[1]);
   } else if (options.connectionId) {
     headers["X-Connection-Id"] = options.connectionId;
+  } else if (state.activeConnectionId) {
+    headers["X-Connection-Id"] = state.activeConnectionId;
   }
   const { connectionId: _cid, headers: _h, ...rest } = options;
   const res = await fetch(path, {
@@ -200,11 +203,10 @@ function profileDetail(p) {
   if (p.fileBased || ["SQLITE", "H2_FILE"].includes(p.dbType)) {
     return `${p.displayType} · ${fileBaseName(p.database) || ""}`;
   }
-  const hierarchy = p.connectionMode === "THREE_LAYER" ? "3-layer" : "2-layer";
   if (p.useSshTunnel || p.sshTunnel) {
-    return `${p.displayType} · ${hierarchy} · ${p.host} via ${p.sshHost || "SSH"}`;
+    return `${p.displayType} · ${p.host} via ${p.sshHost || "SSH"}`;
   }
-  return `${p.displayType} · ${hierarchy} · ${p.host}${p.database ? " / " + p.database : ""}`;
+  return `${p.displayType} · ${p.host}${p.database ? " / " + p.database : ""}`;
 }
 
 function isLiveProfile(p) {
@@ -342,8 +344,8 @@ async function toggleConnectionNode(profile) {
   await accessConnection(profile);
 }
 
-/** Open a saved connection — prompts for password unless already live. */
-async function accessConnection(profile) {
+/** Open a saved connection — prompts for password unless already live or password is saved. */
+async function accessConnection(profile, credentials = null) {
   showError($("#sidebar-error"), "");
   state.selectedProfileId = profile.id;
   renderProfiles();
@@ -368,6 +370,22 @@ async function accessConnection(profile) {
     });
     await onConnected();
     return;
+  }
+
+  // Connect with credentials from the add/edit form, or stored password — skip re-prompt.
+  if (credentials || profile.hasPassword) {
+    setStatus("Connecting…");
+    try {
+      await api("/api/connect/" + encodeURIComponent(profile.id), {
+        method: "POST",
+        body: JSON.stringify(credentials || {}),
+      });
+      await onConnected();
+      return;
+    } catch (err) {
+      if (credentials) throw err;
+      // Stored password failed — fall through to prompt.
+    }
   }
 
   openPasswordModal(profile);
@@ -432,14 +450,17 @@ async function disconnectCurrent(profileId) {
 async function deleteConnection(profile) {
   const ok = confirm(`Delete connection “${profile.name || "Untitled"}”?`);
   if (!ok) return;
-  const wasLive = isLiveProfile(profile);
-  if (wasLive) {
-    await api("/api/disconnect/" + encodeURIComponent(profile.id), { method: "POST", body: "{}" });
+  try {
+    await api("/api/disconnect/" + encodeURIComponent(profile.id), { method: "POST", body: "{}" }).catch(() => {});
+  } finally {
     delete state.connectedIds[profile.id];
     setExpanded(profile.id, false);
   }
   await api("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" });
   if (state.selectedProfileId === profile.id) state.selectedProfileId = null;
+  if (state.activeConnectionId === profile.id) {
+    state.activeConnectionId = Object.keys(state.connectedIds)[0] || null;
+  }
   showError($("#sidebar-error"), "");
   state.connected = Object.keys(state.connectedIds).length > 0;
   if (!state.connected) {
@@ -448,6 +469,7 @@ async function deleteConnection(profile) {
     await syncSessionState();
   }
   await loadProfiles();
+  setStatus("Connection deleted");
 }
 
 /* ── Explorer tree (under a connection) ──────────── */
@@ -504,7 +526,7 @@ function renderExplorerNode(node, layout, connectionId) {
     e.stopPropagation();
     const rect = more.getBoundingClientRect();
     state.activeConnectionId = connectionId;
-    showDbContextMenu(rect.left, rect.bottom + 4, node.schema || node.name);
+    showDbContextMenu(rect.left, rect.bottom + 4, node.schema || node.name, kind);
   };
   row.appendChild(more);
 
@@ -575,7 +597,7 @@ function renderExplorerNode(node, layout, connectionId) {
     e.preventDefault();
     e.stopPropagation();
     state.activeConnectionId = connectionId;
-    showDbContextMenu(e.clientX, e.clientY, node.schema || node.name);
+    showDbContextMenu(e.clientX, e.clientY, node.schema || node.name, kind);
   };
 
   wrap.append(row, kids);
@@ -607,7 +629,6 @@ async function loadDbTypes() {
   sel.innerHTML = state.dbTypes.map((t) =>
     `<option value="${t.id}">${t.name}</option>`).join("");
   sel.onchange = () => updateConnFormForType();
-  $("#connection-mode").onchange = () => updateConnFormForMode();
   $("#use-ssh-tunnel").onchange = () => updateConnFormForMode();
 }
 
@@ -621,64 +642,42 @@ function updateConnFormForType() {
   const form = $("#form-connection");
   if (!state.editingProfileId) {
     form.port.value = type.defaultPort || 0;
-    form.connectionMode.value = defaultHierarchyForType(type.id);
   }
   const fileBased = type.fileBased;
-  const alwaysThree = ["POSTGRESQL", "H2", "H2_FILE"].includes(type.id);
-  const alwaysTwo = fileBased || type.id === "MYSQL";
   form.querySelector(".host-field").style.display = fileBased ? "none" : "";
   form.querySelector(".port-field").style.display = fileBased ? "none" : "";
   form.querySelector(".db-field").querySelector("input").placeholder =
     fileBased ? "/path/to/database.db" : "database name";
 
-  const modeSel = $("#connection-mode");
-  const threeOpt = modeSel.querySelector('option[value="THREE_LAYER"]');
-  const twoOpt = modeSel.querySelector('option[value="TWO_LAYER"]');
   const sshToggle = $("#use-ssh-tunnel");
   const sshWrap = $("#ssh-toggle-wrap");
   if (fileBased) {
-    modeSel.value = "TWO_LAYER";
-    modeSel.disabled = true;
-    if (threeOpt) threeOpt.disabled = true;
-    if (twoOpt) twoOpt.disabled = false;
     if (sshToggle) sshToggle.checked = false;
     if (sshWrap) sshWrap.hidden = true;
-  } else if (alwaysThree) {
-    modeSel.value = "THREE_LAYER";
-    modeSel.disabled = true;
-    if (threeOpt) threeOpt.disabled = false;
-    if (twoOpt) twoOpt.disabled = true;
-    if (sshWrap) sshWrap.hidden = false;
-  } else if (alwaysTwo) {
-    modeSel.value = "TWO_LAYER";
-    modeSel.disabled = true;
-    if (threeOpt) threeOpt.disabled = true;
-    if (twoOpt) twoOpt.disabled = false;
-    if (sshWrap) sshWrap.hidden = false;
-  } else {
-    modeSel.disabled = false;
-    if (threeOpt) threeOpt.disabled = false;
-    if (twoOpt) twoOpt.disabled = false;
-    if (sshWrap) sshWrap.hidden = false;
+  } else if (sshWrap) {
+    sshWrap.hidden = false;
   }
   updateConnFormForMode();
 }
 
 function updateConnFormForMode() {
-  const form = $("#form-connection");
   const type = state.dbTypes.find((t) => t.id === $("#db-type").value);
   const fileBased = type && type.fileBased;
-  const three = form.connectionMode.value === "THREE_LAYER";
   const useSsh = !fileBased && $("#use-ssh-tunnel")?.checked;
   $("#ssh-fields").hidden = !useSsh;
-  if (type && ["POSTGRESQL", "H2", "H2_FILE"].includes(type.id)) {
-    $("#connection-mode-hint").textContent =
-      "PostgreSQL always uses 3-layer: database → schemas → tables.";
-  } else {
-    $("#connection-mode-hint").textContent = three
-      ? "Explorer: database → schemas → tables."
-      : "Explorer: database → tables (typical for MySQL / SQLite).";
+}
+
+function setConnTestStatus(msg, isError = false) {
+  const el = $("#conn-test-status");
+  if (!el) return;
+  if (!msg) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
   }
+  el.hidden = false;
+  el.textContent = msg;
+  el.classList.toggle("error-text", !!isError);
 }
 
 function openNewConnection() {
@@ -689,7 +688,6 @@ function openNewConnection() {
   form.reset();
   form.id.value = "";
   form.dbType.value = "MYSQL";
-  form.connectionMode.value = "TWO_LAYER";
   form.host.value = "localhost";
   form.port.value = 3306;
   form.username.value = "root";
@@ -698,6 +696,7 @@ function openNewConnection() {
   form.sshPort.value = 22;
   form.sshPassword.placeholder = "";
   form.sshPassphrase.placeholder = "";
+  setConnTestStatus("");
   updateConnFormForType();
   $("#modal-connection").showModal();
 }
@@ -711,7 +710,6 @@ function openEditConnection(profile) {
   form.id.value = profile.id;
   form.name.value = profile.name || "";
   form.dbType.value = profile.dbType || "MYSQL";
-  form.connectionMode.value = profile.connectionMode || defaultHierarchyForType(profile.dbType);
   form.host.value = profile.host || "localhost";
   form.port.value = profile.port || 0;
   form.database.value = profile.database || "";
@@ -729,8 +727,8 @@ function openEditConnection(profile) {
   form.sshPassphrase.value = "";
   form.sshPassphrase.placeholder = profile.hasSshPassphrase ? "Leave blank to keep existing" : "";
   form.saveSshPassword.checked = !!profile.saveSshPassword;
+  setConnTestStatus("");
   updateConnFormForType();
-  form.connectionMode.value = profile.connectionMode || defaultHierarchyForType(profile.dbType);
   form.useSshTunnel.checked = !!profile.useSshTunnel;
   updateConnFormForMode();
   $("#modal-connection").showModal();
@@ -758,7 +756,7 @@ function readConnectionForm(form) {
   const profile = {
     name: form.name.value.trim() || undefined,
     dbType: form.dbType.value,
-    connectionMode: form.connectionMode.value || "TWO_LAYER",
+    connectionMode: defaultHierarchyForType(form.dbType.value),
     host: form.host.value.trim(),
     port: Number(form.port.value) || 0,
     database: form.database.value.trim(),
@@ -857,14 +855,18 @@ function positionContextMenu(menu, x, y) {
   });
 }
 
-function showDbContextMenu(x, y, db) {
+function showDbContextMenu(x, y, db, kind = "database") {
   for (const sel of CTX_MENUS) {
     const menu = $(sel);
     if (menu) menu.hidden = true;
   }
   state.contextDb = db;
-  state.contextTarget = { type: "db", schema: db };
-  positionContextMenu($("#ctx-menu-db"), x, y);
+  state.contextTarget = { type: "db", schema: db, kind };
+  const menu = $("#ctx-menu-db");
+  const isSchema = kind === "schema";
+  menu.querySelectorAll(".ctx-db-only").forEach((el) => { el.hidden = isSchema; });
+  menu.querySelectorAll(".ctx-schema-only").forEach((el) => { el.hidden = !isSchema; });
+  positionContextMenu(menu, x, y);
 }
 
 function showFolderContextMenu(x, y, schema, kind) {
@@ -1015,6 +1017,7 @@ function openExportModal({ schema, table = "", scope = "table" }) {
 
 function openImportModal({ schema, table = "", mode = "table" }) {
   hideAllContextMenus();
+  state.importPicked = null;
   $("#import-title").textContent = mode === "sql" ? "Import SQL script" : `Import into ${table}`;
   $("#import-schema").value = schema || "";
   $("#import-table").value = table || "";
@@ -1024,6 +1027,8 @@ function openImportModal({ schema, table = "", mode = "table" }) {
   $("#import-schema").value = schema || "";
   $("#import-table").value = table || "";
   $("#import-mode").value = mode;
+  $("#import-file-name").textContent = "No file selected";
+  $("#import-paste").value = "";
   if (mode === "sql") {
     form.format.value = "sql";
     form.format.disabled = true;
@@ -1035,6 +1040,33 @@ function openImportModal({ schema, table = "", mode = "table" }) {
     $("#import-truncate-wrap").hidden = false;
   }
   $("#modal-import").showModal();
+}
+
+function pickImportFileNative() {
+  try {
+    if (!window.javaApp || typeof window.javaApp.pickImportFile !== "function") {
+      alert("Native file picker unavailable. Paste file contents into the text area instead.");
+      return;
+    }
+    const raw = window.javaApp.pickImportFile();
+    if (!raw) return;
+    const payload = JSON.parse(raw);
+    if (payload.error) {
+      alert(payload.error);
+      return;
+    }
+    state.importPicked = payload;
+    $("#import-file-name").textContent = payload.name || "Selected file";
+    $("#import-paste").value = "";
+    const name = (payload.name || "").toLowerCase();
+    const form = $("#form-import");
+    if (name.endsWith(".json")) form.format.value = "json";
+    else if (name.endsWith(".sql")) form.format.value = "sql";
+    else if (name.endsWith(".xlsx") || name.endsWith(".xls")) form.format.value = "xlsx";
+    else if (name.endsWith(".csv") || name.endsWith(".txt")) form.format.value = "csv";
+  } catch (e) {
+    alert(e.message || "Failed to pick file");
+  }
 }
 
 function addCreateTableColumnRow(defaults = {}) {
@@ -1758,9 +1790,29 @@ function wire() {
   $("#btn-new-connection").onclick = openNewConnection;
   $("#btn-cancel-conn").onclick = () => {
     state.editingProfileId = null;
+    setConnTestStatus("");
     $("#modal-connection").close();
   };
+  $("#btn-test-conn").onclick = async () => {
+    const form = $("#form-connection");
+    const profile = readConnectionForm(form);
+    const btn = $("#btn-test-conn");
+    btn.disabled = true;
+    setConnTestStatus("Testing connection…");
+    try {
+      const result = await api("/api/profiles/test", {
+        method: "POST",
+        body: JSON.stringify(profile),
+      });
+      setConnTestStatus(result.message || "Connection successful");
+    } catch (err) {
+      setConnTestStatus(err.message || "Connection test failed", true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
   $("#btn-cancel-pw").onclick = () => $("#modal-password").close();
+  $("#btn-import-browse").onclick = () => pickImportFileNative();
   $("#btn-close-db-props").onclick = () => $("#modal-db-props").close();
   $("#btn-cancel-db-admin").onclick = () => $("#modal-db-admin").close();
   $("#btn-cancel-schema").onclick = () => $("#modal-schema").close();
@@ -1980,39 +2032,70 @@ function wire() {
   $("#form-import").onsubmit = async (e) => {
     e.preventDefault();
     const form = e.target;
-    const file = form.file.files?.[0];
-    if (!file) {
-      alert("Choose a file to import");
+    const picked = state.importPicked;
+    const paste = (form.paste?.value || "").trim();
+    if (!picked && !paste) {
+      alert("Choose a file or paste content to import");
+      return;
+    }
+    if (!form.schema.value && form.mode.value !== "sql" && form.format.value !== "sql") {
+      alert("Missing database/schema for import");
+      return;
+    }
+    if (!form.table.value && form.mode.value !== "sql" && form.format.value !== "sql") {
+      alert("Missing table name for import");
       return;
     }
     try {
       setStatus("Importing…");
       const format = form.format.value;
       const isExcel = format === "xlsx" || format === "excel";
-      const content = isExcel ? await readFileAsBase64(file) : await readFileAsText(file);
+      let content;
+      let base64 = false;
+      if (picked) {
+        content = picked.content;
+        base64 = !!picked.base64 || isExcel;
+      } else {
+        content = paste;
+        base64 = false;
+        if (isExcel) {
+          alert("Excel import requires Choose file… (paste is for CSV/JSON/SQL).");
+          return;
+        }
+      }
+      const connOpts = state.activeConnectionId ? { connectionId: state.activeConnectionId } : {};
       if (form.mode.value === "sql" || format === "sql") {
         const result = await api("/api/import/sql", {
           method: "POST",
           body: JSON.stringify({ sql: content }),
+          ...connOpts,
         });
+        state.importPicked = null;
         $("#modal-import").close();
         await loadTree();
         setStatus(result.message || "SQL imported");
         return;
       }
-      const result = await api(`/api/databases/${encodeURIComponent(form.schema.value)}/tables/${encodeURIComponent(form.table.value)}/import`, {
-        method: "POST",
-        body: JSON.stringify({
-          format,
-          content,
-          base64: isExcel,
-          truncate: form.truncate.checked,
-          headerRow: form.headerRow.checked,
-        }),
-      });
+      const result = await api(
+        `/api/databases/${encodeURIComponent(form.schema.value)}/tables/${encodeURIComponent(form.table.value)}/import`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            format,
+            content,
+            base64,
+            truncate: form.truncate.checked,
+            headerRow: form.headerRow.checked,
+          }),
+          ...connOpts,
+        }
+      );
+      state.importPicked = null;
       $("#modal-import").close();
       if (state.currentSchema === form.schema.value && state.currentTable === form.table.value) {
         await openTable(form.schema.value, form.table.value);
+      } else {
+        await loadTree();
       }
       setStatus(`Imported ${result.imported || 0} row(s)` + (result.failed ? `, ${result.failed} failed` : ""));
       if (result.errors?.length) {
@@ -2028,11 +2111,14 @@ function wire() {
     const form = e.target;
     const profile = readConnectionForm(form);
     const wasEdit = !!state.editingProfileId;
+    const typedPassword = profile.password;
+    const typedSshPassword = profile.sshPassword;
     try {
       showError($("#sidebar-error"), "");
       const result = await api("/api/profiles", { method: "POST", body: JSON.stringify(profile) });
       const savedId = result.id || profile.id;
       state.editingProfileId = null;
+      setConnTestStatus("");
       $("#modal-connection").close();
       await loadProfiles();
       setStatus("Connection saved");
@@ -2040,8 +2126,20 @@ function wire() {
         const saved = state.profiles.find((p) => p.id === savedId);
         if (saved) {
           state.selectedProfileId = saved.id;
+          state.pendingExpandProfileId = saved.id;
           renderProfiles();
-          await accessConnection(saved);
+          // Reuse the password just typed so we don't prompt again.
+          const credentials = (typedPassword || typedSshPassword)
+            ? {
+                username: profile.username,
+                password: typedPassword || undefined,
+                savePassword: profile.savePassword,
+                sshUsername: profile.sshUsername || undefined,
+                sshPassword: typedSshPassword || undefined,
+                saveSshPassword: profile.saveSshPassword,
+              }
+            : null;
+          await accessConnection(saved, credentials);
         }
       }
     } catch (err) {

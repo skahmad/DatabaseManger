@@ -143,13 +143,6 @@
         <label>Type
           <select name="dbType" id="db-type" class="input"></select>
         </label>
-        <label class="span-2">Object hierarchy
-          <select name="connectionMode" id="connection-mode" class="input">
-            <option value="TWO_LAYER">2-layer — database → tables</option>
-            <option value="THREE_LAYER">3-layer — database → schemas → tables</option>
-          </select>
-        </label>
-        <p class="form-hint span-2" id="connection-mode-hint">Explorer shows databases with tables directly underneath.</p>
         <label class="host-field">Host <input name="host" class="input" value="localhost" /></label>
         <label class="port-field">Port <input name="port" type="number" class="input" value="3306" /></label>
         <label class="db-field span-2">Database / file <input name="database" class="input" placeholder="database name or file path" /></label>
@@ -174,8 +167,10 @@
         </div>
       </fieldset>
 
+      <p class="form-hint span-2" id="conn-test-status" hidden></p>
       <div class="modal-actions">
         <button type="button" class="btn ghost" id="btn-cancel-conn">Cancel</button>
+        <button type="button" class="btn ghost" id="btn-test-conn">Test connection</button>
         <button type="submit" class="btn primary" id="btn-submit-conn">Save</button>
       </div>
     </form>
@@ -215,21 +210,20 @@
     <button type="button" class="ctx-item danger" data-action="conn-delete" role="menuitem">Delete…</button>
   </div>
 
-  <!-- Context menu: database -->
+  <!-- Context menu: database / schema (items toggled by kind in app.js) -->
   <div id="ctx-menu-db" class="ctx-menu" hidden role="menu">
     <button type="button" class="ctx-item" data-action="properties" role="menuitem">Properties</button>
-    <button type="button" class="ctx-item" data-action="create-db" role="menuitem">Create database…</button>
-    <button type="button" class="ctx-item" data-action="create-schema" role="menuitem">Create schema…</button>
+    <button type="button" class="ctx-item ctx-db-only" data-action="create-schema" role="menuitem">Create schema…</button>
     <button type="button" class="ctx-item" data-action="create-table" role="menuitem">Create table…</button>
     <button type="button" class="ctx-item" data-action="create-view" role="menuitem">Create view…</button>
-    <button type="button" class="ctx-item" data-action="modify-db" role="menuitem">Modify…</button>
-    <button type="button" class="ctx-item" data-action="clone-db" role="menuitem">Clone / migrate…</button>
-    <button type="button" class="ctx-item" data-action="export-db" role="menuitem">Export SQL…</button>
+    <button type="button" class="ctx-item ctx-db-only" data-action="modify-db" role="menuitem">Modify…</button>
+    <button type="button" class="ctx-item ctx-db-only" data-action="clone-db" role="menuitem">Clone / migrate…</button>
+    <button type="button" class="ctx-item ctx-db-only" data-action="export-db" role="menuitem">Export SQL…</button>
     <button type="button" class="ctx-item" data-action="import-sql" role="menuitem">Import SQL…</button>
     <button type="button" class="ctx-item" data-action="import-table" role="menuitem">Import data…</button>
     <hr class="ctx-sep" />
-    <button type="button" class="ctx-item danger" data-action="drop-db" role="menuitem">Drop database…</button>
-    <button type="button" class="ctx-item danger" data-action="drop-schema" role="menuitem">Drop schema…</button>
+    <button type="button" class="ctx-item danger ctx-db-only" data-action="drop-db" role="menuitem">Drop database…</button>
+    <button type="button" class="ctx-item danger ctx-schema-only" data-action="drop-schema" role="menuitem">Drop schema…</button>
   </div>
 
   <!-- Context menu: tables folder -->
@@ -427,7 +421,13 @@
           <option value="xlsx">Excel (XLSX)</option>
         </select>
       </label>
-      <label>File <input name="file" type="file" class="input" id="import-file" accept=".csv,.json,.sql,.xlsx,.xls,text/csv,application/json" /></label>
+      <div class="import-file-row">
+        <button type="button" class="btn ghost" id="btn-import-browse">Choose file…</button>
+        <span id="import-file-name" class="form-hint">No file selected</span>
+      </div>
+      <label class="span-2">Or paste content
+        <textarea name="paste" id="import-paste" class="input" rows="6" placeholder="CSV / JSON / SQL text…"></textarea>
+      </label>
       <label class="check" id="import-header-wrap"><input type="checkbox" name="headerRow" checked /> First row is header</label>
       <label class="check" id="import-truncate-wrap"><input type="checkbox" name="truncate" /> Truncate table before import</label>
       <div class="modal-actions">
