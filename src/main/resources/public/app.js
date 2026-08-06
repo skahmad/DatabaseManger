@@ -32,7 +32,30 @@ const state = {
   /** Workspace tabs: DB/SCH context tab (transient) + closable table tabs. */
   workspaceTabs: [],
   activeWorkspaceTabId: null,
+  /** Column names hidden in the Data grid (for current result). */
+  hiddenColumns: {},
+  /** Per-column filters: { [col]: { op, value } } */
+  columnFilters: {},
+  /** Column name currently shown in the filter popup. */
+  filterPopupColumn: null,
 };
+
+const COLUMN_FILTER_OPS = [
+  { id: "contains", label: "contains", needsValue: true },
+  { id: "not_contains", label: "does not contain", needsValue: true },
+  { id: "eq", label: "equals", needsValue: true },
+  { id: "neq", label: "not equal", needsValue: true },
+  { id: "starts", label: "starts with", needsValue: true },
+  { id: "ends", label: "ends with", needsValue: true },
+  { id: "gt", label: "greater than", needsValue: true },
+  { id: "gte", label: "≥", needsValue: true },
+  { id: "lt", label: "less than", needsValue: true },
+  { id: "lte", label: "≤", needsValue: true },
+  { id: "empty", label: "is empty", needsValue: false },
+  { id: "not_empty", label: "is not empty", needsValue: false },
+  { id: "null", label: "is null", needsValue: false },
+  { id: "not_null", label: "is not null", needsValue: false },
+];
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -1652,8 +1675,13 @@ function showEmptyWorkspace() {
   state.columns = [];
   state.result = null;
   state.page = 1;
+  state.hiddenColumns = {};
+  state.columnFilters = {};
+  closeColumnFilterPopup();
   updateRunButton();
   updateContextMeta("");
+  closeColumnVisibilityMenu();
+  updateClearFiltersButton();
   $("#data-context").textContent = "No table selected";
   $("#sql-editor").value = "";
   $("#ddl-view").textContent = "Select a table and open DDL.";
@@ -1678,6 +1706,8 @@ function snapshotActiveWorkspaceTab() {
   tab.columns = state.columns;
   tab.result = state.result;
   tab.page = state.page;
+  tab.hiddenColumns = { ...(state.hiddenColumns || {}) };
+  tab.columnFilters = { ...(state.columnFilters || {}) };
   tab.sql = $("#sql-editor")?.value ?? tab.sql;
   tab.ddl = $("#ddl-view")?.textContent ?? tab.ddl;
   tab.detailFocus = { ...(state.detailFocus || {}) };
@@ -1761,6 +1791,11 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     state.columns = [];
     state.result = null;
     state.page = 1;
+    state.hiddenColumns = {};
+    state.columnFilters = {};
+    closeColumnFilterPopup();
+    closeColumnVisibilityMenu();
+    updateClearFiltersButton();
     if (tab.detailFocus) state.detailFocus = { ...tab.detailFocus };
     tab.title = contextTabTitle(state.detailFocus);
     renderWorkspaceTabs();
@@ -1782,6 +1817,11 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
   updateRunButton();
   $("#data-context").textContent = `${tab.schema} · ${tab.table}`;
   updateContextMeta(`${tab.schema} · ${tab.table}`);
+
+  state.hiddenColumns = { ...(tab.hiddenColumns || {}) };
+  state.columnFilters = { ...(tab.columnFilters || {}) };
+  closeColumnFilterPopup();
+  updateClearFiltersButton();
 
   const hasCache = !forceReload && tab.columns && tab.result;
   if (hasCache) {
@@ -1836,6 +1876,10 @@ async function loadTableIntoActiveTab(tab) {
   state.columns = cols;
   state.result = rows;
   state.page = 1;
+  // Keep prior hide choices for this tab; drop names that no longer exist.
+  state.hiddenColumns = { ...(live.hiddenColumns || {}) };
+  pruneHiddenColumns(rows.columns || []);
+  live.hiddenColumns = { ...state.hiddenColumns };
   state.currentSchema = schema;
   state.currentTable = table;
   $("#sql-editor").value = sql;
@@ -1927,16 +1971,8 @@ function quoteIdent(name) {
   return `"${name.replaceAll('"', '""')}"`;
 }
 
-function updateContextMeta(text) {
-  const el = $("#context-meta");
-  if (!el) return;
-  if (!text) {
-    el.textContent = "";
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  el.textContent = text;
+function updateContextMeta(_text) {
+  // Context summary lives in the status bar only (not the tab bar).
 }
 
 function setDetailFocus({
@@ -2060,12 +2096,322 @@ async function focusHomeDetails(focus) {
   await applyWorkspaceTab(tab.id);
 }
 
+function compareFilterValues(cell, target) {
+  const aNum = Number(cell);
+  const bNum = Number(target);
+  if (cell !== "" && target !== "" && Number.isFinite(aNum) && Number.isFinite(bNum)) {
+    return aNum - bNum;
+  }
+  return String(cell).localeCompare(String(target), undefined, { sensitivity: "base", numeric: true });
+}
+
+function rowMatchesColumnFilter(value, filter) {
+  if (!filter || !filter.op) return true;
+  const op = filter.op;
+  const target = filter.value ?? "";
+
+  if (op === "null") return value == null;
+  if (op === "not_null") return value != null;
+
+  if (value == null) {
+    // NULL is only matched by null / not_null (already handled).
+    return false;
+  }
+
+  const text = String(value);
+  const textLower = text.toLowerCase();
+  const targetLower = String(target).toLowerCase();
+
+  switch (op) {
+    case "empty":
+      return text.trim() === "";
+    case "not_empty":
+      return text.trim() !== "";
+    case "contains":
+      return target === "" ? true : textLower.includes(targetLower);
+    case "not_contains":
+      return target === "" ? true : !textLower.includes(targetLower);
+    case "eq":
+      return textLower === targetLower;
+    case "neq":
+      return textLower !== targetLower;
+    case "starts":
+      return target === "" ? true : textLower.startsWith(targetLower);
+    case "ends":
+      return target === "" ? true : textLower.endsWith(targetLower);
+    case "gt":
+      return target === "" ? true : compareFilterValues(text, target) > 0;
+    case "gte":
+      return target === "" ? true : compareFilterValues(text, target) >= 0;
+    case "lt":
+      return target === "" ? true : compareFilterValues(text, target) < 0;
+    case "lte":
+      return target === "" ? true : compareFilterValues(text, target) <= 0;
+    default:
+      return true;
+  }
+}
+
+function activeColumnFilterCount() {
+  return Object.values(state.columnFilters || {}).filter(isColumnFilterActive).length;
+}
+
+function updateClearFiltersButton() {
+  const clearBtn = $("#btn-clear-filters");
+  if (clearBtn) clearBtn.hidden = activeColumnFilterCount() === 0;
+}
+
+function isColumnFilterActive(filter) {
+  if (!filter?.op) return false;
+  const meta = COLUMN_FILTER_OPS.find((o) => o.id === filter.op);
+  if (!meta) return false;
+  if (!meta.needsValue) return true;
+  return (filter.value ?? "") !== "";
+}
+
+function persistColumnFilters() {
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (tab) tab.columnFilters = { ...(state.columnFilters || {}) };
+}
+
+function setColumnFilter(column, op, value) {
+  if (!state.columnFilters) state.columnFilters = {};
+  const meta = COLUMN_FILTER_OPS.find((o) => o.id === op) || COLUMN_FILTER_OPS[0];
+  if (meta.needsValue && (value ?? "") === "") {
+    delete state.columnFilters[column];
+  } else {
+    state.columnFilters[column] = {
+      op: meta.id,
+      value: meta.needsValue ? (value ?? "") : "",
+    };
+  }
+  persistColumnFilters();
+  state.page = 1;
+  updateClearFiltersButton();
+  renderData(state.result);
+}
+
+function clearColumnFilter(column) {
+  if (!state.columnFilters) state.columnFilters = {};
+  delete state.columnFilters[column];
+  persistColumnFilters();
+  state.page = 1;
+  updateClearFiltersButton();
+  renderData(state.result);
+}
+
+function clearColumnFilters() {
+  state.columnFilters = {};
+  persistColumnFilters();
+  state.page = 1;
+  closeColumnFilterPopup();
+  updateClearFiltersButton();
+  renderData(state.result);
+}
+
+function opNeedsValue(op) {
+  return !!(COLUMN_FILTER_OPS.find((o) => o.id === op)?.needsValue);
+}
+
+function syncFilterPopupValueEnabled() {
+  const opSel = $("#col-filter-op");
+  const valueInput = $("#col-filter-value");
+  if (!opSel || !valueInput) return;
+  const needs = opNeedsValue(opSel.value);
+  valueInput.disabled = !needs;
+  if (!needs) valueInput.value = "";
+}
+
+function closeColumnFilterPopup() {
+  const popup = $("#col-filter-popup");
+  if (popup) popup.hidden = true;
+  state.filterPopupColumn = null;
+}
+
+function positionColumnFilterPopup(anchorEl) {
+  const popup = $("#col-filter-popup");
+  if (!popup || !anchorEl) return;
+  popup.hidden = false;
+  const rect = anchorEl.getBoundingClientRect();
+  const pad = 8;
+  const width = popup.offsetWidth || 264;
+  const height = popup.offsetHeight || 200;
+  let left = rect.left;
+  let top = rect.bottom + 6;
+  if (left + width > window.innerWidth - pad) left = window.innerWidth - width - pad;
+  if (left < pad) left = pad;
+  if (top + height > window.innerHeight - pad) top = Math.max(pad, rect.top - height - 6);
+  popup.style.left = `${Math.round(left)}px`;
+  popup.style.top = `${Math.round(top)}px`;
+}
+
+function openColumnFilterPopup(column, anchorEl) {
+  const popup = $("#col-filter-popup");
+  const title = $("#col-filter-title");
+  const opSel = $("#col-filter-op");
+  const valueInput = $("#col-filter-value");
+  if (!popup || !opSel || !valueInput) return;
+
+  state.filterPopupColumn = column;
+  if (title) title.textContent = column;
+  const current = state.columnFilters?.[column] || { op: "contains", value: "" };
+  opSel.value = current.op || "contains";
+  valueInput.value = current.value || "";
+  syncFilterPopupValueEnabled();
+  positionColumnFilterPopup(anchorEl);
+  requestAnimationFrame(() => {
+    if (opNeedsValue(opSel.value)) valueInput.focus();
+    else opSel.focus();
+  });
+}
+
+function applyColumnFilterFromPopup() {
+  const column = state.filterPopupColumn;
+  if (!column) return;
+  const op = $("#col-filter-op")?.value || "contains";
+  const value = $("#col-filter-value")?.value ?? "";
+  setColumnFilter(column, op, value);
+  closeColumnFilterPopup();
+}
+
 function filteredRows(result) {
   const q = ($("#data-search").value || "").toLowerCase();
-  if (!q) return result.rows || [];
-  return (result.rows || []).filter((row) =>
-    Object.values(row).some((v) => String(v ?? "").toLowerCase().includes(q))
+  const cols = result.columns || [];
+  const filterEntries = Object.entries(state.columnFilters || {}).filter(
+    ([col, f]) => cols.includes(col) && isColumnFilterActive(f)
   );
+
+  return (result.rows || []).filter((row) => {
+    if (q) {
+      const hit = Object.values(row).some((v) => String(v ?? "").toLowerCase().includes(q));
+      if (!hit) return false;
+    }
+    for (const [col, filter] of filterEntries) {
+      if (!rowMatchesColumnFilter(row[col], filter)) return false;
+    }
+    return true;
+  });
+}
+
+function initColumnFilterPopup() {
+  const opSel = $("#col-filter-op");
+  if (!opSel || opSel.options.length) return;
+  for (const op of COLUMN_FILTER_OPS) {
+    const opt = document.createElement("option");
+    opt.value = op.id;
+    opt.textContent = op.label;
+    opSel.appendChild(opt);
+  }
+}
+
+function visibleColumns(columns) {
+  const cols = columns || [];
+  const hidden = state.hiddenColumns || {};
+  const visible = cols.filter((c) => !hidden[c]);
+  // Keep at least one column so the grid never goes blank.
+  return visible.length ? visible : cols.slice(0, 1);
+}
+
+function hiddenColumnCount(columns) {
+  const cols = columns || [];
+  return cols.filter((c) => state.hiddenColumns?.[c]).length;
+}
+
+function pruneHiddenColumns(columns) {
+  const allowed = new Set(columns || []);
+  const next = {};
+  for (const [name, on] of Object.entries(state.hiddenColumns || {})) {
+    if (on && allowed.has(name)) next[name] = true;
+  }
+  // Never hide every column.
+  if (allowed.size && Object.keys(next).length >= allowed.size) {
+    const keep = columns[0];
+    delete next[keep];
+  }
+  state.hiddenColumns = next;
+}
+
+function updateColumnsButton(columns) {
+  const btn = $("#btn-columns");
+  if (!btn) return;
+  const total = (columns || state.result?.columns || []).length;
+  const hidden = hiddenColumnCount(columns || state.result?.columns || []);
+  btn.textContent = hidden ? `Columns (${hidden} hidden)` : "Columns";
+  btn.disabled = !total;
+}
+
+function closeColumnVisibilityMenu() {
+  const menu = $("#col-visibility-menu");
+  if (menu) menu.hidden = true;
+}
+
+function renderColumnVisibilityList(columns) {
+  const list = $("#col-visibility-list");
+  if (!list) return;
+  list.innerHTML = "";
+  const cols = columns || state.result?.columns || [];
+  if (!cols.length) {
+    list.innerHTML = `<div class="hint" style="padding:.35rem">No columns</div>`;
+    return;
+  }
+  pruneHiddenColumns(cols);
+  for (const name of cols) {
+    const label = document.createElement("label");
+    label.className = "col-vis-item";
+    const checked = !state.hiddenColumns?.[name];
+    label.innerHTML =
+      `<input type="checkbox" ${checked ? "checked" : ""} />`
+      + `<span title="${escapeHtml(name)}">${escapeHtml(name)}</span>`;
+    const input = label.querySelector("input");
+    input.onchange = () => {
+      if (!state.hiddenColumns) state.hiddenColumns = {};
+      if (input.checked) {
+        delete state.hiddenColumns[name];
+      } else {
+        // Prevent hiding the last visible column.
+        if (visibleColumns(cols).length <= 1 && !state.hiddenColumns[name]) {
+          input.checked = true;
+          return;
+        }
+        state.hiddenColumns[name] = true;
+      }
+      const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+      if (tab) tab.hiddenColumns = { ...state.hiddenColumns };
+      updateColumnsButton(cols);
+      renderData(state.result);
+      renderColumnVisibilityList(cols);
+    };
+    list.appendChild(label);
+  }
+  updateColumnsButton(cols);
+}
+
+function toggleColumnVisibilityMenu() {
+  const menu = $("#col-visibility-menu");
+  if (!menu) return;
+  const open = menu.hidden;
+  if (open) {
+    renderColumnVisibilityList(state.result?.columns || []);
+    menu.hidden = false;
+  } else {
+    menu.hidden = true;
+  }
+}
+
+function setAllColumnsVisible(show) {
+  const cols = state.result?.columns || [];
+  if (!cols.length) return;
+  if (show) {
+    state.hiddenColumns = {};
+  } else {
+    const hidden = {};
+    for (let i = 1; i < cols.length; i++) hidden[cols[i]] = true;
+    state.hiddenColumns = hidden;
+  }
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (tab) tab.hiddenColumns = { ...state.hiddenColumns };
+  renderColumnVisibilityList(cols);
+  renderData(state.result);
 }
 
 function renderData(result) {
@@ -2079,14 +2425,49 @@ function renderData(result) {
     empty.textContent = result?.message || "No data to show.";
     updateContextMeta(result?.message || "");
     updatePager(0, 0, 0, 1);
+    updateColumnsButton([]);
+    updateClearFiltersButton();
+    closeColumnFilterPopup();
+    closeColumnVisibilityMenu();
     return;
   }
   empty.hidden = true;
+  pruneHiddenColumns(result.columns);
+  const columns = visibleColumns(result.columns);
 
   const head = document.createElement("tr");
-  for (const c of result.columns) {
+  for (const c of columns) {
     const th = document.createElement("th");
-    th.textContent = c;
+    th.className = "col-filterable" + (isColumnFilterActive(state.columnFilters?.[c]) ? " col-filtered" : "");
+    th.title = "Click to filter · right-click to hide";
+    const label = document.createElement("span");
+    label.className = "col-name";
+    label.textContent = c;
+    const mark = document.createElement("span");
+    mark.className = "col-filter-mark";
+    mark.textContent = "▾";
+    mark.setAttribute("aria-hidden", "true");
+    th.append(label, mark);
+    th.onclick = (e) => {
+      e.stopPropagation();
+      closeColumnVisibilityMenu();
+      if (state.filterPopupColumn === c && !$("#col-filter-popup")?.hidden) {
+        closeColumnFilterPopup();
+        return;
+      }
+      openColumnFilterPopup(c, th);
+    };
+    th.oncontextmenu = (e) => {
+      e.preventDefault();
+      closeColumnFilterPopup();
+      if (!state.hiddenColumns) state.hiddenColumns = {};
+      if (visibleColumns(result.columns).length <= 1) return;
+      state.hiddenColumns[c] = true;
+      const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+      if (tab) tab.hiddenColumns = { ...state.hiddenColumns };
+      updateColumnsButton(result.columns);
+      renderData(result);
+    };
     head.appendChild(th);
   }
   thead.appendChild(head);
@@ -2101,7 +2482,7 @@ function renderData(result) {
 
   for (const row of pageRows) {
     const tr = document.createElement("tr");
-    for (const c of result.columns) {
+    for (const c of columns) {
       const td = document.createElement("td");
       const v = row[c];
       if (v == null) {
@@ -2126,6 +2507,8 @@ function renderData(result) {
     (result.executionMs != null ? ` · ${result.executionMs} ms` : "")
   );
   updatePager(from, end, rows.length, totalPages);
+  updateColumnsButton(result.columns);
+  updateClearFiltersButton();
 }
 
 function updatePager(from, to, total, totalPages) {
@@ -2660,6 +3043,49 @@ function wire() {
     state.page = 1;
     renderData(state.result);
   };
+  $("#btn-columns").onclick = (e) => {
+    e.stopPropagation();
+    toggleColumnVisibilityMenu();
+  };
+  $("#btn-columns-show-all").onclick = (e) => {
+    e.stopPropagation();
+    setAllColumnsVisible(true);
+  };
+  $("#btn-columns-hide-all").onclick = (e) => {
+    e.stopPropagation();
+    setAllColumnsVisible(false);
+  };
+  initColumnFilterPopup();
+  $("#btn-clear-filters").onclick = () => clearColumnFilters();
+  $("#col-filter-op").onchange = () => syncFilterPopupValueEnabled();
+  $("#col-filter-apply").onclick = () => applyColumnFilterFromPopup();
+  $("#col-filter-clear").onclick = () => {
+    const column = state.filterPopupColumn;
+    if (!column) return;
+    clearColumnFilter(column);
+    closeColumnFilterPopup();
+  };
+  $("#col-filter-value").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      applyColumnFilterFromPopup();
+    }
+  });
+  $("#col-filter-popup")?.addEventListener("pointerdown", (e) => e.stopPropagation());
+  updateClearFiltersButton();
+  $("#col-visibility-menu")?.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("pointerdown", (e) => {
+    if (e.target.closest(".col-vis-wrap")) return;
+    closeColumnVisibilityMenu();
+    if (e.target.closest("#col-filter-popup") || e.target.closest("#data-table thead th.col-filterable")) return;
+    closeColumnFilterPopup();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeColumnFilterPopup();
+  });
+  window.addEventListener("resize", () => {
+    if (state.filterPopupColumn) closeColumnFilterPopup();
+  });
   $("#btn-export-csv").onclick = exportCsv;
   $("#btn-export-json").onclick = exportJson;
   $("#btn-page-prev").onclick = () => {
@@ -2670,7 +3096,11 @@ function wire() {
     state.page += 1;
     renderData(state.result);
   };
-  $$(".tabs .tab").forEach((t) => t.onclick = () => switchTab(t.dataset.tab));
+  $$(".tabs .tab").forEach((t) => t.onclick = () => {
+    closeColumnVisibilityMenu();
+    closeColumnFilterPopup();
+    switchTab(t.dataset.tab);
+  });
 }
 
 async function boot() {
