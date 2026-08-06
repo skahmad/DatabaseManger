@@ -109,13 +109,23 @@ Output: `binary/windows/amd64/` (or `arm64` on ARM Windows)
 | App folder / `.zip` | Portable app-image from jpackage |
 | `.exe` / `.msi` | Installer — needs [WiX Toolset](https://wixtoolset.org/) |
 
-**Portable JAR zip** (can be assembled on macOS; needs JDK 21 on the Windows PC):
+**Standalone zip** (bundled JRE — no Java install on the Windows PC; can build on macOS/Linux):
+
+```bash
+./scripts/build-windows-standalone.sh
+```
+
+```text
+binary/windows/amd64/forge-database-manager-1.0.0-windows-x86_64-standalone.zip
+```
+
+Unzip and run `Forge Database Manager.vbs` (or `Start.vbs`) for no console window. Use `Forge Database Manager.bat` only if you need to see startup errors. Uses the bundled `runtime\` JRE.
+
+**Portable JAR zip** (smaller; needs JDK 21 on the Windows PC PATH):
 
 ```text
 binary/windows/amd64/forge-database-manager-1.0.0-windows-x86_64-portable.zip
 ```
-
-Unzip and run `Forge Database Manager.bat`.
 
 ## Demo
 

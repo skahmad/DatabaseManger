@@ -66,6 +66,7 @@ public class ApiServer {
         app.get("/api/profiles", ctx -> ctx.json(sanitizeProfiles(profiles)));
         app.get("/api/profiles/{id}/properties", this::profileProperties);
         app.post("/api/profiles", this::saveProfile);
+        app.post("/api/profiles/test", this::testProfile);
         app.delete("/api/profiles/{id}", this::deleteProfile);
 
         // Session
@@ -352,8 +353,47 @@ public class ApiServer {
         ctx.json(Map.of("ok", true, "id", incoming.getId()));
     }
 
+    private void testProfile(Context ctx) {
+        ConnectionProfile profile = gson.fromJson(ctx.body(), ConnectionProfile.class);
+        if (profile.getDbType() == null) {
+            profile.setDbType(DbType.MYSQL);
+        }
+        if (profile.getConnectionMode() == null) {
+            profile.setConnectionMode(ConnectionMode.defaultFor(profile.getDbType()));
+        }
+        // When testing an existing saved profile with blank password, reuse stored secrets.
+        if (profile.getId() != null && !profile.getId().isBlank()) {
+            ConnectionProfile existing = profiles.stream()
+                    .filter(p -> profile.getId().equals(p.getId()))
+                    .findFirst()
+                    .orElse(null);
+            if (existing != null) {
+                if (profile.getPassword() == null || profile.getPassword().isBlank()) {
+                    profile.setPassword(existing.getPassword());
+                }
+                if (profile.getSshPassword() == null || profile.getSshPassword().isBlank()) {
+                    profile.setSshPassword(existing.getSshPassword());
+                }
+                if (profile.getSshPassphrase() == null || profile.getSshPassphrase().isBlank()) {
+                    profile.setSshPassphrase(existing.getSshPassphrase());
+                }
+            }
+        }
+        if (profile.getId() == null || profile.getId().isBlank()) {
+            profile.setId("test-" + java.util.UUID.randomUUID());
+        }
+        try {
+            connectionService.testConnection(profile);
+            ctx.json(Map.of("ok", true, "message", "Connection successful"));
+        } catch (Exception e) {
+            ctx.status(HttpStatus.BAD_REQUEST);
+            ctx.json(Map.of("error", e.getMessage() == null ? "Connection test failed" : e.getMessage()));
+        }
+    }
+
     private void deleteProfile(Context ctx) {
         String id = ctx.pathParam("id");
+        connectionService.disconnect(id);
         profiles.removeIf(p -> id.equals(p.getId()));
         connectionStore.save(profiles);
         ctx.json(Map.of("ok", true));

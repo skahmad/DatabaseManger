@@ -37,9 +37,44 @@ public class ConnectionService {
     }
 
     public synchronized void connect(ConnectionProfile profile) throws SQLException {
+        normalizeProfile(profile);
         if (profile.getId() == null || profile.getId().isBlank()) {
             throw new SQLException("Connection profile id is required");
         }
+
+        // Replace only this profile's prior session — keep other connections open.
+        disconnect(profile.getId());
+
+        OpenedConnection opened = openJdbc(profile);
+        try {
+            DbSession session = new DbSession(profile.copy(), opened.connection, opened.tunnel);
+            sessions.put(profile.getId(), session);
+            activeId = profile.getId();
+        } catch (RuntimeException e) {
+            opened.closeQuietly();
+            throw e;
+        }
+    }
+
+    /**
+     * Opens a JDBC connection (and optional SSH tunnel), runs a trivial probe, then closes.
+     * Does not keep a session.
+     */
+    public void testConnection(ConnectionProfile profile) throws SQLException {
+        normalizeProfile(profile);
+        OpenedConnection opened = openJdbc(profile);
+        try (Connection connection = opened.connection) {
+            try (var st = connection.createStatement()) {
+                st.execute("SELECT 1");
+            }
+        } finally {
+            if (opened.tunnel != null) {
+                opened.tunnel.close();
+            }
+        }
+    }
+
+    private void normalizeProfile(ConnectionProfile profile) {
         if (profile.getDbType() != null && profile.getDbType().isFileBased()) {
             profile.setUseSshTunnel(false);
             profile.setConnectionMode(ConnectionMode.TWO_LAYER);
@@ -51,10 +86,12 @@ public class ConnectionService {
         } else if (profile.getConnectionMode() == null) {
             profile.setConnectionMode(ConnectionMode.defaultFor(profile.getDbType()));
         }
+    }
 
-        // Replace only this profile's prior session — keep other connections open.
-        disconnect(profile.getId());
-
+    private OpenedConnection openJdbc(ConnectionProfile profile) throws SQLException {
+        if (profile.getDbType() == null) {
+            throw new SQLException("Database type is required");
+        }
         try {
             Class.forName(profile.getDbType().getDriverClass());
         } catch (ClassNotFoundException e) {
@@ -87,14 +124,34 @@ public class ConnectionService {
         try {
             Connection connection = DriverManager.getConnection(jdbcUrl, props);
             connection.setAutoCommit(true);
-            DbSession session = new DbSession(profile.copy(), connection, tunnel);
-            sessions.put(profile.getId(), session);
-            activeId = profile.getId();
+            return new OpenedConnection(connection, tunnel);
         } catch (SQLException e) {
             if (tunnel != null) {
                 tunnel.close();
             }
             throw e;
+        }
+    }
+
+    private static final class OpenedConnection {
+        private final Connection connection;
+        private final SshTunnelService tunnel;
+
+        private OpenedConnection(Connection connection, SshTunnelService tunnel) {
+            this.connection = connection;
+            this.tunnel = tunnel;
+        }
+
+        private void closeQuietly() {
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (SQLException ignored) {
+                }
+            }
+            if (tunnel != null) {
+                tunnel.close();
+            }
         }
     }
 
