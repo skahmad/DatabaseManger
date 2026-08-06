@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="teal" data-density="comfortable">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Forge Database Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+</head>
+<body>
+  <!-- Connect gate -->
+  <div id="gate" class="gate">
+    <div class="gate-bg"></div>
+    <div class="gate-card">
+      <div class="gate-brand">
+        <div class="logo-mark" aria-hidden="true"></div>
+        <div>
+          <h1>Forge</h1>
+          <p class="gate-tag">Database Manager</p>
+        </div>
+      </div>
+      <p class="gate-lead">Connect to MySQL, PostgreSQL, SQLite, H2, or SQL Server.</p>
+
+      <div class="gate-section">
+        <div class="section-head">
+          <span>Saved connections</span>
+          <button type="button" class="btn ghost" id="btn-refresh-profiles">Refresh</button>
+        </div>
+        <div id="profile-list" class="profile-list"></div>
+      </div>
+
+      <div class="gate-actions">
+        <button type="button" class="btn primary" id="btn-connect-selected" disabled>Connect</button>
+        <button type="button" class="btn" id="btn-new-connection">New connection</button>
+      </div>
+      <p id="gate-error" class="error-text" hidden></p>
+
+      <div class="prefs-bar">
+        <label>View
+          <select class="input pref-density" aria-label="View density">
+            <option value="comfortable">Comfortable</option>
+            <option value="compact">Compact</option>
+          </select>
+        </label>
+        <label>Theme
+          <select class="input pref-theme" aria-label="Theme colors">
+            <option value="teal">Teal</option>
+            <option value="ocean">Ocean</option>
+            <option value="ember">Ember</option>
+            <option value="violet">Violet</option>
+            <option value="slate">Slate</option>
+            <option value="light">Light</option>
+          </select>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main app (hidden until connected) -->
+  <div id="app" class="app" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <div class="logo-mark sm"></div>
+        <div class="sidebar-title">
+          <strong>Forge</strong>
+          <span id="conn-pill" class="pill">connected</span>
+        </div>
+      </div>
+      <div class="sidebar-actions">
+        <button type="button" class="btn primary block" id="btn-disconnect">Disconnect</button>
+      </div>
+      <div class="explorer-head">
+        <span>Explorer</span>
+        <button type="button" class="icon-btn" id="btn-refresh-tree" title="Refresh">↻</button>
+      </div>
+      <input type="search" id="explorer-filter" class="input" placeholder="Filter objects…" />
+      <div id="tree" class="tree"></div>
+      <div class="prefs-bar sidebar-prefs">
+        <label>View
+          <select class="input pref-density" aria-label="View density">
+            <option value="comfortable">Comfortable</option>
+            <option value="compact">Compact</option>
+          </select>
+        </label>
+        <label>Theme
+          <select class="input pref-theme" aria-label="Theme colors">
+            <option value="teal">Teal</option>
+            <option value="ocean">Ocean</option>
+            <option value="ember">Ember</option>
+            <option value="violet">Violet</option>
+            <option value="slate">Slate</option>
+            <option value="light">Light</option>
+          </select>
+        </label>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-title-block">
+          <div class="eyebrow">Workspace</div>
+          <h2 id="context-title">SQL Editor</h2>
+        </div>
+        <p id="context-meta" class="context-meta" hidden></p>
+        <div class="topbar-meta" id="session-meta"></div>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <div class="tabs-left">
+          <button type="button" class="tab active" data-tab="sql">SQL</button>
+          <button type="button" class="tab" data-tab="data">Data</button>
+          <button type="button" class="tab" data-tab="structure">Structure</button>
+          <button type="button" class="tab" data-tab="ddl">DDL</button>
+        </div>
+        <div class="tabs-right">
+          <div class="pager-controls" aria-label="Pagination">
+            <button type="button" class="btn ghost pager-btn" id="btn-page-prev" title="Previous page" aria-label="Previous page" disabled>←</button>
+            <span id="page-info" class="page-info">0 / 0</span>
+            <button type="button" class="btn ghost pager-btn" id="btn-page-next" title="Next page" aria-label="Next page" disabled>→</button>
+          </div>
+          <input type="search" id="data-search" class="input tabs-search" placeholder="Search rows…" />
+          <button type="button" class="btn ghost" id="btn-export-csv">CSV</button>
+          <button type="button" class="btn ghost" id="btn-export-json">JSON</button>
+        </div>
+      </nav>
+
+      <section id="panel-sql" class="panel active">
+        <div class="toolbar">
+          <button type="button" class="btn primary" id="btn-run">▶ Run</button>
+          <button type="button" class="btn ghost" id="btn-clear-sql">Clear</button>
+          <label class="inline-field">Limit <input type="number" id="row-limit" class="input narrow" value="500" min="1" /></label>
+          <span class="hint">⌘/Ctrl + Enter</span>
+        </div>
+        <textarea id="sql-editor" class="sql-editor" spellcheck="false" placeholder="SELECT * FROM users LIMIT 50;"></textarea>
+      </section>
+
+      <section id="panel-data" class="panel">
+        <div class="toolbar">
+          <span id="data-context" class="context-chip">No table selected</span>
+        </div>
+        <div class="table-wrap">
+          <table id="data-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+          <div id="data-empty" class="empty">Open a table or run a query to see results.</div>
+        </div>
+      </section>
+
+      <section id="panel-structure" class="panel">
+        <div class="table-wrap">
+          <table id="structure-table">
+            <thead>
+              <tr>
+                <th>Column</th><th>Type</th><th>Nullable</th><th>PK</th><th>Auto</th><th>Default</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div id="structure-empty" class="empty">Select a table to view structure.</div>
+        </div>
+      </section>
+
+      <section id="panel-ddl" class="panel">
+        <pre id="ddl-view" class="ddl-view">Select a table and open DDL.</pre>
+      </section>
+
+      <footer class="status-bar">
+        <span id="status">Ready</span>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Modal: new / edit connection -->
+  <dialog id="modal-connection" class="modal">
+    <form method="dialog" id="form-connection" class="modal-card">
+      <h3 id="modal-conn-title">New connection</h3>
+      <input type="hidden" name="id" id="conn-id" value="" />
+      <div class="form-grid">
+        <label>Name <input name="name" class="input" placeholder="Local MySQL" /></label>
+        <label>Type
+          <select name="dbType" id="db-type" class="input"></select>
+        </label>
+        <label class="host-field">Host <input name="host" class="input" value="localhost" /></label>
+        <label class="port-field">Port <input name="port" type="number" class="input" value="3306" /></label>
+        <label class="db-field">Database / file <input name="database" class="input" placeholder="database name or file path" /></label>
+        <label>Username <input name="username" class="input" value="root" /></label>
+        <label>Password <input name="password" type="password" class="input" autocomplete="current-password" placeholder="Leave blank to keep existing" /></label>
+        <label class="check"><input type="checkbox" name="savePassword" /> Save password</label>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-conn">Cancel</button>
+        <button type="submit" class="btn primary" id="btn-submit-conn">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal: password prompt -->
+  <dialog id="modal-password" class="modal">
+    <form method="dialog" id="form-password" class="modal-card">
+      <h3>Password required</h3>
+      <p class="gate-lead" id="password-lead">Enter credentials to continue.</p>
+      <label>Username <input name="username" class="input" /></label>
+      <label>Password <input name="password" type="password" class="input" autofocus /></label>
+      <label class="check"><input type="checkbox" name="savePassword" /> Save password</label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-pw">Cancel</button>
+        <button type="submit" class="btn primary">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
