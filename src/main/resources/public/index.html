@@ -47,15 +47,12 @@
     </aside>
 
     <main class="main">
-      <header class="topbar">
-        <div class="topbar-title-block">
-          <div class="eyebrow">Workspace</div>
-          <h2 id="context-title">SQL Editor</h2>
-        </div>
-        <p id="context-meta" class="context-meta" hidden></p>
-      </header>
+      <div class="workspace-tabbar" aria-label="Open workspace tabs">
+        <div id="workspace-tabs" class="workspace-tabs" role="tablist"></div>
+        <p id="context-meta" class="context-meta workspace-meta" hidden></p>
+      </div>
 
-      <nav class="tabs" role="tablist">
+      <nav class="tabs" role="tablist" aria-label="View">
         <div class="tabs-left">
           <button type="button" class="tab active" data-tab="details">Details</button>
           <button type="button" class="tab" data-tab="sql">SQL</button>

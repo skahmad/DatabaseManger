@@ -29,6 +29,11 @@ const state = {
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
   importPicked: null,
+  /** Closable workspace tabs (home/database + open tables). */
+  workspaceTabs: [
+    { id: "home", kind: "home", title: "Database", closable: false, viewMode: "details" },
+  ],
+  activeWorkspaceTabId: "home",
 };
 
 async function api(path, options = {}) {
@@ -326,16 +331,13 @@ async function toggleConnectionNode(profile) {
       body: JSON.stringify({ id: profile.id }),
     });
     state.activeConnectionId = profile.id;
-    state.currentTable = null;
-    updateRunButton();
-    setDetailFocus({ scope: "connection" });
     if (isExpanded(profile.id)) {
       setExpanded(profile.id, false);
     } else {
       setExpanded(profile.id, true);
     }
     renderProfiles();
-    switchTab("details");
+    await focusHomeDetails({ scope: "connection" });
     return;
   }
 
@@ -402,9 +404,7 @@ async function onConnected() {
   setConnectedUi(true);
   const count = Object.keys(state.connectedIds).length;
   setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
-  setDetailFocus({ scope: "connection" });
-  switchTab("details");
-  await refreshDetails();
+  await focusHomeDetails({ scope: "connection" });
   await loadProfiles();
 }
 
@@ -421,10 +421,27 @@ async function resetSession() {
   state.expandedProfileIds = {};
   setDetailFocus({ scope: "connection" });
   updateContextMeta("");
-  $("#context-title").textContent = "Details";
+  resetWorkspaceTabs();
   setConnectedUi(false);
   updateRunButton();
   refreshDetails().catch(() => {});
+}
+
+function closeWorkspaceTabsForConnection(connectionId) {
+  if (!connectionId) return;
+  const kept = state.workspaceTabs.filter(
+    (t) => t.kind !== "table" || t.connectionId !== connectionId
+  );
+  const removedActive = !kept.some((t) => t.id === state.activeWorkspaceTabId);
+  state.workspaceTabs = kept.length ? kept : [
+    { id: "home", kind: "home", title: homeTabTitle(), closable: false, viewMode: "details" },
+  ];
+  syncHomeTabTitle();
+  if (removedActive) {
+    state.activeWorkspaceTabId = "home";
+    applyWorkspaceTab("home").catch((e) => console.error(e));
+  }
+  renderWorkspaceTabs();
 }
 
 async function disconnectCurrent(profileId) {
@@ -433,6 +450,7 @@ async function disconnectCurrent(profileId) {
   await api("/api/disconnect/" + encodeURIComponent(id), { method: "POST", body: "{}" });
   delete state.connectedIds[id];
   setExpanded(id, false);
+  closeWorkspaceTabsForConnection(id);
   if (state.activeConnectionId === id) {
     state.activeConnectionId = Object.keys(state.connectedIds)[0] || null;
   }
@@ -457,6 +475,7 @@ async function deleteConnection(profile) {
     setExpanded(profile.id, false);
   }
   await api("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" });
+  closeWorkspaceTabsForConnection(profile.id);
   if (state.selectedProfileId === profile.id) state.selectedProfileId = null;
   if (state.activeConnectionId === profile.id) {
     state.activeConnectionId = Object.keys(state.connectedIds)[0] || null;
@@ -505,8 +524,11 @@ async function loadTreeInto(container, connectionId) {
   }
 }
 
-function renderExplorerNode(node, layout, connectionId) {
+function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
   const kind = node.kind || "database";
+  const databaseName = layout === "database-schemas" && kind === "database"
+    ? (node.name || null)
+    : (parentDatabase || null);
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
 
@@ -546,20 +568,19 @@ function renderExplorerNode(node, layout, connectionId) {
       }).catch(() => {});
     }
     if (kind === "schema" || (kind === "database" && layout !== "database-schemas")) {
-      state.currentSchema = node.schema || node.name;
-      state.currentTable = null;
-      updateRunButton();
-      setDetailFocus({ scope: "schema", schema: node.schema || node.name });
-      if (state.currentTab === "details") refreshDetails().catch(console.error);
-      else {
-        switchTab("details");
-      }
+      await focusHomeDetails({
+        scope: "schema",
+        schema: node.schema || node.name,
+        database: databaseName || profileDatabaseName(connectionId),
+        connectionId,
+      });
     } else if (kind === "database" && layout === "database-schemas") {
-      state.currentTable = null;
-      updateRunButton();
-      setDetailFocus({ scope: "database", database: node.name, schema: node.schema || node.name });
-      if (state.currentTab === "details") refreshDetails().catch(console.error);
-      else switchTab("details");
+      await focusHomeDetails({
+        scope: "database",
+        database: node.name,
+        schema: node.schema || node.name,
+        connectionId,
+      });
     }
 
     kids.hidden = !kids.hidden;
@@ -570,11 +591,12 @@ function renderExplorerNode(node, layout, connectionId) {
       if (childSchemas) {
         kids.innerHTML = "";
         for (const schemaNode of childSchemas) {
-          kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId));
+          kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId, node.name));
         }
         return;
       }
       const schema = node.schema || node.name;
+      const dbForObjects = databaseName || profileDatabaseName(connectionId);
       const base = `/api/databases/${encodeURIComponent(schema)}`;
       const [tables, views, procs, funcs] = await Promise.all([
         api(withConnectionId(`${base}/tables`, connectionId)),
@@ -583,10 +605,10 @@ function renderExplorerNode(node, layout, connectionId) {
         api(withConnectionId(`${base}/functions`, connectionId)),
       ]);
       kids.innerHTML = "";
-      kids.appendChild(folder("Tables", "tbl", schema, tables, "table", connectionId));
-      kids.appendChild(folder("Views", "vw", schema, views, "view", connectionId));
-      kids.appendChild(folder("Procedures", "db", schema, procs, "proc", connectionId));
-      kids.appendChild(folder("Functions", "db", schema, funcs, "func", connectionId));
+      kids.appendChild(folder("Tables", "tbl", schema, tables, "table", connectionId, dbForObjects));
+      kids.appendChild(folder("Views", "vw", schema, views, "view", connectionId, dbForObjects));
+      kids.appendChild(folder("Procedures", "db", schema, procs, "proc", connectionId, dbForObjects));
+      kids.appendChild(folder("Functions", "db", schema, funcs, "func", connectionId, dbForObjects));
     } catch (err) {
       kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
       loaded = false;
@@ -1357,7 +1379,7 @@ async function handleContextAction(action) {
   }
 }
 
-function folder(label, badge, schema, items, kind, connectionId) {
+function folder(label, badge, schema, items, kind, connectionId, database = null) {
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
   const row = document.createElement("div");
@@ -1432,7 +1454,7 @@ function folder(label, badge, schema, items, kind, connectionId) {
             body: JSON.stringify({ id: connectionId }),
           }).catch(() => {});
         }
-        await openTable(schema, name, connectionId);
+        await openTable(schema, name, connectionId, database);
       }
     };
     kids.appendChild(item);
@@ -1444,41 +1466,333 @@ function folder(label, badge, schema, items, kind, connectionId) {
   return wrap;
 }
 
-async function openTable(schema, table, connectionId) {
-  if (connectionId) state.activeConnectionId = connectionId;
-  state.currentSchema = schema;
-  state.currentTable = table;
-  setDetailFocus({ scope: "table", schema, table });
-  updateRunButton();
+function tableTabId(schema, table, connectionId) {
+  return `table:${connectionId || state.activeConnectionId || ""}:${schema}.${table}`;
+}
+
+function activeProfile() {
+  const id = state.activeConnectionId || state.selectedProfileId;
+  if (!id) return null;
+  return state.profiles.find((p) => p.id === id) || null;
+}
+
+function profileById(id) {
+  if (!id) return activeProfile();
+  return state.profiles.find((p) => p.id === id) || null;
+}
+
+function profileDatabaseName(connectionId) {
+  const profile = profileById(connectionId || state.activeConnectionId);
+  if (!profile?.database) return "";
+  return profile.fileBased || ["SQLITE", "H2_FILE"].includes(profile.dbType)
+    ? fileBaseName(profile.database)
+    : profile.database;
+}
+
+function isThreeLayerProfile(profile) {
+  if (!profile) return false;
+  return profile.connectionMode === "THREE_LAYER"
+    || ["POSTGRESQL", "H2", "H2_FILE"].includes(profile.dbType);
+}
+
+/** Hover tooltip: for PostgreSQL — connection · database · schema */
+function workspaceTabTooltip(tab) {
+  const profile = profileById(tab.connectionId || state.activeConnectionId);
+  const connName = (profile?.name || "").trim() || profile?.displayType || "Connection";
+  const database = tab.database
+    || tab.detailFocus?.database
+    || profileDatabaseName(tab.connectionId || state.activeConnectionId)
+    || "";
+  let schema = "";
+  if (tab.kind === "table") {
+    schema = tab.schema || "";
+  } else {
+    const focus = tab.detailFocus || state.detailFocus || {};
+    if (focus.scope === "schema" || focus.scope === "table") {
+      schema = focus.schema || "";
+    }
+  }
+
+  if (profile && (isThreeLayerProfile(profile) || profile.dbType === "POSTGRESQL")) {
+    const parts = [connName];
+    if (database) parts.push(database);
+    if (schema && schema !== database) parts.push(schema);
+    return parts.join(" · ");
+  }
+
+  if (tab.kind === "table" && tab.schema) {
+    return database ? `${connName} · ${database} · ${tab.schema}.${tab.table}` : `${tab.schema}.${tab.table}`;
+  }
+  return tab.title || connName;
+}
+
+/** Label for the pinned home tab — prefer database name over "Home". */
+function homeTabTitle(focus = state.detailFocus) {
+  const f = focus || {};
+  if (f.scope === "database" && f.database) return f.database;
+  if (f.scope === "schema" && f.schema) {
+    // For PostgreSQL prefer database name on the tab label; schema is in the tooltip.
+    const profile = profileById(f.connectionId || state.activeConnectionId);
+    if (profile && isThreeLayerProfile(profile)) {
+      return f.database || profileDatabaseName(f.connectionId) || f.schema;
+    }
+    return f.schema;
+  }
+  if (f.scope === "table" && f.schema) {
+    const profile = profileById(f.connectionId || state.activeConnectionId);
+    if (profile && isThreeLayerProfile(profile)) {
+      return f.database || profileDatabaseName(f.connectionId) || f.schema;
+    }
+    return f.schema;
+  }
+  const profile = activeProfile();
+  if (profile) {
+    if (profile.database) {
+      return profile.fileBased || ["SQLITE", "H2_FILE"].includes(profile.dbType)
+        ? fileBaseName(profile.database)
+        : profile.database;
+    }
+    return profile.name || profile.displayType || "Database";
+  }
+  return "Database";
+}
+
+function syncHomeTabTitle(focus) {
+  const home = state.workspaceTabs.find((t) => t.id === "home");
+  if (!home) return;
+  home.title = homeTabTitle(focus || home.detailFocus || state.detailFocus);
+}
+
+function resetWorkspaceTabs() {
+  state.workspaceTabs = [
+    { id: "home", kind: "home", title: homeTabTitle(), closable: false, viewMode: "details" },
+  ];
+  state.activeWorkspaceTabId = "home";
+  state.currentSchema = null;
+  state.currentTable = null;
+  state.columns = [];
+  state.result = null;
   state.page = 1;
-  $("#data-context").textContent = `${schema} · ${table}`;
-  $("#context-title").textContent = table;
+  renderWorkspaceTabs();
+  applyWorkspaceTab("home");
+}
+
+function snapshotActiveWorkspaceTab() {
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (!tab) return;
+  tab.viewMode = state.currentTab || "details";
+  tab.schema = state.currentSchema;
+  tab.table = state.currentTable;
+  tab.connectionId = state.activeConnectionId;
+  tab.database = state.detailFocus?.database || tab.database || profileDatabaseName(state.activeConnectionId);
+  tab.columns = state.columns;
+  tab.result = state.result;
+  tab.page = state.page;
+  tab.sql = $("#sql-editor")?.value ?? tab.sql;
+  tab.ddl = $("#ddl-view")?.textContent ?? tab.ddl;
+  tab.detailFocus = { ...(state.detailFocus || {}) };
+}
+
+function renderWorkspaceTabs() {
+  const root = $("#workspace-tabs");
+  if (!root) return;
+  root.innerHTML = "";
+  for (const tab of state.workspaceTabs) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ws-tab" + (tab.id === state.activeWorkspaceTabId ? " active" : "") + (tab.closable ? " closable" : "");
+    btn.role = "tab";
+    btn.dataset.tabId = tab.id;
+    btn.title = workspaceTabTooltip(tab);
+    btn.innerHTML =
+      `<span class="ws-tab-kind">${tab.kind === "table" ? "TBL" : "DB"}</span>`
+      + `<span class="ws-tab-label">${escapeHtml(tab.title)}</span>`
+      + `<span class="ws-tab-close" data-close-tab="${escapeHtml(tab.id)}" title="Close" aria-label="Close">×</span>`;
+    btn.onclick = (e) => {
+      const close = e.target.closest("[data-close-tab]");
+      if (close) {
+        e.preventDefault();
+        e.stopPropagation();
+        closeWorkspaceTab(close.dataset.closeTab);
+        return;
+      }
+      activateWorkspaceTab(tab.id).catch((err) => alert(err.message));
+    };
+    btn.onauxclick = (e) => {
+      if (e.button === 1 && tab.closable) {
+        e.preventDefault();
+        closeWorkspaceTab(tab.id);
+      }
+    };
+    root.appendChild(btn);
+  }
+}
+
+async function activateWorkspaceTab(tabId, { forceReload = false } = {}) {
+  if (!tabId) return;
+  if (tabId !== state.activeWorkspaceTabId) {
+    snapshotActiveWorkspaceTab();
+  }
+  const tab = state.workspaceTabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  state.activeWorkspaceTabId = tabId;
+  renderWorkspaceTabs();
+  await applyWorkspaceTab(tabId, { forceReload });
+}
+
+async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
+  const tab = state.workspaceTabs.find((t) => t.id === tabId);
+  if (!tab) return;
+
+  if (tab.kind === "home") {
+    state.currentSchema = null;
+    state.currentTable = null;
+    state.columns = [];
+    state.result = null;
+    state.page = 1;
+    if (tab.detailFocus) state.detailFocus = { ...tab.detailFocus };
+    syncHomeTabTitle(state.detailFocus);
+    renderWorkspaceTabs();
+    updateRunButton();
+    $("#data-context").textContent = "No table selected";
+    $("#sql-editor").value = tab.sql || "";
+    $("#ddl-view").textContent = tab.ddl || "Select a table and open DDL.";
+    renderStructure([]);
+    renderData(null);
+    updateContextMeta(tab.title !== "Database" ? tab.title : "");
+    switchTab(tab.viewMode || "details", { skipTitle: true });
+    return;
+  }
+
+  if (tab.connectionId) state.activeConnectionId = tab.connectionId;
+  state.currentSchema = tab.schema;
+  state.currentTable = tab.table;
+  setDetailFocus({ scope: "table", schema: tab.schema, table: tab.table });
+  updateRunButton();
+  $("#data-context").textContent = `${tab.schema} · ${tab.table}`;
+  updateContextMeta(`${tab.schema} · ${tab.table}`);
+
+  const hasCache = !forceReload && tab.columns && tab.result;
+  if (hasCache) {
+    state.columns = tab.columns;
+    state.result = tab.result;
+    state.page = tab.page || 1;
+    $("#sql-editor").value = tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 500}`;
+    $("#ddl-view").textContent = tab.ddl || "";
+    renderStructure(tab.columns);
+    renderData(tab.result);
+    switchTab(tab.viewMode || "data", { skipTitle: true });
+    return;
+  }
+
+  await loadTableIntoActiveTab(tab);
+}
+
+async function loadTableIntoActiveTab(tab) {
+  const schema = tab.schema;
+  const table = tab.table;
+  const cid = tab.connectionId || state.activeConnectionId;
   updateContextMeta("Loading…");
   setStatus(`Loading ${table}…`);
   const limit = Number($("#row-limit").value) || 500;
-  const cid = connectionId || state.activeConnectionId;
   const base = `/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}`;
   const [cols, rows] = await Promise.all([
     api(withConnectionId(`${base}/columns`, cid)),
     api(withConnectionId(`${base}/rows?limit=${limit}`, cid)),
   ]);
-  state.columns = cols;
-  state.result = rows;
-  renderStructure(cols);
-  renderData(rows);
+  let ddlText = "DDL unavailable";
   try {
     const ddl = await api(withConnectionId(`${base}/ddl`, cid));
-    $("#ddl-view").textContent = ddl.ddl || "";
+    ddlText = ddl.ddl || "";
   } catch {
-    $("#ddl-view").textContent = "DDL unavailable";
+    /* ignore */
   }
-  $("#sql-editor").value = `SELECT * FROM ${quoteIdent(table)} LIMIT ${limit}`;
-  if (state.currentTab === "details") {
-    await refreshDetails();
-  } else {
-    switchTab("data");
-  }
+  const sql = `SELECT * FROM ${quoteIdent(table)} LIMIT ${limit}`;
+
+  // Tab may have been closed while loading
+  const live = state.workspaceTabs.find((t) => t.id === tab.id);
+  if (!live) return;
+
+  live.columns = cols;
+  live.result = rows;
+  live.ddl = ddlText;
+  live.sql = sql;
+  live.page = 1;
+  live.viewMode = live.viewMode === "details" ? "data" : (live.viewMode || "data");
+
+  if (state.activeWorkspaceTabId !== live.id) return;
+
+  state.columns = cols;
+  state.result = rows;
+  state.page = 1;
+  state.currentSchema = schema;
+  state.currentTable = table;
+  $("#sql-editor").value = sql;
+  $("#ddl-view").textContent = ddlText;
+  $("#data-context").textContent = `${schema} · ${table}`;
+  renderStructure(cols);
+  renderData(rows);
+  updateContextMeta(`${schema} · ${table}`);
+  switchTab(live.viewMode || "data", { skipTitle: true });
   setStatus(rows.message || `Loaded ${table}`);
+}
+
+function closeWorkspaceTab(tabId) {
+  const idx = state.workspaceTabs.findIndex((t) => t.id === tabId);
+  if (idx < 0) return;
+  const tab = state.workspaceTabs[idx];
+  if (!tab.closable) return;
+
+  const wasActive = state.activeWorkspaceTabId === tabId;
+  state.workspaceTabs.splice(idx, 1);
+
+  if (!wasActive) {
+    renderWorkspaceTabs();
+    return;
+  }
+
+  const next = state.workspaceTabs[idx] || state.workspaceTabs[idx - 1] || state.workspaceTabs[0];
+  state.activeWorkspaceTabId = next?.id || "home";
+  renderWorkspaceTabs();
+  applyWorkspaceTab(state.activeWorkspaceTabId).catch((e) => console.error(e));
+}
+
+async function openTable(schema, table, connectionId, database = null) {
+  if (connectionId) state.activeConnectionId = connectionId;
+  const cid = connectionId || state.activeConnectionId;
+  const id = tableTabId(schema, table, cid);
+  const dbName = database || state.detailFocus?.database || profileDatabaseName(cid) || "";
+  snapshotActiveWorkspaceTab();
+
+  let tab = state.workspaceTabs.find((t) => t.id === id);
+  if (!tab) {
+    tab = {
+      id,
+      kind: "table",
+      title: table,
+      schema,
+      table,
+      database: dbName,
+      connectionId: cid,
+      closable: true,
+      viewMode: "data",
+    };
+    state.workspaceTabs.push(tab);
+  } else {
+    tab.connectionId = cid;
+    tab.schema = schema;
+    tab.table = table;
+    tab.database = dbName || tab.database;
+    tab.title = table;
+  }
+
+  state.activeWorkspaceTabId = id;
+  state.currentSchema = schema;
+  state.currentTable = table;
+  setDetailFocus({ scope: "table", schema, table, database: dbName, connectionId: cid });
+  updateRunButton();
+  renderWorkspaceTabs();
+  await applyWorkspaceTab(id, { forceReload: !tab.columns || !tab.result });
 }
 
 function quoteIdent(name) {
@@ -1497,8 +1811,20 @@ function updateContextMeta(text) {
   el.textContent = text;
 }
 
-function setDetailFocus({ scope = "connection", schema = null, table = null, database = null } = {}) {
-  state.detailFocus = { scope, schema, table, database };
+function setDetailFocus({
+  scope = "connection",
+  schema = null,
+  table = null,
+  database = null,
+  connectionId = null,
+} = {}) {
+  state.detailFocus = {
+    scope,
+    schema,
+    table,
+    database,
+    connectionId: connectionId || state.activeConnectionId || null,
+  };
 }
 
 async function refreshDetails() {
@@ -1564,35 +1890,55 @@ function renderDetailsItems(items) {
 
 /* ── Tabs / data grid ────────────────────────────── */
 
-function switchTab(name) {
+function switchTab(name, { skipTitle = false } = {}) {
   state.currentTab = name;
-  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+  const activeWs = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (activeWs) activeWs.viewMode = name;
+
+  $$(".tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
-  const titles = {
-    details: "Details",
-    sql: "SQL Editor",
-    data: "Data",
-    structure: "Structure",
-    ddl: "DDL",
-  };
-  if (state.currentTable) {
-    $("#context-title").textContent = state.currentTable;
-    if (state.currentSchema) {
+
+  if (!skipTitle) {
+    if (state.currentTable && state.currentSchema) {
       updateContextMeta(`${state.currentSchema} · ${state.currentTable}`);
+    } else if (state.detailFocus?.scope === "schema" && state.detailFocus.schema) {
+      updateContextMeta(state.detailFocus.schema);
+    } else if (state.detailFocus?.scope === "database" && state.detailFocus.database) {
+      updateContextMeta(state.detailFocus.database);
+    } else if (name !== "details") {
+      updateContextMeta("");
     }
-  } else if (state.detailFocus?.scope === "schema" && state.detailFocus.schema) {
-    $("#context-title").textContent = state.detailFocus.schema;
-    updateContextMeta(titles[name] || "");
-  } else if (state.detailFocus?.scope === "database" && state.detailFocus.database) {
-    $("#context-title").textContent = state.detailFocus.database;
-    updateContextMeta(titles[name] || "");
-  } else {
-    $("#context-title").textContent = titles[name] || "Workspace";
-    updateContextMeta("");
   }
   if (name === "details") {
     refreshDetails().catch((e) => console.error(e));
   }
+}
+
+/** Show connection/schema/database details on the pinned database tab. */
+async function focusHomeDetails(focus) {
+  snapshotActiveWorkspaceTab();
+  const normalized = {
+    ...(focus || {}),
+    connectionId: focus?.connectionId || state.activeConnectionId || null,
+    database: focus?.database || profileDatabaseName(focus?.connectionId || state.activeConnectionId) || null,
+  };
+  setDetailFocus(normalized);
+  const home = state.workspaceTabs.find((t) => t.id === "home");
+  if (home) {
+    home.detailFocus = { ...normalized };
+    home.connectionId = normalized.connectionId;
+    home.database = normalized.database || "";
+    home.viewMode = "details";
+    home.title = homeTabTitle(normalized);
+  } else {
+    syncHomeTabTitle(normalized);
+  }
+  state.activeWorkspaceTabId = "home";
+  state.currentSchema = null;
+  state.currentTable = null;
+  updateRunButton();
+  renderWorkspaceTabs();
+  await applyWorkspaceTab("home");
 }
 
 function filteredRows(result) {
@@ -1709,6 +2055,13 @@ async function runSql() {
     const result = await api("/api/query", { method: "POST", body: JSON.stringify({ sql }) });
     state.result = result;
     state.page = 1;
+    const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+    if (tab && tab.kind === "table") {
+      tab.result = result;
+      tab.page = 1;
+      tab.sql = sql;
+      tab.viewMode = "data";
+    }
     renderData(result);
     switchTab("data");
     setStatus(result.message);
@@ -2198,13 +2551,14 @@ function wire() {
     state.page += 1;
     renderData(state.result);
   };
-  $$(".tab").forEach((t) => t.onclick = () => switchTab(t.dataset.tab));
+  $$(".tabs .tab").forEach((t) => t.onclick = () => switchTab(t.dataset.tab));
 }
 
 async function boot() {
   wire();
   setConnectedUi(false);
   updateRunButton();
+  renderWorkspaceTabs();
   await loadDbTypes();
   await loadProfiles();
   const session = await syncSessionState();
@@ -2220,15 +2574,13 @@ async function boot() {
       setExpanded(session.profile.id, true);
     }
     setConnectedUi(true);
-    setDetailFocus({ scope: "connection" });
     renderProfiles();
     const count = Object.keys(state.connectedIds).length;
     setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
-    switchTab("details");
+    await focusHomeDetails({ scope: "connection" });
   } else {
     setStatus("Ready");
-    switchTab("details");
-    refreshDetails().catch(() => {});
+    await focusHomeDetails({ scope: "connection" });
   }
 }
 
