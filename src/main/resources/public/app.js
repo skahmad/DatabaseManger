@@ -29,11 +29,9 @@ const state = {
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
   importPicked: null,
-  /** Closable workspace tabs (home/database + open tables). */
-  workspaceTabs: [
-    { id: "home", kind: "home", title: "Database", closable: false, viewMode: "details" },
-  ],
-  activeWorkspaceTabId: "home",
+  /** Workspace tabs: DB/SCH context tab (transient) + closable table tabs. */
+  workspaceTabs: [],
+  activeWorkspaceTabId: null,
 };
 
 async function api(path, options = {}) {
@@ -429,17 +427,20 @@ async function resetSession() {
 
 function closeWorkspaceTabsForConnection(connectionId) {
   if (!connectionId) return;
-  const kept = state.workspaceTabs.filter(
-    (t) => t.kind !== "table" || t.connectionId !== connectionId
-  );
+  const kept = state.workspaceTabs.filter((t) => {
+    if (t.kind === "table") return t.connectionId !== connectionId;
+    if (t.kind === "context") return t.connectionId !== connectionId;
+    return true;
+  });
   const removedActive = !kept.some((t) => t.id === state.activeWorkspaceTabId);
-  state.workspaceTabs = kept.length ? kept : [
-    { id: "home", kind: "home", title: homeTabTitle(), closable: false, viewMode: "details" },
-  ];
-  syncHomeTabTitle();
+  state.workspaceTabs = kept;
+  if (!kept.length) {
+    showEmptyWorkspace();
+    return;
+  }
   if (removedActive) {
-    state.activeWorkspaceTabId = "home";
-    applyWorkspaceTab("home").catch((e) => console.error(e));
+    state.activeWorkspaceTabId = kept[kept.length - 1].id;
+    applyWorkspaceTab(state.activeWorkspaceTabId).catch((e) => console.error(e));
   }
   renderWorkspaceTabs();
 }
@@ -1526,26 +1527,13 @@ function workspaceTabTooltip(tab) {
   return tab.title || connName;
 }
 
-/** Label for the pinned home tab — prefer database name over "Home". */
-function homeTabTitle(focus = state.detailFocus) {
+/** Label for the DB/SCH context tab. */
+function contextTabTitle(focus = state.detailFocus) {
   const f = focus || {};
+  if (f.scope === "schema" && f.schema) return f.schema;
   if (f.scope === "database" && f.database) return f.database;
-  if (f.scope === "schema" && f.schema) {
-    // For PostgreSQL prefer database name on the tab label; schema is in the tooltip.
-    const profile = profileById(f.connectionId || state.activeConnectionId);
-    if (profile && isThreeLayerProfile(profile)) {
-      return f.database || profileDatabaseName(f.connectionId) || f.schema;
-    }
-    return f.schema;
-  }
-  if (f.scope === "table" && f.schema) {
-    const profile = profileById(f.connectionId || state.activeConnectionId);
-    if (profile && isThreeLayerProfile(profile)) {
-      return f.database || profileDatabaseName(f.connectionId) || f.schema;
-    }
-    return f.schema;
-  }
-  const profile = activeProfile();
+  if (f.scope === "table" && f.schema) return f.schema;
+  const profile = profileById(f.connectionId) || activeProfile();
   if (profile) {
     if (profile.database) {
       return profile.fileBased || ["SQLITE", "H2_FILE"].includes(profile.dbType)
@@ -1557,24 +1545,71 @@ function homeTabTitle(focus = state.detailFocus) {
   return "Database";
 }
 
-function syncHomeTabTitle(focus) {
-  const home = state.workspaceTabs.find((t) => t.id === "home");
-  if (!home) return;
-  home.title = homeTabTitle(focus || home.detailFocus || state.detailFocus);
+function contextTabBadge(tab) {
+  if (tab.kind === "table") return "TBL";
+  const scope = tab.detailFocus?.scope || tab.scope;
+  if (scope === "schema") return "SCH";
+  return "DB";
 }
 
-function resetWorkspaceTabs() {
-  state.workspaceTabs = [
-    { id: "home", kind: "home", title: homeTabTitle(), closable: false, viewMode: "details" },
-  ];
-  state.activeWorkspaceTabId = "home";
+function removeContextTabs() {
+  state.workspaceTabs = state.workspaceTabs.filter((t) => t.kind !== "context" && t.kind !== "home");
+}
+
+function ensureContextTab(focus) {
+  const normalized = {
+    ...(focus || {}),
+    connectionId: focus?.connectionId || state.activeConnectionId || null,
+    database: focus?.database || profileDatabaseName(focus?.connectionId || state.activeConnectionId) || null,
+  };
+  let tab = state.workspaceTabs.find((t) => t.kind === "context" || t.id === "context" || t.id === "home");
+  if (!tab) {
+    tab = {
+      id: "context",
+      kind: "context",
+      title: contextTabTitle(normalized),
+      closable: true,
+      viewMode: "details",
+      connectionId: normalized.connectionId,
+      database: normalized.database || "",
+      detailFocus: { ...normalized },
+    };
+    // Context tab leads the bar (before any leftover table tabs).
+    state.workspaceTabs.unshift(tab);
+  } else {
+    tab.id = "context";
+    tab.kind = "context";
+    tab.closable = true;
+    tab.detailFocus = { ...normalized };
+    tab.connectionId = normalized.connectionId;
+    tab.database = normalized.database || "";
+    tab.viewMode = "details";
+    tab.title = contextTabTitle(normalized);
+  }
+  return tab;
+}
+
+function showEmptyWorkspace() {
+  state.workspaceTabs = [];
+  state.activeWorkspaceTabId = null;
   state.currentSchema = null;
   state.currentTable = null;
   state.columns = [];
   state.result = null;
   state.page = 1;
+  updateRunButton();
+  updateContextMeta("");
+  $("#data-context").textContent = "No table selected";
+  $("#sql-editor").value = "";
+  $("#ddl-view").textContent = "Select a table and open DDL.";
+  renderStructure([]);
+  renderData(null);
   renderWorkspaceTabs();
-  applyWorkspaceTab("home");
+  switchTab("details", { skipTitle: true });
+}
+
+function resetWorkspaceTabs() {
+  showEmptyWorkspace();
 }
 
 function snapshotActiveWorkspaceTab() {
@@ -1600,12 +1635,14 @@ function renderWorkspaceTabs() {
   for (const tab of state.workspaceTabs) {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "ws-tab" + (tab.id === state.activeWorkspaceTabId ? " active" : "") + (tab.closable ? " closable" : "");
+    btn.className = "ws-tab"
+      + (tab.id === state.activeWorkspaceTabId ? " active" : "")
+      + (tab.closable !== false ? " closable" : "");
     btn.role = "tab";
     btn.dataset.tabId = tab.id;
     btn.title = workspaceTabTooltip(tab);
     btn.innerHTML =
-      `<span class="ws-tab-kind">${tab.kind === "table" ? "TBL" : "DB"}</span>`
+      `<span class="ws-tab-kind">${escapeHtml(contextTabBadge(tab))}</span>`
       + `<span class="ws-tab-label">${escapeHtml(tab.title)}</span>`
       + `<span class="ws-tab-close" data-close-tab="${escapeHtml(tab.id)}" title="Close" aria-label="Close">×</span>`;
     btn.onclick = (e) => {
@@ -1619,7 +1656,7 @@ function renderWorkspaceTabs() {
       activateWorkspaceTab(tab.id).catch((err) => alert(err.message));
     };
     btn.onauxclick = (e) => {
-      if (e.button === 1 && tab.closable) {
+      if (e.button === 1 && tab.closable !== false) {
         e.preventDefault();
         closeWorkspaceTab(tab.id);
       }
@@ -1641,17 +1678,21 @@ async function activateWorkspaceTab(tabId, { forceReload = false } = {}) {
 }
 
 async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
+  if (!tabId) {
+    showEmptyWorkspace();
+    return;
+  }
   const tab = state.workspaceTabs.find((t) => t.id === tabId);
   if (!tab) return;
 
-  if (tab.kind === "home") {
+  if (tab.kind === "context" || tab.kind === "home") {
     state.currentSchema = null;
     state.currentTable = null;
     state.columns = [];
     state.result = null;
     state.page = 1;
     if (tab.detailFocus) state.detailFocus = { ...tab.detailFocus };
-    syncHomeTabTitle(state.detailFocus);
+    tab.title = contextTabTitle(state.detailFocus);
     renderWorkspaceTabs();
     updateRunButton();
     $("#data-context").textContent = "No table selected";
@@ -1659,7 +1700,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     $("#ddl-view").textContent = tab.ddl || "Select a table and open DDL.";
     renderStructure([]);
     renderData(null);
-    updateContextMeta(tab.title !== "Database" ? tab.title : "");
+    updateContextMeta(tab.title || "");
     switchTab(tab.viewMode || "details", { skipTitle: true });
     return;
   }
@@ -1741,10 +1782,15 @@ function closeWorkspaceTab(tabId) {
   const idx = state.workspaceTabs.findIndex((t) => t.id === tabId);
   if (idx < 0) return;
   const tab = state.workspaceTabs[idx];
-  if (!tab.closable) return;
+  if (tab.closable === false) return;
 
   const wasActive = state.activeWorkspaceTabId === tabId;
   state.workspaceTabs.splice(idx, 1);
+
+  if (!state.workspaceTabs.length) {
+    showEmptyWorkspace();
+    return;
+  }
 
   if (!wasActive) {
     renderWorkspaceTabs();
@@ -1752,7 +1798,7 @@ function closeWorkspaceTab(tabId) {
   }
 
   const next = state.workspaceTabs[idx] || state.workspaceTabs[idx - 1] || state.workspaceTabs[0];
-  state.activeWorkspaceTabId = next?.id || "home";
+  state.activeWorkspaceTabId = next.id;
   renderWorkspaceTabs();
   applyWorkspaceTab(state.activeWorkspaceTabId).catch((e) => console.error(e));
 }
@@ -1763,6 +1809,8 @@ async function openTable(schema, table, connectionId, database = null) {
   const id = tableTabId(schema, table, cid);
   const dbName = database || state.detailFocus?.database || profileDatabaseName(cid) || "";
   snapshotActiveWorkspaceTab();
+  // Opening a table replaces the DB/SCH context tab.
+  removeContextTabs();
 
   let tab = state.workspaceTabs.find((t) => t.id === id);
   if (!tab) {
@@ -1914,7 +1962,7 @@ function switchTab(name, { skipTitle = false } = {}) {
   }
 }
 
-/** Show connection/schema/database details on the pinned database tab. */
+/** Show connection/database/schema details on a transient DB/SCH tab. */
 async function focusHomeDetails(focus) {
   snapshotActiveWorkspaceTab();
   const normalized = {
@@ -1923,22 +1971,13 @@ async function focusHomeDetails(focus) {
     database: focus?.database || profileDatabaseName(focus?.connectionId || state.activeConnectionId) || null,
   };
   setDetailFocus(normalized);
-  const home = state.workspaceTabs.find((t) => t.id === "home");
-  if (home) {
-    home.detailFocus = { ...normalized };
-    home.connectionId = normalized.connectionId;
-    home.database = normalized.database || "";
-    home.viewMode = "details";
-    home.title = homeTabTitle(normalized);
-  } else {
-    syncHomeTabTitle(normalized);
-  }
-  state.activeWorkspaceTabId = "home";
+  const tab = ensureContextTab(normalized);
+  state.activeWorkspaceTabId = tab.id;
   state.currentSchema = null;
   state.currentTable = null;
   updateRunButton();
   renderWorkspaceTabs();
-  await applyWorkspaceTab("home");
+  await applyWorkspaceTab(tab.id);
 }
 
 function filteredRows(result) {
@@ -2580,7 +2619,7 @@ async function boot() {
     await focusHomeDetails({ scope: "connection" });
   } else {
     setStatus("Ready");
-    await focusHomeDetails({ scope: "connection" });
+    showEmptyWorkspace();
   }
 }
 
