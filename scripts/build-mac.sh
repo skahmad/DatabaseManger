@@ -93,7 +93,6 @@ jpackage \
   --mac-package-identifier "$BUNDLE_ID" \
   --mac-package-name "Forge DB Manager" \
   --java-options "-Dfile.encoding=UTF-8" \
-  --java-options "--enable-native-access=ALL-UNNAMED" \
   --java-options "-Djdk.gtk.version=3"
 
 DMG="$(ls -1 "$DIST_DIR"/*.dmg | head -1)"

@@ -130,8 +130,7 @@ $jpackageArgs = @(
     "--main-jar", "database-manager-$AppVersion.jar",
     "--main-class", $MainClass,
     "--dest", $DistDir,
-    "--java-options", "-Dfile.encoding=UTF-8",
-    "--java-options", "--enable-native-access=ALL-UNNAMED"
+    "--java-options", "-Dfile.encoding=UTF-8"
 ) + $iconArgs
 
 if ($Type -eq "exe" -or $Type -eq "msi") {
