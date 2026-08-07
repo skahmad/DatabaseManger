@@ -14,7 +14,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>21</maven.compiler.release>
         <main.class>com.forgesystem.dbmanager.Launcher</main.class>
-        <javalin.version>6.3.0</javalin.version>
+        <javalin.version>7.2.2</javalin.version>
         <javafx.version>23.0.2</javafx.version>
         <shade.skip>false</shade.skip>
     </properties>

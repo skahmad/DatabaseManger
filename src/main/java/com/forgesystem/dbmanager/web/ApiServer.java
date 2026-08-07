@@ -42,103 +42,105 @@ public class ApiServer {
 
     public void start() {
         app = Javalin.create(config -> {
+            config.jetty.host = "127.0.0.1";
+            config.jetty.port = port;
             config.staticFiles.add(staticFiles -> {
                 staticFiles.hostedPath = "/";
                 staticFiles.directory = "/public";
                 staticFiles.location = io.javalin.http.staticfiles.Location.CLASSPATH;
             });
             config.http.defaultContentType = "application/json";
-        });
 
-        app.exception(Exception.class, (e, ctx) -> {
-            connectionService.clearRequestSession();
-            ctx.status(HttpStatus.BAD_REQUEST);
-            ctx.json(Map.of("error", e.getMessage() == null ? e.toString() : e.getMessage()));
-        });
+            config.routes.exception(Exception.class, (e, ctx) -> {
+                connectionService.clearRequestSession();
+                ctx.status(HttpStatus.BAD_REQUEST);
+                ctx.json(Map.of("error", e.getMessage() == null ? e.toString() : e.getMessage()));
+            });
 
-        // Clear per-request session binding after every call (parallel explorer loads).
-        app.after(ctx -> connectionService.clearRequestSession());
+            // Clear per-request session binding after every call (parallel explorer loads).
+            config.routes.after(ctx -> connectionService.clearRequestSession());
 
-        // Health
-        app.get("/api/health", ctx -> ctx.json(Map.of("ok", true, "app", "DB Pilot")));
+            // Health
+            config.routes.get("/api/health", ctx -> ctx.json(Map.of("ok", true, "app", "DB Pilot")));
 
-        // Connection profiles
-        app.get("/api/profiles", ctx -> ctx.json(sanitizeProfiles(profiles)));
-        app.get("/api/profiles/{id}/properties", this::profileProperties);
-        app.post("/api/profiles", this::saveProfile);
-        app.post("/api/profiles/test", this::testProfile);
-        app.delete("/api/profiles/{id}", this::deleteProfile);
+            // Connection profiles
+            config.routes.get("/api/profiles", ctx -> ctx.json(sanitizeProfiles(profiles)));
+            config.routes.get("/api/profiles/{id}/properties", this::profileProperties);
+            config.routes.post("/api/profiles", this::saveProfile);
+            config.routes.post("/api/profiles/test", this::testProfile);
+            config.routes.delete("/api/profiles/{id}", this::deleteProfile);
 
-        // Session
-        app.get("/api/session", this::session);
-        app.post("/api/session/active", this::setActiveSession);
-        app.post("/api/connect", this::connect);
-        app.post("/api/connect/{id}", this::connectById);
-        app.post("/api/disconnect", this::disconnect);
-        app.post("/api/disconnect/{id}", this::disconnectById);
+            // Session
+            config.routes.get("/api/session", this::session);
+            config.routes.post("/api/session/active", this::setActiveSession);
+            config.routes.post("/api/connect", this::connect);
+            config.routes.post("/api/connect/{id}", this::connectById);
+            config.routes.post("/api/disconnect", this::disconnect);
+            config.routes.post("/api/disconnect/{id}", this::disconnectById);
 
-        // Metadata
-        app.get("/api/databases", this::databases);
-        app.get("/api/schemas", this::schemas);
-        app.get("/api/explorer", this::explorer);
-        app.get("/api/details", this::details);
-        app.get("/api/databases/{schema}/properties", this::databaseProperties);
-        app.get("/api/databases/{schema}/tables", this::tables);
-        app.get("/api/databases/{schema}/views", this::views);
-        app.get("/api/databases/{schema}/procedures", this::procedures);
-        app.get("/api/databases/{schema}/functions", this::functions);
-        app.get("/api/databases/{schema}/tables/{table}/columns", this::columns);
-        app.get("/api/databases/{schema}/tables/{table}/ddl", this::ddl);
-        app.get("/api/databases/{schema}/tables/{table}/rows", this::previewRows);
+            // Metadata
+            config.routes.get("/api/databases", this::databases);
+            config.routes.get("/api/schemas", this::schemas);
+            config.routes.get("/api/explorer", this::explorer);
+            config.routes.get("/api/details", this::details);
+            config.routes.get("/api/databases/{schema}/properties", this::databaseProperties);
+            config.routes.get("/api/databases/{schema}/tables", this::tables);
+            config.routes.get("/api/databases/{schema}/views", this::views);
+            config.routes.get("/api/databases/{schema}/procedures", this::procedures);
+            config.routes.get("/api/databases/{schema}/functions", this::functions);
+            config.routes.get("/api/databases/{schema}/tables/{table}/columns", this::columns);
+            config.routes.get("/api/databases/{schema}/tables/{table}/ddl", this::ddl);
+            config.routes.get("/api/databases/{schema}/tables/{table}/rows", this::previewRows);
 
-        // Query / CRUD
-        app.post("/api/query", this::query);
-        app.post("/api/databases/{schema}/tables/{table}/rows", this::insertRow);
-        app.put("/api/databases/{schema}/tables/{table}/rows", this::updateRow);
-        app.delete("/api/databases/{schema}/tables/{table}/rows", this::deleteRow);
+            // Query / CRUD
+            config.routes.post("/api/query", this::query);
+            config.routes.post("/api/databases/{schema}/tables/{table}/rows", this::insertRow);
+            config.routes.put("/api/databases/{schema}/tables/{table}/rows", this::updateRow);
+            config.routes.delete("/api/databases/{schema}/tables/{table}/rows", this::deleteRow);
 
-        // Database / schema administration
-        app.post("/api/databases", this::createDatabase);
-        app.patch("/api/databases/{name}", this::alterDatabase);
-        app.delete("/api/databases/{name}", this::dropDatabase);
-        app.post("/api/databases/{name}/clone", this::cloneDatabase);
-        app.post("/api/migrate", this::migrateDatabase);
-        app.post("/api/schemas", this::createSchema);
-        app.delete("/api/schemas/{name}", this::dropSchema);
+            // Database / schema administration
+            config.routes.post("/api/databases", this::createDatabase);
+            config.routes.patch("/api/databases/{name}", this::alterDatabase);
+            config.routes.delete("/api/databases/{name}", this::dropDatabase);
+            config.routes.post("/api/databases/{name}/clone", this::cloneDatabase);
+            config.routes.post("/api/migrate", this::migrateDatabase);
+            config.routes.post("/api/schemas", this::createSchema);
+            config.routes.delete("/api/schemas/{name}", this::dropSchema);
 
-        // Table / view / index administration
-        app.post("/api/databases/{schema}/tables", this::createTable);
-        app.delete("/api/databases/{schema}/tables/{table}", this::dropTable);
-        app.post("/api/databases/{schema}/tables/{table}/rename", this::renameTable);
-        app.post("/api/databases/{schema}/tables/{table}/columns", this::addColumn);
-        app.delete("/api/databases/{schema}/tables/{table}/columns/{column}", this::dropColumn);
-        app.post("/api/databases/{schema}/views", this::createView);
-        app.delete("/api/databases/{schema}/views/{view}", this::dropView);
-        app.get("/api/databases/{schema}/tables/{table}/indexes", this::listIndexes);
-        app.post("/api/databases/{schema}/tables/{table}/indexes", this::createIndex);
-        app.delete("/api/databases/{schema}/tables/{table}/indexes/{name}", this::dropIndex);
+            // Table / view / index administration
+            config.routes.post("/api/databases/{schema}/tables", this::createTable);
+            config.routes.delete("/api/databases/{schema}/tables/{table}", this::dropTable);
+            config.routes.post("/api/databases/{schema}/tables/{table}/rename", this::renameTable);
+            config.routes.post("/api/databases/{schema}/tables/{table}/columns", this::addColumn);
+            config.routes.delete("/api/databases/{schema}/tables/{table}/columns/{column}", this::dropColumn);
+            config.routes.post("/api/databases/{schema}/views", this::createView);
+            config.routes.delete("/api/databases/{schema}/views/{view}", this::dropView);
+            config.routes.get("/api/databases/{schema}/tables/{table}/indexes", this::listIndexes);
+            config.routes.post("/api/databases/{schema}/tables/{table}/indexes", this::createIndex);
+            config.routes.delete("/api/databases/{schema}/tables/{table}/indexes/{name}", this::dropIndex);
 
-        // Import / export
-        app.get("/api/databases/{schema}/tables/{table}/export", this::exportTable);
-        app.get("/api/databases/{schema}/export", this::exportDatabase);
-        app.post("/api/databases/{schema}/tables/{table}/import", this::importTable);
-        app.post("/api/import/sql", this::importSql);
+            // Import / export
+            config.routes.get("/api/databases/{schema}/tables/{table}/export", this::exportTable);
+            config.routes.get("/api/databases/{schema}/export", this::exportDatabase);
+            config.routes.post("/api/databases/{schema}/tables/{table}/import", this::importTable);
+            config.routes.post("/api/import/sql", this::importSql);
 
-        app.get("/api/db-types", ctx -> {
-            List<Map<String, Object>> types = new ArrayList<>();
-            for (DbType t : DbType.values()) {
-                types.add(Map.of(
-                        "id", t.name(),
-                        "name", t.getDisplayName(),
-                        "defaultPort", t.getDefaultPort(),
-                        "fileBased", t.isFileBased()
-                ));
-            }
-            ctx.json(types);
+            config.routes.get("/api/db-types", ctx -> {
+                List<Map<String, Object>> types = new ArrayList<>();
+                for (DbType t : DbType.values()) {
+                    types.add(Map.of(
+                            "id", t.name(),
+                            "name", t.getDisplayName(),
+                            "defaultPort", t.getDefaultPort(),
+                            "fileBased", t.isFileBased()
+                    ));
+                }
+                ctx.json(types);
+            });
         });
 
         // Localhost only — consumed by the desktop WebView, not exposed as a public site.
-        app.start("127.0.0.1", port);
+        app.start();
     }
 
     public int getPort() {
