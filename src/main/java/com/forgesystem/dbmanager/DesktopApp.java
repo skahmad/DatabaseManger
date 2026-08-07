@@ -58,7 +58,7 @@ public class DesktopApp extends Application {
         engine.load(url);
 
         Scene scene = new Scene(new StackPane(webView), 1280, 800);
-        stage.setTitle("Forge Database Manager");
+        stage.setTitle("DB Pilot");
         stage.setMinWidth(960);
         stage.setMinHeight(640);
         stage.setScene(scene);
@@ -74,7 +74,7 @@ public class DesktopApp extends Application {
         });
         stage.show();
 
-        System.out.println("Forge Database Manager (desktop) ready — UI embedded, API on " + url);
+        System.out.println("DB Pilot (desktop) ready — UI embedded, API on " + url);
     }
 
     @Override

@@ -196,6 +196,20 @@ button { cursor: pointer; }
   transition: background-color 99999s ease-out;
 }
 .inline-field { display: flex; align-items: center; gap: 0.5rem; color: var(--muted); font-size: 0.9rem; }
+.sql-ctx-field { flex-shrink: 0; }
+.sql-ctx-select {
+  min-width: 8.5rem;
+  max-width: 14rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+}
+.sql-table-chip,
+.sql-file-chip {
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* Prefs */
 .prefs-bar {
@@ -436,11 +450,15 @@ body.resizing-sidebar * {
 .workspace-tabbar {
   display: flex;
   align-items: stretch;
-  gap: 0.75rem;
+  gap: 0.35rem;
   min-height: 2.6rem;
   border-bottom: 1px solid var(--line);
   background: var(--bg-elev);
-  padding: 0 0.5rem 0 0.35rem;
+  padding: 0 0.35rem 0 0.35rem;
+  /* Keep visible so the overflow menu can paint below the bar. */
+  overflow: visible;
+  position: relative;
+  z-index: 40;
 }
 .workspace-tabs {
   display: flex;
@@ -448,15 +466,79 @@ body.resizing-sidebar * {
   gap: 0.15rem;
   flex: 1;
   min-width: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: thin;
+  overflow: hidden;
+}
+.workspace-tabs::-webkit-scrollbar { display: none; }
+.ws-tabs-more-wrap {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 0.25rem 0.15rem;
+  z-index: 50;
+}
+.ws-tabs-more {
+  min-width: 2rem;
+  font-weight: 600;
+}
+.ws-tabs-overflow-menu {
+  position: absolute;
+  top: calc(100% + 0.2rem);
+  right: 0;
+  z-index: 120;
+  min-width: 12rem;
+  max-width: 22rem;
+  max-height: min(50vh, 18rem);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.4rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+.ws-tabs-overflow-menu[hidden] { display: none !important; }
+.ws-overflow-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 0.4rem 0.55rem;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  width: 100%;
+}
+.ws-overflow-item:hover { background: rgba(var(--accent-rgb), 0.1); }
+.ws-overflow-item.active {
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.12);
+}
+.ws-overflow-kind {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.ws-overflow-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 .ws-tab {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  max-width: 14rem;
+  max-width: 12rem;
   border: none;
   border-right: 1px solid transparent;
   background: transparent;
@@ -749,6 +831,38 @@ body.resizing-sidebar * {
   padding: 0.3rem 0.7rem; border-radius: 8px; font-weight: 600; font-size: 0.9rem;
 }
 
+.sql-find-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  padding: 0.45rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+.sql-find-bar[hidden] { display: none !important; }
+.sql-find-input {
+  width: min(18rem, 100%);
+  min-width: 10rem;
+  flex: 1;
+  font-size: 0.85rem;
+  color: var(--text) !important;
+  -webkit-text-fill-color: var(--text) !important;
+  caret-color: var(--accent);
+  background: var(--bg-input);
+}
+.sql-find-case {
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.sql-find-count {
+  min-width: 3.5rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+.sql-find-count.sql-find-empty { color: #e35d6a; }
 .sql-editor {
   flex: 1; width: 100%; resize: none; border: none; outline: none;
   background: var(--editor-bg); color: var(--text); padding: 1.25rem 1.5rem;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a Linux installable package for Forge Database Manager.
+# Build a Linux installable package for DB Pilot.
 # On macOS/Windows, builds inside Docker (JDK 21 + jpackage).
 # On Linux, builds natively.
 #
@@ -11,7 +11,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="Forge Database Manager"
+APP_NAME="DB Pilot"
 APP_VERSION="1.0.0"
 MAIN_CLASS="com.forgesystem.dbmanager.Launcher"
 VENDOR="Forge System"

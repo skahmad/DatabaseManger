@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="Forge Database Manager"
+APP_NAME="DB Pilot"
 APP_VERSION="1.0.0"
 MAIN_CLASS="com.forgesystem.dbmanager.Launcher"
 JFX_PLATFORM="win"
@@ -88,23 +88,23 @@ fi
 cp -R "$JRE_ROOT"/. "$PORTABLE_DIR/runtime/"
 
 # GUI launcher (no console): .vbs is the primary entry; .bat kept for debugging
-cat > "$PORTABLE_DIR/Forge Database Manager.vbs" <<'EOF'
+cat > "$PORTABLE_DIR/${APP_NAME}.vbs" <<EOF
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 dir = fso.GetParentFolderName(WScript.ScriptFullName)
 javaw = dir & "\runtime\bin\javaw.exe"
 If Not fso.FileExists(javaw) Then
-  MsgBox "Bundled Java runtime not found. Re-download the standalone package.", vbCritical, "Forge Database Manager"
+  MsgBox "Bundled Java runtime not found. Re-download the standalone package.", vbCritical, "${APP_NAME}"
   WScript.Quit 1
 End If
 ' WindowStyle 0 = hidden (no console); WaitOnReturn = False
 sh.CurrentDirectory = dir
 sh.Run """" & javaw & """ -Dfile.encoding=UTF-8 -cp ""lib\*"" com.forgesystem.dbmanager.Launcher", 0, False
 EOF
-perl -pi -e 's/\r?\n/\r\n/' "$PORTABLE_DIR/Forge Database Manager.vbs" 2>/dev/null || true
+perl -pi -e 's/\r?\n/\r\n/' "$PORTABLE_DIR/${APP_NAME}.vbs" 2>/dev/null || true
 
 # Optional console launcher for troubleshooting startup errors
-cat > "$PORTABLE_DIR/Forge Database Manager.bat" <<'EOF'
+cat > "$PORTABLE_DIR/${APP_NAME}.bat" <<EOF
 @echo off
 setlocal
 cd /d "%~dp0"
@@ -114,15 +114,15 @@ if not exist "%JAVA_EXE%" (
   pause
   exit /b 1
 )
-echo Starting Forge Database Manager...
+echo Starting ${APP_NAME}...
 "%JAVA_EXE%" -Dfile.encoding=UTF-8 -cp "lib\*" com.forgesystem.dbmanager.Launcher
 if errorlevel 1 pause
 endlocal
 EOF
-perl -pi -e 's/\r?\n/\r\n/' "$PORTABLE_DIR/Forge Database Manager.bat" 2>/dev/null || true
+perl -pi -e 's/\r?\n/\r\n/' "$PORTABLE_DIR/${APP_NAME}.bat" 2>/dev/null || true
 
 # Convenience: double-click "Start.vbs" or the main .vbs — no black console window
-cp "$PORTABLE_DIR/Forge Database Manager.vbs" "$PORTABLE_DIR/Start.vbs"
+cp "$PORTABLE_DIR/${APP_NAME}.vbs" "$PORTABLE_DIR/Start.vbs"
 
 ZIP_NAME="forge-database-manager-${APP_VERSION}-windows-${ARCH}-standalone.zip"
 rm -f "$OUT_DIR/$ZIP_NAME"
@@ -137,5 +137,5 @@ echo "Standalone Windows x64 package created:"
 echo "  $OUT_DIR/$ZIP_NAME"
 ls -lh "$OUT_DIR/$ZIP_NAME"
 echo
-echo "On Windows: unzip and run \"Forge Database Manager.vbs\" (or Start.vbs) — no console, no system Java."
-echo "Use \"Forge Database Manager.bat\" only to debug startup errors in a console."
+echo "On Windows: unzip and run \"${APP_NAME}.vbs\" (or Start.vbs) — no console, no system Java."
+echo "Use \"${APP_NAME}.bat\" only to debug startup errors in a console."

@@ -81,7 +81,7 @@ public class ImportExportService {
 
     public ExportPayload exportDatabaseSql(String schema, boolean includeData, int limitPerTable) throws Exception {
         StringBuilder sb = new StringBuilder();
-        sb.append("-- Forge Database Manager SQL export\n");
+        sb.append("-- DB Pilot SQL export\n");
         sb.append("-- Schema/Database: ").append(schema).append("\n\n");
         List<String> tables = databaseService.listTables(schema);
         int limit = limitPerTable <= 0 ? 100_000 : Math.min(limitPerTable, 500_000);

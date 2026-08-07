@@ -7,7 +7,7 @@
     <groupId>com.forgesystem</groupId>
     <artifactId>database-manager</artifactId>
     <version>1.0.0</version>
-    <name>Forge Database Manager</name>
+    <name>DB Pilot</name>
     <description>Desktop database manager with embedded HTML UI</description>
 
     <properties>

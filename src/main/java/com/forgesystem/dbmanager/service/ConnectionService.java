@@ -267,6 +267,79 @@ public class ConnectionService {
         }
     }
 
+    /**
+     * Apply optional database + schema context before running ad-hoc SQL.
+     * <ul>
+     *   <li>MySQL / SQL Server: {@code database} switches catalog ({@code USE}).</li>
+     *   <li>PostgreSQL: {@code database} switches catalog; {@code schema} sets {@code search_path}.</li>
+     *   <li>When only database is set on 3-layer engines, catalog is switched and search_path is left alone.</li>
+     * </ul>
+     */
+    public synchronized void applyQueryContext(String database, String schema) throws SQLException {
+        DbSession session = resolveSession();
+        if (session == null) {
+            throw new SQLException("Not connected to a database");
+        }
+        Connection conn = session.connection;
+        DbType type = session.profile.getDbType();
+        String db = blankToNull(database);
+        String sch = blankToNull(schema);
+
+        switch (type) {
+            case MYSQL -> {
+                String target = db != null ? db : sch;
+                if (target != null) {
+                    useDatabase(target);
+                }
+            }
+            case SQLSERVER -> {
+                if (db != null) {
+                    useDatabase(db);
+                }
+                // Schema is typically qualified in SQL; default schema cannot be safely changed per query.
+            }
+            case POSTGRESQL -> {
+                if (db != null) {
+                    switchCatalog(conn, db);
+                    session.profile.setDatabase(db);
+                }
+                if (sch != null) {
+                    useDatabase(sch);
+                }
+            }
+            case H2, H2_FILE -> {
+                if (sch != null) {
+                    conn.createStatement().execute(
+                            "SET SCHEMA \"" + sch.replace("\"", "\"\"") + "\"");
+                }
+            }
+            case SQLITE -> { /* single file database */ }
+        }
+    }
+
+    /** Switch PostgreSQL / SQL Server catalog when supported by the driver. */
+    private static void switchCatalog(Connection conn, String catalog) throws SQLException {
+        if (catalog == null || catalog.isBlank()) {
+            return;
+        }
+        try {
+            String current = conn.getCatalog();
+            if (catalog.equals(current)) {
+                return;
+            }
+        } catch (SQLException ignored) {
+        }
+        conn.setCatalog(catalog);
+    }
+
+    private static String blankToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
     /** Prefer request-bound session (parallel-safe); otherwise the UI active session. */
     private DbSession resolveSession() {
         String bound = requestSessionId.get();

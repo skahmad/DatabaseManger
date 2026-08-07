@@ -60,7 +60,7 @@ public class ApiServer {
         app.after(ctx -> connectionService.clearRequestSession());
 
         // Health
-        app.get("/api/health", ctx -> ctx.json(Map.of("ok", true, "app", "Forge Database Manager")));
+        app.get("/api/health", ctx -> ctx.json(Map.of("ok", true, "app", "DB Pilot")));
 
         // Connection profiles
         app.get("/api/profiles", ctx -> ctx.json(sanitizeProfiles(profiles)));
@@ -79,6 +79,7 @@ public class ApiServer {
 
         // Metadata
         app.get("/api/databases", this::databases);
+        app.get("/api/schemas", this::schemas);
         app.get("/api/explorer", this::explorer);
         app.get("/api/details", this::details);
         app.get("/api/databases/{schema}/properties", this::databaseProperties);
@@ -466,6 +467,12 @@ public class ApiServer {
         ctx.json(databaseService.listDatabases());
     }
 
+    private void schemas(Context ctx) throws Exception {
+        requireConnected(ctx);
+        String database = ctx.queryParam("database");
+        ctx.json(databaseService.listSchemas(database));
+    }
+
     private void explorer(Context ctx) throws Exception {
         requireConnected(ctx);
         ctx.json(databaseService.getExplorerTree());
@@ -549,6 +556,15 @@ public class ApiServer {
         requireConnected(ctx);
         JsonObject body = gson.fromJson(ctx.body(), JsonObject.class);
         String sql = body.get("sql").getAsString();
+        String database = body.has("database") && !body.get("database").isJsonNull()
+                ? body.get("database").getAsString() : null;
+        String schema = body.has("schema") && !body.get("schema").isJsonNull()
+                ? body.get("schema").getAsString() : null;
+        try {
+            connectionService.applyQueryContext(database, schema);
+        } catch (Exception ignored) {
+            // Best-effort context switch; still attempt the script.
+        }
         QueryResult result = databaseService.executeScript(sql);
         ctx.json(toResultJson(result));
     }
