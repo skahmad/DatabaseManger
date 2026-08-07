@@ -91,8 +91,10 @@ jpackage \
   --dest "$DIST_DIR" \
   --icon "$ICNS" \
   --mac-package-identifier "$BUNDLE_ID" \
-  --mac-package-name "Forge DB Manager" \
+  --mac-package-name "DB Pilot" \
   --java-options "-Dfile.encoding=UTF-8" \
+  --java-options "-Dapple.awt.application.name=DBPilot" \
+  --java-options "-Dapple.laf.useScreenMenuBar=true" \
   --java-options "-Djdk.gtk.version=3"
 
 DMG="$(ls -1 "$DIST_DIR"/*.dmg | head -1)"

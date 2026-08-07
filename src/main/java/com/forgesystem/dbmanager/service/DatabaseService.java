@@ -424,7 +424,7 @@ public class DatabaseService {
         return out;
     }
 
-    private long countTableRows(String schema, String table) {
+    public long countTableRows(String schema, String table) {
         try {
             String sql = "SELECT COUNT(*) AS c FROM " + qualify(schema, table);
             QueryResult result = execute(sql);
@@ -865,11 +865,21 @@ public class DatabaseService {
     }
 
     public QueryResult previewTable(String schema, String table, int limit) throws SQLException {
+        return previewTable(schema, table, limit, 0);
+    }
+
+    public QueryResult previewTable(String schema, String table, int limit, int offset) throws SQLException {
         String qualified = qualify(schema, table);
-        String sql = "SELECT * FROM " + qualified + " LIMIT " + Math.max(1, limit);
+        int lim = Math.max(1, limit);
+        int off = Math.max(0, offset);
         DbType type = connectionService.getProfile().getDbType();
+        String sql;
         if (type == DbType.SQLSERVER) {
-            sql = "SELECT TOP " + Math.max(1, limit) + " * FROM " + qualified;
+            sql = "SELECT * FROM " + qualified
+                    + " ORDER BY (SELECT NULL) OFFSET " + off
+                    + " ROWS FETCH NEXT " + lim + " ROWS ONLY";
+        } else {
+            sql = "SELECT * FROM " + qualified + " LIMIT " + lim + " OFFSET " + off;
         }
         return execute(sql);
     }
