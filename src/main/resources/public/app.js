@@ -361,6 +361,33 @@ function profileDetail(p) {
   return p.host || "host";
 }
 
+function connectionSearchQuery() {
+  return ($("#conn-search")?.value || "").trim().toLowerCase();
+}
+
+function profileMatchesSearch(p, query) {
+  if (!query) return true;
+  const haystack = [
+    p.name,
+    p.host,
+    p.database,
+    p.displayType,
+    p.dbType,
+    p.sshHost,
+    p.username,
+    profileDetail(p),
+    fileBaseName(p.database),
+  ].filter(Boolean).join(" ").toLowerCase();
+  return haystack.includes(query);
+}
+
+function filteredProfiles() {
+  const q = connectionSearchQuery();
+  const list = state.profiles || [];
+  if (!q) return list;
+  return list.filter((p) => profileMatchesSearch(p, q));
+}
+
 function isLiveProfile(p) {
   return !!(p && state.connectedIds && state.connectedIds[p.id]);
 }
@@ -401,7 +428,13 @@ function renderProfiles() {
     return;
   }
 
-  for (const p of state.profiles) {
+  const profiles = filteredProfiles();
+  if (!profiles.length) {
+    tree.innerHTML = `<div class="profile-empty">No connections match “${escapeHtml(connectionSearchQuery())}”.</div>`;
+    return;
+  }
+
+  for (const p of profiles) {
     const wrap = document.createElement("div");
     wrap.className = "tree-node conn-node";
     wrap.dataset.profileId = p.id;
@@ -5216,6 +5249,7 @@ function escapeHtml(s) {
 function wire() {
   wirePrefs();
   $("#btn-refresh-profiles").onclick = () => loadProfiles().catch(console.error);
+  $("#conn-search")?.addEventListener("input", () => renderProfiles());
   $("#btn-new-connection").onclick = openNewConnection;
   $("#btn-cancel-conn").onclick = () => {
     state.editingProfileId = null;

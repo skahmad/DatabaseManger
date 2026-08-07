@@ -394,6 +394,16 @@ body.resizing-sidebar * {
   padding: 0 0.15rem;
 }
 .explorer-head-actions { display: flex; gap: 0.2rem; }
+.conn-search-wrap {
+  flex-shrink: 0;
+  padding: 0.15rem 0.05rem 0.35rem;
+}
+.conn-search {
+  width: 100%;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.78rem;
+  border-radius: 8px;
+}
 .tree { flex: 1; overflow: auto; font-size: 0.85rem; min-height: 0; }
 .tree-children {
   margin-left: 0.55rem;
