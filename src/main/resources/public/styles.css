@@ -409,9 +409,23 @@ body.resizing-sidebar * {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .tree-row .tree-label strong {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
   font-size: 0.82rem;
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conn-live-dot {
+  flex-shrink: 0;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.2);
 }
 .tree-more {
   appearance: none;
