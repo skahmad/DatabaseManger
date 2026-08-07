@@ -617,12 +617,14 @@ body.resizing-sidebar * {
   border-bottom: 1px solid var(--line);
   background: var(--bg-elev);
 }
+.tabs[hidden] { display: none !important; }
 .tabs-left {
   display: flex;
   gap: 0.25rem;
   min-width: 0;
   flex-wrap: wrap;
 }
+.tabs-left[hidden] { display: none !important; }
 .tabs-right {
   display: flex;
   align-items: center;
@@ -630,6 +632,11 @@ body.resizing-sidebar * {
   margin-left: auto;
   flex-shrink: 0;
   padding-bottom: 0.45rem;
+}
+.tabs-right[hidden] { display: none !important; }
+.tabs.tabs-tools-only {
+  justify-content: flex-end;
+  padding-top: 0.45rem;
 }
 .pager-controls {
   display: inline-flex;

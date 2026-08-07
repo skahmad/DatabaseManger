@@ -42,6 +42,16 @@
             <option value="light">Light</option>
           </select>
         </label>
+        <label>Zoom
+          <select class="input pref-zoom" aria-label="Screen zoom">
+            <option value="75">75%</option>
+            <option value="90">90%</option>
+            <option value="100">100%</option>
+            <option value="110">110%</option>
+            <option value="125">125%</option>
+            <option value="150">150%</option>
+          </select>
+        </label>
       </div>
       <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize"></div>
     </aside>
@@ -55,15 +65,15 @@
         </div>
       </div>
 
-      <nav class="tabs" role="tablist" aria-label="View">
-        <div class="tabs-left">
+      <nav id="view-tabs" class="tabs" role="tablist" aria-label="View" hidden>
+        <div class="tabs-left" id="view-tabs-left">
           <button type="button" class="tab active" data-tab="details">Details</button>
           <button type="button" class="tab" data-tab="sql">SQL</button>
           <button type="button" class="tab" data-tab="data">Data</button>
           <button type="button" class="tab" data-tab="structure">Structure</button>
           <button type="button" class="tab" data-tab="ddl">DDL</button>
         </div>
-        <div class="tabs-right">
+        <div class="tabs-right" id="view-tabs-right">
           <input type="text" id="data-search" class="input tabs-search" placeholder="Search rows…" autocomplete="off" spellcheck="false" />
           <div class="pager-controls" aria-label="Pagination">
             <button type="button" class="btn ghost pager-btn" id="btn-page-prev" title="Previous page" aria-label="Previous page" disabled>←</button>
@@ -129,6 +139,7 @@
 
       <section id="panel-data" class="panel">
         <div class="toolbar">
+          <button type="button" class="btn ghost sm" id="btn-back-to-sql" hidden title="Back to SQL editor">← SQL</button>
           <span id="data-context" class="context-chip">No table selected</span>
         </div>
         <div class="table-wrap">

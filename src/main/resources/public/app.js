@@ -4,6 +4,7 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const PREFS_KEY = "forge-dbmanager-prefs";
 const THEMES = ["teal", "ocean", "ember", "violet", "slate", "light"];
 const DENSITIES = ["comfortable", "compact"];
+const ZOOM_LEVELS = [75, 90, 100, 110, 125, 150];
 
 const state = {
   profiles: [],
@@ -139,14 +140,32 @@ function savePrefs(partial) {
   return next;
 }
 
+function normalizeZoom(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 100;
+  const nearest = ZOOM_LEVELS.reduce((best, z) =>
+    Math.abs(z - n) < Math.abs(best - n) ? z : best, ZOOM_LEVELS[0]);
+  return nearest;
+}
+
+function applyZoom(zoom) {
+  const pct = normalizeZoom(zoom);
+  const root = document.documentElement;
+  root.style.zoom = `${pct}%`;
+  root.dataset.zoom = String(pct);
+  $$(".pref-zoom").forEach((el) => { el.value = String(pct); });
+}
+
 function applyPrefs() {
   const prefs = loadPrefs();
   const theme = THEMES.includes(prefs.theme) ? prefs.theme : "teal";
   const density = DENSITIES.includes(prefs.density) ? prefs.density : "compact";
+  const zoom = normalizeZoom(prefs.zoom ?? 100);
   document.documentElement.dataset.theme = theme;
   document.documentElement.dataset.density = density;
   $$(".pref-theme").forEach((el) => { el.value = theme; });
   $$(".pref-density").forEach((el) => { el.value = density; });
+  applyZoom(zoom);
   applySidebarWidth(prefs.sidebarWidth);
 }
 
@@ -213,6 +232,12 @@ function wirePrefs() {
   $$(".pref-density").forEach((el) => {
     el.onchange = () => {
       savePrefs({ density: el.value });
+      applyPrefs();
+    };
+  });
+  $$(".pref-zoom").forEach((el) => {
+    el.onchange = () => {
+      savePrefs({ zoom: normalizeZoom(el.value) });
       applyPrefs();
     };
   });
@@ -2572,24 +2597,60 @@ async function openTable(schema, table, connectionId, database = null) {
   // Opening a table replaces the DB/SCH context tab.
   removeContextTabs();
 
-  let tab = state.workspaceTabs.find((t) => t.id === id);
   const three = isThreeLayerProfile(profile);
+  let tab = state.workspaceTabs.find((t) => t.id === id);
+
   if (!tab) {
-    tab = {
-      id,
-      kind: "table",
-      title: table,
-      schema,
-      table,
-      database: dbName,
-      connectionId: cid,
-      queryDatabase: dbName,
-      querySchema: three ? schema : "",
-      closable: true,
-      pinned: false,
-      viewMode: "data",
-    };
-    state.workspaceTabs.push(tab);
+    // Reuse an unpinned table tab (prefer the active one). Only open a new
+    // tab when every existing table tab is pinned (or none exist yet).
+    const active = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+    let replace = null;
+    if (active && active.kind === "table" && !active.pinned) {
+      replace = active;
+    } else {
+      replace = state.workspaceTabs.find((t) => t.kind === "table" && !t.pinned) || null;
+    }
+
+    if (replace) {
+      const oldId = replace.id;
+      replace.id = id;
+      replace.kind = "table";
+      replace.title = table;
+      replace.schema = schema;
+      replace.table = table;
+      replace.database = dbName;
+      replace.connectionId = cid;
+      replace.queryDatabase = dbName;
+      replace.querySchema = three ? schema : "";
+      replace.columns = null;
+      replace.result = null;
+      replace.ddl = null;
+      replace.sql = null;
+      replace.page = 1;
+      replace.hiddenColumns = {};
+      replace.columnFilters = {};
+      replace.sqlFileName = null;
+      replace.sqlFilePath = null;
+      replace.viewMode = replace.viewMode === "details" ? "data" : (replace.viewMode || "data");
+      if (state.activeWorkspaceTabId === oldId) state.activeWorkspaceTabId = id;
+      tab = replace;
+    } else {
+      tab = {
+        id,
+        kind: "table",
+        title: table,
+        schema,
+        table,
+        database: dbName,
+        connectionId: cid,
+        queryDatabase: dbName,
+        querySchema: three ? schema : "",
+        closable: true,
+        pinned: false,
+        viewMode: "data",
+      };
+      state.workspaceTabs.push(tab);
+    }
   } else {
     tab.connectionId = cid;
     tab.schema = schema;
@@ -2988,13 +3049,78 @@ function renderDetailsItems(items) {
 
 /* ── Tabs / data grid ────────────────────────────── */
 
-function switchTab(name, { skipTitle = false } = {}) {
-  state.currentTab = name;
-  const activeWs = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
-  if (activeWs) activeWs.viewMode = name;
+function activeWorkspaceTab() {
+  return state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId) || null;
+}
 
-  $$(".tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
-  $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
+/** True when the active workspace tab is a concrete table. */
+function isTableWorkspaceActive(tab = activeWorkspaceTab()) {
+  return !!(tab && tab.kind === "table" && tab.table);
+}
+
+/**
+ * View tabs (Details/SQL/Data/Structure/DDL) only for table workspace tabs.
+ * Non-table query results keep the data tool strip (search/pager/export).
+ */
+function updateViewTabBarVisibility() {
+  const nav = $("#view-tabs");
+  const left = $("#view-tabs-left");
+  const right = $("#view-tabs-right");
+  const backBtn = $("#btn-back-to-sql");
+  if (!nav) return;
+
+  const tab = activeWorkspaceTab();
+  const isTable = isTableWorkspaceActive(tab);
+  const onData = state.currentTab === "data";
+  const showDataTools = onData && !!(state.result || isTable);
+
+  if (isTable) {
+    nav.hidden = false;
+    nav.classList.remove("tabs-tools-only");
+    if (left) left.hidden = false;
+    if (right) right.hidden = false;
+  } else if (showDataTools) {
+    // Query result on a DB/SQL tab: tools only, no view switcher.
+    nav.hidden = false;
+    nav.classList.add("tabs-tools-only");
+    if (left) left.hidden = true;
+    if (right) right.hidden = false;
+  } else {
+    nav.hidden = true;
+    nav.classList.remove("tabs-tools-only");
+    if (left) left.hidden = true;
+    if (right) right.hidden = true;
+  }
+
+  if (backBtn) {
+    backBtn.hidden = isTable || !onData || !(tab && (tab.kind === "sql" || tab.kind === "context" || tab.kind === "home"));
+  }
+}
+
+function switchTab(name, { skipTitle = false } = {}) {
+  const tab = activeWorkspaceTab();
+  const isTable = isTableWorkspaceActive(tab);
+  let target = name;
+
+  // Without a table, Structure/DDL/Details don't apply to SQL tabs.
+  if (!isTable) {
+    if (tab?.kind === "sql") {
+      target = (name === "data" && (state.result || tab.result)) ? "data" : "sql";
+    } else if (tab?.kind === "context" || tab?.kind === "home") {
+      if (name === "sql") target = "sql";
+      else if (name === "data" && (state.result || tab.result)) target = "data";
+      else target = "details";
+    } else if (!tab) {
+      target = "details";
+    }
+  }
+
+  state.currentTab = target;
+  if (tab) tab.viewMode = target;
+
+  $$(".tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === target));
+  $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${target}`));
+  updateViewTabBarVisibility();
 
   if (!skipTitle) {
     if (state.currentTable && state.currentSchema) {
@@ -3003,14 +3129,14 @@ function switchTab(name, { skipTitle = false } = {}) {
       updateContextMeta(state.detailFocus.schema);
     } else if (state.detailFocus?.scope === "database" && state.detailFocus.database) {
       updateContextMeta(state.detailFocus.database);
-    } else if (name !== "details") {
+    } else if (target !== "details") {
       updateContextMeta("");
     }
   }
-  if (name === "details") {
+  if (target === "details") {
     refreshDetails().catch((e) => console.error(e));
   }
-  if (name === "sql") {
+  if (target === "sql") {
     refreshSqlContextUi().catch((e) => console.error(e));
   }
 }
@@ -3366,6 +3492,7 @@ function renderData(result) {
     updateClearFiltersButton();
     closeColumnFilterPopup();
     closeColumnVisibilityMenu();
+    updateViewTabBarVisibility();
     return;
   }
   empty.hidden = true;
@@ -3446,6 +3573,7 @@ function renderData(result) {
   updatePager(from, end, rows.length, totalPages);
   updateColumnsButton(result.columns);
   updateClearFiltersButton();
+  updateViewTabBarVisibility();
 }
 
 function updatePager(from, to, total, totalPages) {
@@ -4150,6 +4278,10 @@ function wire() {
     closeWorkspaceTabsOverflowMenu();
     switchTab(t.dataset.tab);
   });
+  $("#btn-back-to-sql")?.addEventListener("click", () => {
+    switchTab("sql");
+    $("#sql-editor")?.focus();
+  });
 }
 
 async function boot() {
@@ -4157,6 +4289,7 @@ async function boot() {
   setConnectedUi(false);
   updateRunButton();
   renderWorkspaceTabs();
+  updateViewTabBarVisibility();
   await loadDbTypes();
   await loadProfiles();
   const session = await syncSessionState();
