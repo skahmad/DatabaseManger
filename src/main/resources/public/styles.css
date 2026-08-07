@@ -870,11 +870,349 @@ body.resizing-sidebar * {
   font-variant-numeric: tabular-nums;
 }
 .sql-find-count.sql-find-empty { color: #e35d6a; }
-.sql-editor {
-  flex: 1; width: 100%; resize: none; border: none; outline: none;
-  background: var(--editor-bg); color: var(--text); padding: 1.25rem 1.5rem;
-  font-family: var(--mono); font-size: 0.95rem; line-height: 1.55;
+.sql-zoom-label {
+  min-width: 2.6rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+  user-select: none;
 }
+.sql-find-mark {
+  background: rgba(251, 191, 36, 0.35);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0;
+}
+.sql-find-mark.current {
+  background: rgba(251, 191, 36, 0.7);
+  outline: 1px solid #fbbf24;
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.4);
+}
+.sql-workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sql-editor-shell {
+  flex: 1;
+  min-height: 4rem;
+  display: flex;
+  align-items: stretch;
+  background: var(--editor-bg);
+  border-top: 1px solid transparent;
+  overflow: hidden;
+  position: relative;
+  --sql-fs: 0.82rem;
+  --sql-lh: 1.45;
+}
+.sql-gutter {
+  flex: 0 0 auto;
+  min-width: 2.6rem;
+  padding: 0.55rem 0.35rem 0.55rem 0.45rem;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: var(--sql-fs);
+  line-height: var(--sql-lh);
+  color: var(--muted);
+  background: var(--bg-elev);
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+  user-select: none;
+  white-space: pre;
+  box-sizing: border-box;
+  z-index: 2;
+}
+.sql-gutter-line {
+  display: block;
+  height: calc(var(--sql-fs) * var(--sql-lh));
+  line-height: calc(var(--sql-fs) * var(--sql-lh));
+  padding-right: 0.15rem;
+  opacity: 0.72;
+}
+.sql-gutter-line.active {
+  color: var(--accent);
+  opacity: 1;
+  font-weight: 600;
+}
+.sql-code-pane {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.sql-highlight,
+.sql-editor {
+  margin: 0;
+  border: none;
+  outline: none;
+  padding: 0.55rem 0.75rem;
+  font-family: var(--mono);
+  font-size: var(--sql-fs);
+  line-height: var(--sql-lh);
+  tab-size: 2;
+  white-space: pre;
+  word-wrap: normal;
+  overflow-wrap: normal;
+  box-sizing: border-box;
+}
+.sql-highlight {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--text);
+  background: var(--editor-bg);
+  z-index: 0;
+}
+.sql-editor {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--text);
+  overflow: auto;
+  z-index: 1;
+}
+.sql-editor::placeholder {
+  color: var(--muted);
+  -webkit-text-fill-color: var(--muted);
+  opacity: 0.55;
+}
+.sql-editor::selection {
+  background: rgba(var(--accent-rgb), 0.35);
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+.sql-tok-kw { color: #7dd3fc; font-weight: 600; }
+.sql-tok-fn { color: #c4b5fd; }
+.sql-tok-type { color: #86efac; }
+.sql-tok-str { color: #f9a8d4; }
+.sql-tok-num { color: #fcd34d; }
+.sql-tok-cm { color: #64748b; font-style: italic; }
+.sql-tok-op { color: #94a3b8; }
+.sql-tok-tbl { color: #5eead4; }
+.sql-tok-col { color: #fde68a; }
+.sql-tok-id { color: var(--text); }
+[data-theme="light"] .sql-tok-kw { color: #0369a1; }
+[data-theme="light"] .sql-tok-fn { color: #6d28d9; }
+[data-theme="light"] .sql-tok-type { color: #15803d; }
+[data-theme="light"] .sql-tok-str { color: #be185d; }
+[data-theme="light"] .sql-tok-num { color: #b45309; }
+[data-theme="light"] .sql-tok-cm { color: #94a3b8; }
+[data-theme="light"] .sql-tok-tbl { color: #0f766e; }
+[data-theme="light"] .sql-tok-col { color: #a16207; }
+.sql-suggest {
+  position: absolute;
+  z-index: 40;
+  min-width: 12rem;
+  max-width: min(22rem, 70%);
+  max-height: 14rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.3rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+.sql-suggest[hidden] { display: none !important; }
+.sql-suggest-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 0.28rem 0.45rem;
+  border-radius: 6px;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  cursor: pointer;
+  width: 100%;
+}
+.sql-suggest-item:hover,
+.sql-suggest-item.active {
+  background: rgba(var(--accent-rgb), 0.14);
+  color: var(--accent);
+}
+.sql-suggest-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sql-suggest-kind {
+  flex-shrink: 0;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.sql-editor-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-shrink: 0;
+  padding: 0.2rem 0.65rem;
+  border-top: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+}
+.sql-editor-hint {
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font);
+  font-size: 0.7rem;
+}
+.sql-log-resizer {
+  flex: 0 0 5px;
+  cursor: row-resize;
+  background: transparent;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid transparent;
+  position: relative;
+  z-index: 3;
+}
+.sql-log-resizer:hover,
+.sql-log-resizer.active,
+body.resizing-sql-log .sql-log-resizer {
+  background: rgba(var(--accent-rgb), 0.35);
+  border-color: var(--accent);
+}
+.sql-log {
+  flex: 0 0 auto;
+  height: var(--sql-log-height, 9.5rem);
+  min-height: 2rem;
+  max-height: 70%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev);
+  border-top: 1px solid var(--line);
+  min-width: 0;
+}
+.sql-log.minimized {
+  height: auto !important;
+  max-height: none;
+}
+.sql-log.minimized .sql-log-output,
+.sql-log.minimized .sql-log-find-bar {
+  display: none !important;
+}
+.sql-workspace:has(.sql-log.minimized) .sql-log-resizer {
+  display: none !important;
+}
+.sql-log-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  padding: 0.2rem 0.45rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+  min-height: 1.9rem;
+}
+.sql-log-title {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+}
+.sql-log-meta {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sql-log-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  flex-shrink: 0;
+}
+.sql-log-toggle {
+  min-width: 1.6rem;
+  padding: 0.1rem 0.25rem;
+  font-size: 0.75rem;
+  line-height: 1;
+}
+.sql-log.minimized .sql-log-toggle { transform: rotate(-90deg); }
+.sql-log-find-bar { padding: 0.3rem 0.45rem; }
+.sql-log-output {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0.45rem 0.65rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--editor-bg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+  outline: none;
+}
+.sql-log-output:focus {
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.35);
+}
+.sql-log-entry {
+  margin: 0 0 0.65rem;
+  padding-bottom: 0.55rem;
+  border-bottom: 1px dashed var(--line);
+}
+.sql-log-entry:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.sql-log-entry-head {
+  color: var(--muted);
+  font-size: 0.7rem;
+  margin-bottom: 0.2rem;
+}
+.sql-log-entry.ok .sql-log-entry-head { color: #34d399; }
+.sql-log-entry.err .sql-log-entry-head { color: #fb7185; }
+.sql-log-entry.info .sql-log-entry-head { color: var(--accent); }
+.sql-log-entry-body { color: var(--text); }
+.sql-log-mark {
+  background: rgba(var(--accent-rgb), 0.35);
+  color: inherit;
+  border-radius: 2px;
+}
+.sql-log-mark.current {
+  background: rgba(251, 191, 36, 0.55);
+  outline: 1px solid #fbbf24;
+}
+body.resizing-sql-log { cursor: row-resize; user-select: none; }
+body.resizing-sql-log * { cursor: row-resize !important; }
 
 .table-wrap { flex: 1; overflow: auto; position: relative; }
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
@@ -965,7 +1303,19 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
 [data-density="compact"] .tab { padding: 0.4rem 0.7rem; font-size: 0.9rem; }
 [data-density="compact"] .toolbar { padding: 0.45rem 1rem; gap: 0.4rem; }
 [data-density="compact"] th, td { padding: 0.35rem 0.55rem; font-size: 0.8rem; }
-[data-density="compact"] .sql-editor { padding: 0.75rem 1rem; font-size: 0.85rem; line-height: 1.4; }
+[data-density="compact"] .sql-gutter {
+  min-width: 2.35rem;
+  padding: 0.45rem 0.3rem 0.45rem 0.35rem;
+}
+[data-density="compact"] .sql-editor-shell {
+  --sql-fs: 0.78rem;
+  --sql-lh: 1.4;
+}
+[data-density="compact"] .sql-highlight,
+[data-density="compact"] .sql-editor {
+  padding: 0.45rem 0.65rem;
+}
+[data-density="compact"] .sql-editor-status { padding: 0.15rem 0.55rem; font-size: 0.68rem; }
 [data-density="compact"] .ddl-view { padding: 0.75rem 1rem; font-size: 0.8rem; }
 [data-density="compact"] .tree { font-size: 0.82rem; }
 [data-density="compact"] .tree-row { padding: 0.2rem 0.3rem; }

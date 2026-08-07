@@ -5,6 +5,8 @@ const PREFS_KEY = "forge-dbmanager-prefs";
 const THEMES = ["teal", "ocean", "ember", "violet", "slate", "light"];
 const DENSITIES = ["comfortable", "compact"];
 const ZOOM_LEVELS = [75, 90, 100, 110, 125, 150];
+const SQL_EDITOR_ZOOM_LEVELS = [70, 80, 90, 100, 110, 125, 150, 175, 200];
+const SQL_EDITOR_BASE_REM = 0.82;
 
 const state = {
   profiles: [],
@@ -38,6 +40,25 @@ const state = {
   workspaceApplyEpoch: 0,
   /** SQL editor find: current match index among matches. */
   sqlFindIndex: -1,
+  /** Output log find: current match index. */
+  sqlLogFindIndex: -1,
+  sqlLogEntries: [],
+  /** Cached schema objects for SQL autocomplete / highlighting. */
+  sqlMeta: {
+    key: "",
+    tables: [],
+    views: [],
+    columnsByTable: {},
+    loading: false,
+    ready: false,
+  },
+  sqlSuggest: {
+    open: false,
+    items: [],
+    index: 0,
+    start: 0,
+    end: 0,
+  },
   /** Workspace tabs: DB/SCH context tab (transient) + closable table tabs. */
   workspaceTabs: [],
   activeWorkspaceTabId: null,
@@ -156,6 +177,53 @@ function applyZoom(zoom) {
   $$(".pref-zoom").forEach((el) => { el.value = String(pct); });
 }
 
+function normalizeSqlEditorZoom(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 100;
+  return SQL_EDITOR_ZOOM_LEVELS.reduce((best, z) =>
+    Math.abs(z - n) < Math.abs(best - n) ? z : best, SQL_EDITOR_ZOOM_LEVELS[0]);
+}
+
+/** Zoom only the SQL editor text (not the whole app). */
+function applySqlEditorZoom(zoom, { persist = true } = {}) {
+  const pct = normalizeSqlEditorZoom(zoom);
+  const shell = $("#sql-editor-shell");
+  const base = document.documentElement.dataset.density === "compact" ? 0.78 : SQL_EDITOR_BASE_REM;
+  const fs = base * (pct / 100);
+  const fsCss = `${fs.toFixed(3)}rem`;
+  if (shell) {
+    shell.style.setProperty("--sql-fs", fsCss);
+    shell.dataset.editorZoom = String(pct);
+  }
+  // Direct font-size for JavaFX WebView, which can ignore CSS variables on some nodes.
+  ["#sql-editor", "#sql-highlight", "#sql-gutter"].forEach((sel) => {
+    const el = $(sel);
+    if (el) el.style.fontSize = fsCss;
+  });
+  const label = $("#sql-zoom-label");
+  if (label) label.textContent = `${pct}%`;
+  const hint = $("#sql-editor-hint");
+  if (hint) {
+    const zoomBit = pct === 100 ? "" : ` · text ${pct}%`;
+    hint.textContent = `Tab indent · Ctrl+Space suggest · Ctrl+F find · Ctrl± zoom${zoomBit} · ⌘/Ctrl+Enter run`;
+  }
+  if (persist) savePrefs({ sqlEditorZoom: pct });
+  if (typeof refreshSqlEditorUi === "function") refreshSqlEditorUi();
+  return pct;
+}
+
+function bumpSqlEditorZoom(delta) {
+  const current = normalizeSqlEditorZoom(loadPrefs().sqlEditorZoom ?? $("#sql-editor-shell")?.dataset.editorZoom ?? 100);
+  let idx = SQL_EDITOR_ZOOM_LEVELS.indexOf(current);
+  if (idx < 0) idx = SQL_EDITOR_ZOOM_LEVELS.indexOf(100);
+  const nextIdx = Math.min(SQL_EDITOR_ZOOM_LEVELS.length - 1, Math.max(0, idx + delta));
+  return applySqlEditorZoom(SQL_EDITOR_ZOOM_LEVELS[nextIdx]);
+}
+
+function isSqlPanelActive() {
+  return !!$("#panel-sql")?.classList.contains("active");
+}
+
 function applyPrefs() {
   const prefs = loadPrefs();
   const theme = THEMES.includes(prefs.theme) ? prefs.theme : "teal";
@@ -166,7 +234,9 @@ function applyPrefs() {
   $$(".pref-theme").forEach((el) => { el.value = theme; });
   $$(".pref-density").forEach((el) => { el.value = density; });
   applyZoom(zoom);
+  applySqlEditorZoom(prefs.sqlEditorZoom ?? 100, { persist: false });
   applySidebarWidth(prefs.sidebarWidth);
+  applySqlLogLayout();
 }
 
 function applySidebarWidth(width) {
@@ -233,6 +303,7 @@ function wirePrefs() {
     el.onchange = () => {
       savePrefs({ density: el.value });
       applyPrefs();
+      applySqlEditorZoom(loadPrefs().sqlEditorZoom ?? 100, { persist: false });
     };
   });
   $$(".pref-zoom").forEach((el) => {
@@ -1178,10 +1249,816 @@ function updateSqlFileChip(name = state.sqlFileName) {
   }
 }
 
-function setSqlEditorContent(sql, fileName = null, filePath = null) {
-  const editor = $("#sql-editor");
+const SQL_INDENT = "  ";
+
+const SQL_KEYWORDS = new Set([
+  "select", "from", "where", "and", "or", "not", "insert", "into", "values", "update", "set",
+  "delete", "create", "alter", "drop", "table", "view", "index", "unique", "primary", "key",
+  "foreign", "references", "constraint", "null", "is", "in", "like", "ilike", "between", "exists",
+  "join", "inner", "left", "right", "full", "outer", "cross", "on", "using", "as", "distinct",
+  "group", "by", "order", "asc", "desc", "having", "limit", "offset", "fetch", "next", "only",
+  "union", "all", "except", "intersect", "case", "when", "then", "else", "end", "with",
+  "recursive", "returning", "default", "check", "cascade", "restrict", "truncate", "replace",
+  "function", "procedure", "trigger", "begin", "commit", "rollback", "transaction", "grant",
+  "revoke", "schema", "database", "if", "elsif", "elseif", "loop", "while", "for", "return",
+  "returns", "declare", "true", "false", "cast", "over", "partition", "window", "lateral",
+  "natural", "some", "any", "of", "to", "add", "column", "rename", "type", "owner", "explain",
+  "analyze", "vacuum", "show", "use", "desc", "describe", "do", "language", "plpgsql",
+]);
+
+const SQL_FUNCTIONS = new Set([
+  "count", "sum", "avg", "min", "max", "coalesce", "nullif", "greatest", "least", "now",
+  "current_timestamp", "current_date", "current_time", "date", "time", "timestamp", "extract",
+  "date_trunc", "age", "concat", "concat_ws", "substring", "substr", "trim", "ltrim", "rtrim",
+  "lower", "upper", "length", "char_length", "replace", "position", "round", "floor", "ceil",
+  "abs", "mod", "power", "sqrt", "random", "md5", "uuid_generate_v4", "json_build_object",
+  "jsonb_agg", "array_agg", "string_agg", "row_number", "rank", "dense_rank", "lag", "lead",
+  "first_value", "last_value", "nvl", "ifnull", "isnull", "convert", "cast", "format",
+]);
+
+const SQL_TYPES = new Set([
+  "int", "integer", "bigint", "smallint", "tinyint", "serial", "bigserial", "numeric", "decimal",
+  "real", "double", "float", "boolean", "bool", "text", "varchar", "char", "character", "bytea",
+  "blob", "clob", "json", "jsonb", "uuid", "date", "time", "timestamp", "timestamptz", "interval",
+  "array", "enum", "money", "bit", "varbinary", "nvarchar", "ntext", "datetime", "datetime2",
+]);
+
+function getSqlEditor() {
+  return $("#sql-editor");
+}
+
+function getSqlEditorValue() {
+  return getSqlEditor()?.value ?? "";
+}
+
+/** Set editor text and refresh gutter / highlight / cursor chrome. */
+function setSqlEditorValue(text) {
+  const editor = getSqlEditor();
   if (!editor) return;
-  editor.value = sql ?? "";
+  editor.value = text ?? "";
+  refreshSqlEditorUi();
+}
+
+function sqlLineColAt(text, index) {
+  const safe = Math.max(0, Math.min(index ?? 0, text.length));
+  const before = text.slice(0, safe);
+  const lines = before.split("\n");
+  return { line: lines.length, col: (lines[lines.length - 1] || "").length + 1 };
+}
+
+function sqlMetaObjectNames() {
+  const meta = state.sqlMeta || {};
+  const tables = new Set((meta.tables || []).map((t) => String(t).toLowerCase()));
+  const views = new Set((meta.views || []).map((t) => String(t).toLowerCase()));
+  const cols = new Set();
+  for (const list of Object.values(meta.columnsByTable || {})) {
+    for (const c of list || []) cols.add(String(c).toLowerCase());
+  }
+  for (const c of state.columns || []) {
+    if (c?.name) cols.add(String(c.name).toLowerCase());
+  }
+  return { tables, views, cols };
+}
+
+function highlightSql(text) {
+  const src = text || "";
+  if (!src) return "";
+  const { tables, views, cols } = sqlMetaObjectNames();
+  let out = "";
+  let i = 0;
+  const len = src.length;
+
+  const push = (cls, value) => {
+    out += `<span class="${cls}">${escapeHtml(value)}</span>`;
+  };
+
+  while (i < len) {
+    const c = src[i];
+    const next = src[i + 1] || "";
+
+    if (c === "-" && next === "-") {
+      let j = i + 2;
+      while (j < len && src[j] !== "\n") j += 1;
+      push("sql-tok-cm", src.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      let j = i + 2;
+      while (j < len - 1 && !(src[j] === "*" && src[j + 1] === "/")) j += 1;
+      j = Math.min(len, j + 2);
+      push("sql-tok-cm", src.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      const quote = c;
+      let j = i + 1;
+      while (j < len) {
+        if (src[j] === quote) {
+          if (src[j + 1] === quote) { j += 2; continue; }
+          j += 1;
+          break;
+        }
+        if (src[j] === "\n" && quote === "'") break;
+        j += 1;
+      }
+      push("sql-tok-str", src.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (c === "$") {
+      // PostgreSQL dollar-quote: $$…$$ or $tag$…$tag$
+      const tagMatch = src.slice(i).match(/^\$([A-Za-z_][A-Za-z0-9_]*)?\$/);
+      if (tagMatch) {
+        const tag = tagMatch[0];
+        const closeAt = src.indexOf(tag, i + tag.length);
+        const end = closeAt >= 0 ? closeAt + tag.length : len;
+        push("sql-tok-str", src.slice(i, end));
+        i = end;
+        continue;
+      }
+    }
+    if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(next))) {
+      let j = i + 1;
+      while (j < len && /[0-9.]/.test(src[j])) j += 1;
+      push("sql-tok-num", src.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(c) || c === "`" || c === "[") {
+      let j = i;
+      if (c === "`" || c === "[") {
+        const close = c === "`" ? "`" : "]";
+        j = i + 1;
+        while (j < len && src[j] !== close && src[j] !== "\n") j += 1;
+        if (j < len) j += 1;
+      } else {
+        j = i + 1;
+        while (j < len && /[A-Za-z0-9_$]/.test(src[j])) j += 1;
+      }
+      const raw = src.slice(i, j);
+      const bare = raw.replace(/^[`"\[]|[`"\]]$/g, "");
+      const lower = bare.toLowerCase();
+      let cls = "sql-tok-id";
+      if (SQL_KEYWORDS.has(lower)) cls = "sql-tok-kw";
+      else if (SQL_FUNCTIONS.has(lower)) cls = "sql-tok-fn";
+      else if (SQL_TYPES.has(lower)) cls = "sql-tok-type";
+      else if (tables.has(lower) || views.has(lower)) cls = "sql-tok-tbl";
+      else if (cols.has(lower)) cls = "sql-tok-col";
+      push(cls, raw);
+      i = j;
+      continue;
+    }
+    if (/[().,;=*/%!<>|&+\-]/.test(c)) {
+      let j = i + 1;
+      if ((c === "<" || c === ">" || c === "!" || c === "=" || c === "|") && /[=<>|]/.test(next)) j += 1;
+      push("sql-tok-op", src.slice(i, j));
+      i = j;
+      continue;
+    }
+    // whitespace / other
+    let j = i + 1;
+    while (j < len && !/[A-Za-z0-9_`"'$\/\-]/.test(src[j]) && !/[().,;=*/%!<>|&+]/.test(src[j])) {
+      // stop at potential comment/string starts handled above next loop
+      if (src[j] === "-" || src[j] === "/" || src[j] === "'" || src[j] === '"' || src[j] === "$") break;
+      if (/[A-Za-z0-9_`]/.test(src[j])) break;
+      j += 1;
+    }
+    out += escapeHtml(src.slice(i, j));
+    i = j;
+  }
+  // Preserve trailing newline height in <pre>
+  if (src.endsWith("\n")) out += "\n";
+  return out;
+}
+
+function renderSqlFindMarkedHtml(text, query, matchCase, currentIndex) {
+  const matches = collectSqlFindMatches(text, query, matchCase);
+  if (!matches.length) return escapeHtml(text || "");
+  let out = "";
+  let pos = 0;
+  const len = query.length;
+  matches.forEach((start, i) => {
+    const end = start + len;
+    out += escapeHtml(text.slice(pos, start));
+    const cls = i === currentIndex ? "sql-find-mark current" : "sql-find-mark";
+    out += `<mark class="${cls}">${escapeHtml(text.slice(start, end))}</mark>`;
+    pos = end;
+  });
+  out += escapeHtml(text.slice(pos));
+  if (text.endsWith("\n")) out += "\n";
+  return out;
+}
+
+function refreshSqlHighlight() {
+  const editor = getSqlEditor();
+  const pre = $("#sql-highlight");
+  if (!editor || !pre) return;
+  const text = editor.value || "";
+  const findOpen = !$("#sql-find-bar")?.hidden;
+  const query = findOpen ? ($("#sql-find-input")?.value || "") : "";
+  if (findOpen && query) {
+    const matchCase = !!$("#sql-find-case")?.checked;
+    const idx = Math.max(0, state.sqlFindIndex);
+    pre.innerHTML = renderSqlFindMarkedHtml(text, query, matchCase, idx) || " ";
+  } else {
+    pre.innerHTML = highlightSql(text) || " ";
+  }
+  pre.scrollTop = editor.scrollTop;
+  pre.scrollLeft = editor.scrollLeft;
+}
+
+function refreshSqlGutter() {
+  const editor = getSqlEditor();
+  const gutter = $("#sql-gutter");
+  if (!editor || !gutter) return;
+  const text = editor.value || "";
+  const lineCount = text.length ? text.split("\n").length : 1;
+  const { line: activeLine } = sqlLineColAt(text, editor.selectionStart ?? 0);
+  const widthDigits = String(Math.max(lineCount, 1)).length;
+  gutter.style.minWidth = `${Math.max(2.35, 1.1 + widthDigits * 0.55)}rem`;
+
+  let html = "";
+  for (let i = 1; i <= lineCount; i++) {
+    html += `<span class="sql-gutter-line${i === activeLine ? " active" : ""}">${i}</span>`;
+  }
+  gutter.innerHTML = html;
+  gutter.scrollTop = editor.scrollTop;
+}
+
+function refreshSqlCursorStatus() {
+  const editor = getSqlEditor();
+  const pos = $("#sql-cursor-pos");
+  if (!editor || !pos) return;
+  const { line, col } = sqlLineColAt(editor.value || "", editor.selectionStart ?? 0);
+  const selLen = Math.abs((editor.selectionEnd ?? 0) - (editor.selectionStart ?? 0));
+  pos.textContent = selLen > 0 ? `Ln ${line}, Col ${col} · ${selLen} selected` : `Ln ${line}, Col ${col}`;
+}
+
+function refreshSqlEditorUi() {
+  refreshSqlHighlight();
+  refreshSqlGutter();
+  refreshSqlCursorStatus();
+}
+
+function syncSqlEditorScroll() {
+  const editor = getSqlEditor();
+  const gutter = $("#sql-gutter");
+  const pre = $("#sql-highlight");
+  if (!editor) return;
+  if (gutter) gutter.scrollTop = editor.scrollTop;
+  if (pre) {
+    pre.scrollTop = editor.scrollTop;
+    pre.scrollLeft = editor.scrollLeft;
+  }
+}
+
+function replaceSqlEditorRange(start, end, insert) {
+  const editor = getSqlEditor();
+  if (!editor) return;
+  const value = editor.value;
+  editor.value = value.slice(0, start) + insert + value.slice(end);
+  const caret = start + insert.length;
+  editor.setSelectionRange(caret, caret);
+  refreshSqlEditorUi();
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function indentSqlSelection(outdent = false) {
+  const editor = getSqlEditor();
+  if (!editor) return;
+  const value = editor.value;
+  let start = editor.selectionStart;
+  let end = editor.selectionEnd;
+  const hasSelection = start !== end;
+
+  if (!hasSelection && !outdent) {
+    replaceSqlEditorRange(start, end, SQL_INDENT);
+    return;
+  }
+
+  while (start > 0 && value[start - 1] !== "\n") start -= 1;
+  let endLine = end;
+  if (endLine > start && value[endLine - 1] === "\n") endLine -= 1;
+  while (endLine < value.length && value[endLine] !== "\n") endLine += 1;
+
+  const block = value.slice(start, endLine);
+  const lines = block.split("\n");
+  const next = lines.map((line) => {
+    if (outdent) {
+      if (line.startsWith(SQL_INDENT)) return line.slice(SQL_INDENT.length);
+      if (line.startsWith("\t")) return line.slice(1);
+      if (line.startsWith(" ")) return line.replace(/^ {1,2}/, "");
+      return line;
+    }
+    return line.length ? SQL_INDENT + line : line;
+  }).join("\n");
+
+  editor.value = value.slice(0, start) + next + value.slice(endLine);
+  const delta = next.length - block.length;
+  editor.setSelectionRange(start, endLine + delta);
+  refreshSqlEditorUi();
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function toggleSqlLineComment() {
+  const editor = getSqlEditor();
+  if (!editor) return;
+  const value = editor.value;
+  let start = editor.selectionStart;
+  let end = editor.selectionEnd;
+  while (start > 0 && value[start - 1] !== "\n") start -= 1;
+  let endLine = end;
+  if (endLine > start && value[endLine - 1] === "\n") endLine -= 1;
+  while (endLine < value.length && value[endLine] !== "\n") endLine += 1;
+
+  const block = value.slice(start, endLine);
+  const lines = block.split("\n");
+  const uncomment = lines.every((line) => !line.trim() || /^\s*--/.test(line));
+  const next = lines.map((line) => {
+    if (!line.trim()) return line;
+    if (uncomment) return line.replace(/^(\s*)--\s?/, "$1");
+    const m = line.match(/^(\s*)/);
+    return `${m ? m[1] : ""}-- ${line.slice(m ? m[1].length : 0)}`;
+  }).join("\n");
+
+  editor.value = value.slice(0, start) + next + value.slice(endLine);
+  editor.setSelectionRange(start, start + next.length);
+  refreshSqlEditorUi();
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function autoIndentSqlOnEnter() {
+  const editor = getSqlEditor();
+  if (!editor) return;
+  const value = editor.value;
+  const pos = editor.selectionStart;
+  const lineStart = value.lastIndexOf("\n", pos - 1) + 1;
+  const prevLine = value.slice(lineStart, pos);
+  const indent = (prevLine.match(/^\s*/) || [""])[0];
+  const extra = /\(\s*$/.test(prevLine.trimEnd()) || /\b(BEGIN|THEN|ELSE|LOOP)\s*$/i.test(prevLine.trim())
+    ? SQL_INDENT
+    : "";
+  replaceSqlEditorRange(pos, pos, `\n${indent}${extra}`);
+}
+
+/* ── SQL schema meta + autocomplete ─────────────── */
+
+function sqlListSchema() {
+  const ctx = readSqlContextFromUi();
+  const profile = activeProfile();
+  if (isThreeLayerProfile(profile)) {
+    return ctx.schema || state.currentSchema || "";
+  }
+  return ctx.database || state.currentSchema || profileDatabaseName(state.activeConnectionId) || "";
+}
+
+function sqlMetaCacheKey() {
+  return `${state.activeConnectionId || ""}::${sqlListSchema()}`;
+}
+
+async function ensureSqlMeta({ force = false } = {}) {
+  const cid = state.activeConnectionId;
+  const schema = sqlListSchema();
+  if (!cid || !schema) return state.sqlMeta;
+  const key = `${cid}::${schema}`;
+  if (!force && state.sqlMeta.key === key && state.sqlMeta.ready) {
+    return state.sqlMeta;
+  }
+  if (state.sqlMeta.loading && state.sqlMeta.key === key && !force) return state.sqlMeta;
+
+  state.sqlMeta = {
+    key,
+    tables: state.sqlMeta.key === key ? (state.sqlMeta.tables || []) : [],
+    views: state.sqlMeta.key === key ? (state.sqlMeta.views || []) : [],
+    columnsByTable: state.sqlMeta.key === key ? (state.sqlMeta.columnsByTable || {}) : {},
+    loading: true,
+    ready: false,
+  };
+
+  try {
+    const base = withConnectionId(`/api/databases/${encodeURIComponent(schema)}`, cid);
+    const [tables, views] = await Promise.all([
+      api(`${base}/tables`).catch(() => []),
+      api(`${base}/views`).catch(() => []),
+    ]);
+    if (sqlMetaCacheKey() !== key) return state.sqlMeta;
+    state.sqlMeta.tables = Array.isArray(tables) ? tables : [];
+    state.sqlMeta.views = Array.isArray(views) ? views : [];
+    if (state.currentTable && state.columns?.length) {
+      state.sqlMeta.columnsByTable[state.currentTable] = state.columns.map((c) => c.name).filter(Boolean);
+    }
+    state.sqlMeta.ready = true;
+  } catch (e) {
+    console.error(e);
+  } finally {
+    if (state.sqlMeta.key === key) state.sqlMeta.loading = false;
+    refreshSqlHighlight();
+  }
+  return state.sqlMeta;
+}
+
+async function ensureSqlTableColumns(table) {
+  if (!table) return [];
+  const schema = sqlListSchema();
+  const cid = state.activeConnectionId;
+  if (!cid || !schema) return [];
+  const cached = state.sqlMeta.columnsByTable?.[table];
+  if (cached) return cached;
+  try {
+    const cols = await api(withConnectionId(
+      `/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/columns`,
+      cid
+    ));
+    const names = (Array.isArray(cols) ? cols : []).map((c) => c.name || c).filter(Boolean);
+    if (!state.sqlMeta.columnsByTable) state.sqlMeta.columnsByTable = {};
+    state.sqlMeta.columnsByTable[table] = names;
+    refreshSqlHighlight();
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+function tablesReferencedInSql(sql) {
+  const names = new Set();
+  const re = /\b(?:from|join|update|into|table)\s+([`"\[]?)([A-Za-z_][\w$]*)\1/gi;
+  let m;
+  while ((m = re.exec(sql || ""))) {
+    names.add(m[2]);
+  }
+  if (state.currentTable) names.add(state.currentTable);
+  return [...names];
+}
+
+function closeSqlSuggest() {
+  state.sqlSuggest = { open: false, items: [], index: 0, start: 0, end: 0 };
+  const box = $("#sql-suggest");
+  if (box) {
+    box.hidden = true;
+    box.innerHTML = "";
+  }
+}
+
+function renderSqlSuggest() {
+  const box = $("#sql-suggest");
+  const editor = getSqlEditor();
+  if (!box || !editor) return;
+  const { open, items, index } = state.sqlSuggest;
+  if (!open || !items.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = items.map((item, i) => (
+    `<button type="button" class="sql-suggest-item${i === index ? " active" : ""}" data-idx="${i}" role="option" aria-selected="${i === index}">`
+    + `<span class="sql-suggest-label">${escapeHtml(item.label)}</span>`
+    + `<span class="sql-suggest-kind">${escapeHtml(item.kind)}</span>`
+    + `</button>`
+  )).join("");
+
+  // Position near caret (approximate via line/col).
+  const { line, col } = sqlLineColAt(editor.value || "", state.sqlSuggest.start);
+  const style = getComputedStyle(editor);
+  const lineHeight = parseFloat(style.lineHeight) || 18;
+  const padTop = parseFloat(style.paddingTop) || 0;
+  const padLeft = parseFloat(style.paddingLeft) || 0;
+  const charW = (() => {
+    // Rough monospace width from font-size.
+    return (parseFloat(style.fontSize) || 13) * 0.62;
+  })();
+  const gutter = $("#sql-gutter");
+  const gutterW = gutter ? gutter.getBoundingClientRect().width : 0;
+  const top = padTop + (line * lineHeight) - editor.scrollTop + 4;
+  const left = gutterW + padLeft + ((col - 1) * charW) - editor.scrollLeft;
+  box.style.top = `${Math.max(8, Math.min(top, editor.clientHeight - 24))}px`;
+  box.style.left = `${Math.max(gutterW + 8, Math.min(left, (editor.parentElement?.clientWidth || 300) - 40))}px`;
+
+  const active = box.querySelector(".sql-suggest-item.active");
+  active?.scrollIntoView({ block: "nearest" });
+}
+
+function acceptSqlSuggest(idx = state.sqlSuggest.index) {
+  const editor = getSqlEditor();
+  const item = state.sqlSuggest.items[idx];
+  if (!editor || !item) return;
+  const { start, end } = state.sqlSuggest;
+  const insert = item.insert ?? item.label;
+  const value = editor.value;
+  editor.value = value.slice(0, start) + insert + value.slice(end);
+  let caret = start + insert.length;
+  // Place caret inside function parens: COUNT()
+  if (insert.endsWith("()")) caret -= 1;
+  editor.setSelectionRange(caret, caret);
+  closeSqlSuggest();
+  refreshSqlEditorUi();
+  editor.focus();
+}
+
+async function updateSqlSuggest({ force = false } = {}) {
+  const editor = getSqlEditor();
+  if (!editor) return;
+  const value = editor.value || "";
+  const caret = editor.selectionStart ?? 0;
+  if (editor.selectionStart !== editor.selectionEnd && !force) {
+    closeSqlSuggest();
+    return;
+  }
+
+  await ensureSqlMeta();
+
+  // Word / table.column prefix before caret.
+  const before = value.slice(0, caret);
+  const m = before.match(/(?:([A-Za-z_][\w$]*)\.)?([A-Za-z_][\w$]*)$/);
+  if (!m && !force) {
+    closeSqlSuggest();
+    return;
+  }
+  const tableRef = m?.[1] || "";
+  const prefix = (m?.[2] || "");
+  const start = caret - prefix.length - (tableRef ? tableRef.length + 1 : 0);
+  const tokenStart = caret - prefix.length;
+  const q = prefix.toLowerCase();
+
+  if (!force && !tableRef && prefix.length < 1) {
+    closeSqlSuggest();
+    return;
+  }
+
+  const items = [];
+  const pushUnique = (label, kind, insert = label, score = 0) => {
+    if (items.some((x) => x.label === label && x.kind === kind)) return;
+    items.push({ label, kind, insert, score });
+  };
+
+  if (tableRef) {
+    // column completion for tableRef.
+    const tableName = (state.sqlMeta.tables || []).find((t) => t.toLowerCase() === tableRef.toLowerCase())
+      || (state.sqlMeta.views || []).find((t) => t.toLowerCase() === tableRef.toLowerCase())
+      || tableRef;
+    const cols = await ensureSqlTableColumns(tableName);
+    for (const col of cols) {
+      if (!q || col.toLowerCase().startsWith(q) || col.toLowerCase().includes(q)) {
+        pushUnique(col, "col", col, col.toLowerCase().startsWith(q) ? 2 : 1);
+      }
+    }
+  } else {
+    // Prefer tables/views after FROM/JOIN/UPDATE/INTO/TABLE.
+    const head = before.slice(0, tokenStart);
+    const afterObjectKw = /\b(from|join|update|into|table|references)\s+$/i.test(head);
+    const afterSelectish = /\b(select|where|and|or|on|set|by|having|returning)\s+$/i.test(head)
+      || /[,(]\s*$/.test(head);
+
+    for (const t of state.sqlMeta.tables || []) {
+      if (!q || t.toLowerCase().startsWith(q) || t.toLowerCase().includes(q)) {
+        pushUnique(t, "table", t, (afterObjectKw ? 5 : 2) + (t.toLowerCase().startsWith(q) ? 1 : 0));
+      }
+    }
+    for (const t of state.sqlMeta.views || []) {
+      if (!q || t.toLowerCase().startsWith(q) || t.toLowerCase().includes(q)) {
+        pushUnique(t, "view", t, (afterObjectKw ? 4 : 1) + (t.toLowerCase().startsWith(q) ? 1 : 0));
+      }
+    }
+
+    // Columns from referenced tables / current table.
+    const refs = tablesReferencedInSql(value);
+    for (const tbl of refs) {
+      const cols = state.sqlMeta.columnsByTable?.[tbl]
+        || (tbl === state.currentTable ? (state.columns || []).map((c) => c.name) : null);
+      if (!cols) {
+        ensureSqlTableColumns(tbl); // warm cache async
+        continue;
+      }
+      for (const col of cols) {
+        if (!col) continue;
+        if (!q || col.toLowerCase().startsWith(q) || col.toLowerCase().includes(q)) {
+          pushUnique(col, "col", col, (afterSelectish ? 4 : 2) + (col.toLowerCase().startsWith(q) ? 1 : 0));
+        }
+      }
+    }
+
+    if (!afterObjectKw) {
+      for (const kw of SQL_KEYWORDS) {
+        if (q && kw.startsWith(q)) pushUnique(kw.toUpperCase(), "kw", kw.toUpperCase(), 1);
+      }
+      for (const fn of SQL_FUNCTIONS) {
+        if (q && fn.startsWith(q)) pushUnique(`${fn.toUpperCase()}()`, "fn", `${fn.toUpperCase()}()`, 1);
+      }
+    }
+  }
+
+  items.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));
+  const limited = items.slice(0, 40);
+  if (!limited.length) {
+    closeSqlSuggest();
+    return;
+  }
+
+  state.sqlSuggest = {
+    open: true,
+    items: limited,
+    index: 0,
+    start: tableRef ? tokenStart : tokenStart,
+    end: caret,
+  };
+  // When completing after table., only replace the column prefix.
+  if (tableRef) {
+    state.sqlSuggest.start = tokenStart;
+  }
+  renderSqlSuggest();
+}
+
+function handleSqlSuggestKeydown(e) {
+  if (!state.sqlSuggest.open) return false;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    state.sqlSuggest.index = (state.sqlSuggest.index + 1) % state.sqlSuggest.items.length;
+    renderSqlSuggest();
+    return true;
+  }
+  if (e.key === "ArrowUp") {
+    e.preventDefault();
+    state.sqlSuggest.index = (state.sqlSuggest.index - 1 + state.sqlSuggest.items.length) % state.sqlSuggest.items.length;
+    renderSqlSuggest();
+    return true;
+  }
+  if (e.key === "Enter" || e.key === "Tab") {
+    e.preventDefault();
+    acceptSqlSuggest();
+    return true;
+  }
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeSqlSuggest();
+    return true;
+  }
+  return false;
+}
+
+function handleSqlEditorKeydown(e) {
+  const editor = getSqlEditor();
+  if (!editor) return;
+
+  if (handleSqlSuggestKeydown(e)) return;
+
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod) {
+    if (e.key === "Tab") {
+      e.preventDefault();
+      indentSqlSelection(e.shiftKey);
+      return;
+    }
+    if (e.key === "Enter" && !e.altKey) {
+      e.preventDefault();
+      autoIndentSqlOnEnter();
+      return;
+    }
+    if (e.key === "Escape" && !$("#sql-find-bar")?.hidden) {
+      e.preventDefault();
+      closeSqlFindBar();
+    }
+    return;
+  }
+
+  // Use e.code — more reliable than e.key in JavaFX WebView.
+  if (e.code === "Equal" || e.code === "NumpadAdd" || e.key === "=" || e.key === "+") {
+    e.preventDefault();
+    bumpSqlEditorZoom(1);
+    return;
+  }
+  if (e.code === "Minus" || e.code === "NumpadSubtract" || e.key === "-" || e.key === "_") {
+    e.preventDefault();
+    bumpSqlEditorZoom(-1);
+    return;
+  }
+  if (e.code === "Digit0" || e.code === "Numpad0" || e.key === "0") {
+    e.preventDefault();
+    applySqlEditorZoom(100);
+    return;
+  }
+  if (e.code === "Space" || e.key === " ") {
+    e.preventDefault();
+    updateSqlSuggest({ force: true });
+    return;
+  }
+  if (e.code === "Slash" || e.key === "/") {
+    e.preventDefault();
+    toggleSqlLineComment();
+    return;
+  }
+  if (e.code === "Enter" || e.key === "Enter") {
+    e.preventDefault();
+    if ($("#btn-run")?.disabled) return;
+    runSql();
+    return;
+  }
+  if (e.code === "KeyF" || e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    openSqlFindBar();
+    return;
+  }
+  if (e.code === "KeyG" || e.key.toLowerCase() === "g") {
+    e.preventDefault();
+    if ($("#sql-find-bar")?.hidden) openSqlFindBar();
+    else runSqlFind(e.shiftKey ? -1 : 1, { focusEditor: true });
+    return;
+  }
+  if (e.code === "KeyS" || e.key.toLowerCase() === "s") {
+    e.preventDefault();
+    saveSqlFile();
+    return;
+  }
+  if (e.code === "KeyO" || e.key.toLowerCase() === "o") {
+    e.preventDefault();
+    loadSqlFile();
+  }
+}
+
+function wireSqlGlobalShortcuts() {
+  if (window.__sqlGlobalShortcutsWired) return;
+  window.__sqlGlobalShortcutsWired = true;
+  window.addEventListener("keydown", (e) => {
+    if (!isSqlPanelActive()) return;
+    const mod = e.metaKey || e.ctrlKey;
+    if (!mod) return;
+
+    const t = e.target;
+    const id = t && t.id;
+    const inLog = !!(t && (id === "sql-log-output" || t.closest?.("#sql-log")));
+    const inFindInput = id === "sql-find-input" || id === "sql-log-find-input";
+
+    if (e.code === "KeyF" || (e.key && e.key.toLowerCase() === "f")) {
+      // Always handle find on the SQL panel (WebView often won't reach the textarea handler).
+      if (inFindInput) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (inLog) openSqlLogFindBar();
+      else openSqlFindBar();
+      return;
+    }
+
+    if (inFindInput || id === "sql-editor") return; // editor has its own handler
+
+    if (e.code === "Equal" || e.code === "NumpadAdd" || e.key === "=" || e.key === "+") {
+      e.preventDefault();
+      bumpSqlEditorZoom(1);
+    } else if (e.code === "Minus" || e.code === "NumpadSubtract" || e.key === "-" || e.key === "_") {
+      e.preventDefault();
+      bumpSqlEditorZoom(-1);
+    } else if (e.code === "Digit0" || e.code === "Numpad0" || e.key === "0") {
+      e.preventDefault();
+      applySqlEditorZoom(100);
+    }
+  }, true);
+}
+
+function wireSqlEditor() {
+  const editor = getSqlEditor();
+  if (!editor || editor.dataset.sqlEditorWired === "1") return;
+  editor.dataset.sqlEditorWired = "1";
+  editor.addEventListener("keydown", handleSqlEditorKeydown);
+  editor.addEventListener("input", () => {
+    refreshSqlEditorUi();
+    if (!$("#sql-find-bar")?.hidden) runSqlFind(0, { focusEditor: false });
+    updateSqlSuggest().catch(() => {});
+  });
+  editor.addEventListener("scroll", syncSqlEditorScroll);
+  editor.addEventListener("keyup", refreshSqlCursorStatus);
+  editor.addEventListener("click", () => {
+    refreshSqlEditorUi();
+    closeSqlSuggest();
+  });
+  editor.addEventListener("select", refreshSqlCursorStatus);
+  editor.addEventListener("blur", () => {
+    setTimeout(() => {
+      if (!$("#sql-suggest")?.matches(":hover")) closeSqlSuggest();
+    }, 150);
+  });
+  editor.addEventListener("focus", () => {
+    ensureSqlMeta().catch(() => {});
+  });
+  editor.addEventListener("wheel", (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    e.preventDefault();
+    bumpSqlEditorZoom(e.deltaY < 0 ? 1 : -1);
+  }, { passive: false });
+  $("#sql-suggest")?.addEventListener("mousedown", (e) => {
+    const btn = e.target.closest(".sql-suggest-item");
+    if (!btn) return;
+    e.preventDefault();
+    acceptSqlSuggest(Number(btn.dataset.idx));
+  });
+  wireSqlGlobalShortcuts();
+  applySqlEditorZoom(loadPrefs().sqlEditorZoom ?? 100, { persist: false });
+  refreshSqlEditorUi();
+}
+
+function setSqlEditorContent(sql, fileName = null, filePath = null) {
+  const editor = getSqlEditor();
+  if (!editor) return;
+  setSqlEditorValue(sql ?? "");
   state.sqlFileName = fileName || null;
   state.sqlFilePath = filePath || null;
   updateSqlFileChip(state.sqlFileName);
@@ -1406,24 +2283,32 @@ function updateSqlFindCount(current, total) {
   }
 }
 
-function selectSqlFindMatch(start, length) {
-  const editor = $("#sql-editor");
+function selectSqlFindMatch(start, length, { focusEditor = false } = {}) {
+  const editor = getSqlEditor();
   if (!editor || start < 0) return;
-  editor.focus();
-  editor.setSelectionRange(start, start + length);
+  if (focusEditor) editor.focus();
+  try {
+    editor.setSelectionRange(start, start + length);
+  } catch {
+    /* ignore */
+  }
   // Keep the match in view when possible.
   try {
     const before = editor.value.slice(0, start);
     const lines = before.split("\n").length;
     const lineHeight = parseFloat(getComputedStyle(editor).lineHeight) || 18;
     editor.scrollTop = Math.max(0, (lines - 3) * lineHeight);
+    syncSqlEditorScroll();
   } catch {
     /* ignore */
   }
+  refreshSqlHighlight();
+  refreshSqlGutter();
+  refreshSqlCursorStatus();
 }
 
-function runSqlFind(direction = 0) {
-  const editor = $("#sql-editor");
+function runSqlFind(direction = 0, { focusEditor = false } = {}) {
+  const editor = getSqlEditor();
   const input = $("#sql-find-input");
   if (!editor || !input) return;
   const query = input.value || "";
@@ -1432,12 +2317,12 @@ function runSqlFind(direction = 0) {
   if (!matches.length) {
     state.sqlFindIndex = -1;
     updateSqlFindCount(-1, 0);
+    refreshSqlHighlight();
     return;
   }
 
   let idx = state.sqlFindIndex;
   if (direction === 0) {
-    // Prefer the match at/after the caret.
     const caret = editor.selectionStart || 0;
     idx = matches.findIndex((m) => m >= caret);
     if (idx < 0) idx = 0;
@@ -1448,32 +2333,42 @@ function runSqlFind(direction = 0) {
   }
   state.sqlFindIndex = idx;
   updateSqlFindCount(idx, matches.length);
-  selectSqlFindMatch(matches[idx], query.length);
+  selectSqlFindMatch(matches[idx], query.length, { focusEditor: focusEditor || direction !== 0 });
 }
 
 function openSqlFindBar(seed = "") {
   const bar = $("#sql-find-bar");
   const input = $("#sql-find-input");
-  const editor = $("#sql-editor");
+  const editor = getSqlEditor();
   if (!bar || !input) return;
+  // Ensure SQL panel is visible.
+  if (!isSqlPanelActive()) switchTab("sql");
   bar.hidden = false;
+  bar.removeAttribute("hidden");
   if (seed) {
     input.value = seed;
-  } else if (!input.value && editor) {
+  } else if (editor) {
     const selected = editor.value.slice(editor.selectionStart, editor.selectionEnd);
     if (selected && !selected.includes("\n")) input.value = selected;
   }
-  input.focus();
-  input.select();
-  runSqlFind(0);
+  // Focus find box on next tick so WebView reliably accepts it.
+  setTimeout(() => {
+    input.focus();
+    input.select();
+    runSqlFind(0, { focusEditor: false });
+  }, 0);
 }
 
 function closeSqlFindBar() {
   const bar = $("#sql-find-bar");
-  if (bar) bar.hidden = true;
+  if (bar) {
+    bar.hidden = true;
+    bar.setAttribute("hidden", "");
+  }
   state.sqlFindIndex = -1;
   updateSqlFindCount(-1, 0);
-  $("#sql-editor")?.focus();
+  refreshSqlHighlight();
+  getSqlEditor()?.focus();
 }
 
 function saveSqlFile() {
@@ -2380,7 +3275,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
       ?? (tab.detailFocus?.scope === "schema" ? (tab.detailFocus.schema || "") : "");
     renderWorkspaceTabs();
     updateRunButton();
-    $("#sql-editor").value = tab.sql || "";
+    setSqlEditorValue(tab.sql || "");
     state.sqlFileName = tab.sqlFileName || null;
     state.sqlFilePath = tab.sqlFilePath || null;
     updateSqlFileChip(state.sqlFileName);
@@ -2398,7 +3293,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     await refreshSqlContextUi();
     if (epoch !== state.workspaceApplyEpoch) return;
     // Re-assert editor/results in case an older refresh raced.
-    if ($("#sql-editor") && tab.sql != null) $("#sql-editor").value = tab.sql;
+    if (tab.sql != null) setSqlEditorValue(tab.sql);
     if (tab.result) {
       state.result = tab.result;
       renderData(tab.result);
@@ -2429,7 +3324,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     $("#data-context").textContent = tab.result
       ? (sqlContextLabel(tab) || "Query result")
       : (sqlContextLabel(tab) || "Query");
-    $("#sql-editor").value = tab.sql || "";
+    setSqlEditorValue(tab.sql || "");
     state.sqlFileName = tab.sqlFileName || null;
     state.sqlFilePath = tab.sqlFilePath || null;
     updateSqlFileChip(state.sqlFileName);
@@ -2442,7 +3337,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     await refreshSqlContextUi();
     if (epoch !== state.workspaceApplyEpoch) return;
     // File/query tabs: never let a stale refresh wipe the editor or result grid.
-    if ($("#sql-editor") && tab.sql != null) $("#sql-editor").value = tab.sql;
+    if (tab.sql != null) setSqlEditorValue(tab.sql);
     if (tab.sqlFileName) {
       tab.title = tab.sqlFileName;
       state.sqlFileName = tab.sqlFileName;
@@ -2485,7 +3380,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     state.columns = tab.columns;
     state.result = tab.result;
     state.page = tab.page || 1;
-    $("#sql-editor").value = tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 500}`;
+    setSqlEditorValue(tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 500}`);
     state.sqlFileName = tab.sqlFileName || null;
     state.sqlFilePath = tab.sqlFilePath || null;
     updateSqlFileChip(state.sqlFileName);
@@ -2544,7 +3439,7 @@ async function loadTableIntoActiveTab(tab) {
   live.hiddenColumns = { ...state.hiddenColumns };
   state.currentSchema = schema;
   state.currentTable = table;
-  $("#sql-editor").value = sql;
+  setSqlEditorValue(sql);
   $("#ddl-view").textContent = ddlText;
   $("#data-context").textContent = `${schema} · ${table}`;
   renderStructure(cols);
@@ -2833,7 +3728,8 @@ async function refreshSqlContextUi() {
   const keepSql = $("#sql-editor")?.value ?? editorBefore ?? liveTab?.sql;
   persistSqlContextToActiveTab();
   if (liveTab && keepSql != null) liveTab.sql = keepSql;
-  if ($("#sql-editor") && keepSql != null) $("#sql-editor").value = keepSql;
+  if (keepSql != null) setSqlEditorValue(keepSql);
+  ensureSqlMeta().catch(() => {});
 }
 
 function persistSqlContextToActiveTab() {
@@ -2869,12 +3765,14 @@ function persistSqlContextToActiveTab() {
 async function onSqlDatabaseChanged() {
   persistSqlContextToActiveTab();
   const profile = activeProfile();
-  if (!isThreeLayerProfile(profile)) return;
-  const schSel = $("#sql-schema");
-  const schemas = await loadSqlSchemaOptions($("#sql-db")?.value || "");
-  const keep = schSel?.value || "";
-  fillSelectOptions(schSel, schemas, keep, { allowEmpty: true, emptyLabel: "Schema…" });
-  persistSqlContextToActiveTab();
+  if (isThreeLayerProfile(profile)) {
+    const schSel = $("#sql-schema");
+    const schemas = await loadSqlSchemaOptions($("#sql-db")?.value || "");
+    const keep = schSel?.value || "";
+    fillSelectOptions(schSel, schemas, keep, { allowEmpty: true, emptyLabel: "Schema…" });
+    persistSqlContextToActiveTab();
+  }
+  ensureSqlMeta({ force: true }).catch(() => {});
 }
 
 /** Open SQL editor at database, schema, or table level. */
@@ -3138,6 +4036,8 @@ function switchTab(name, { skipTitle = false } = {}) {
   }
   if (target === "sql") {
     refreshSqlContextUi().catch((e) => console.error(e));
+    ensureSqlMeta().catch(() => {});
+    requestAnimationFrame(() => refreshSqlEditorUi());
   }
 }
 
@@ -3610,6 +4510,367 @@ function renderStructure(cols) {
   }
 }
 
+/* ── SQL output log ──────────────────────────────── */
+
+function applySqlLogLayout() {
+  const prefs = loadPrefs();
+  const log = $("#sql-log");
+  const workspace = $("#sql-workspace");
+  if (!log || !workspace) return;
+  const minimized = !!prefs.sqlLogMinimized;
+  log.classList.toggle("minimized", minimized);
+  const toggle = $("#btn-sql-log-toggle");
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", minimized ? "false" : "true");
+    toggle.textContent = minimized ? "▸" : "▾";
+    toggle.title = minimized ? "Expand output" : "Minimize output";
+  }
+  const h = Number(prefs.sqlLogHeight);
+  const height = Number.isFinite(h) ? Math.min(480, Math.max(80, Math.round(h))) : 152;
+  if (!minimized) {
+    workspace.style.setProperty("--sql-log-height", `${height}px`);
+  }
+}
+
+function setSqlLogMinimized(minimized) {
+  savePrefs({ sqlLogMinimized: !!minimized });
+  applySqlLogLayout();
+}
+
+function toggleSqlLogMinimized() {
+  const prefs = loadPrefs();
+  setSqlLogMinimized(!prefs.sqlLogMinimized);
+}
+
+function expandSqlLog() {
+  if (loadPrefs().sqlLogMinimized) setSqlLogMinimized(false);
+}
+
+function formatSqlLogTime(date = new Date()) {
+  return date.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function summarizeSqlSnippet(sql, max = 160) {
+  const one = String(sql || "").replace(/\s+/g, " ").trim();
+  if (one.length <= max) return one;
+  return `${one.slice(0, max - 1)}…`;
+}
+
+function formatQueryResultLog(result, { sql, where } = {}) {
+  const lines = [];
+  if (sql) lines.push(summarizeSqlSnippet(sql, 240));
+  if (where) lines.push(`Context: ${where}`);
+  if (!result) {
+    lines.push("(no result)");
+    return lines.join("\n");
+  }
+  if (result.message) lines.push(result.message);
+  if (result.executionMs != null) lines.push(`Time: ${result.executionMs} ms`);
+  if (result.update) {
+    lines.push(`Rows affected: ${result.affectedRows ?? result.rowCount ?? 0}`);
+  } else if (result.columns?.length) {
+    lines.push(`Columns: ${result.columns.length}`);
+    lines.push(`Rows returned: ${result.rows?.length ?? result.affectedRows ?? 0}`);
+  }
+  return lines.join("\n");
+}
+
+function updateSqlLogMeta() {
+  const meta = $("#sql-log-meta");
+  if (!meta) return;
+  const n = state.sqlLogEntries?.length || 0;
+  meta.textContent = n ? `${n} entr${n === 1 ? "y" : "ies"}` : "";
+}
+
+function renderSqlLogOutput() {
+  const out = $("#sql-log-output");
+  if (!out) return;
+  const entries = state.sqlLogEntries || [];
+  if (!entries.length) {
+    out.textContent = "Query output will appear here.";
+    updateSqlLogMeta();
+    return;
+  }
+  out.innerHTML = entries.map((e) => (
+    `<div class="sql-log-entry ${escapeHtml(e.level || "info")}">`
+    + `<div class="sql-log-entry-head">${escapeHtml(e.head || "")}</div>`
+    + `<div class="sql-log-entry-body">${escapeHtml(e.body || "")}</div>`
+    + `</div>`
+  )).join("");
+  out.scrollTop = out.scrollHeight;
+  updateSqlLogMeta();
+  if (!$("#sql-log-find-bar")?.hidden) runSqlLogFind(0);
+}
+
+function appendSqlLog(level, head, body) {
+  if (!state.sqlLogEntries) state.sqlLogEntries = [];
+  state.sqlLogEntries.push({
+    level: level || "info",
+    head: head || formatSqlLogTime(),
+    body: body || "",
+    at: Date.now(),
+  });
+  // Cap history so the DOM stays light.
+  if (state.sqlLogEntries.length > 200) {
+    state.sqlLogEntries = state.sqlLogEntries.slice(-200);
+  }
+  renderSqlLogOutput();
+}
+
+function clearSqlLog() {
+  state.sqlLogEntries = [];
+  state.sqlLogFindIndex = -1;
+  renderSqlLogOutput();
+  closeSqlLogFindBar();
+}
+
+function getSqlLogPlainText() {
+  const entries = state.sqlLogEntries || [];
+  if (!entries.length) return "";
+  return entries.map((e) => `${e.head}\n${e.body}`).join("\n\n");
+}
+
+async function copySqlLog() {
+  const out = $("#sql-log-output");
+  let text = "";
+  const sel = window.getSelection?.();
+  if (sel && !sel.isCollapsed && out?.contains(sel.anchorNode)) {
+    text = sel.toString();
+  } else {
+    text = getSqlLogPlainText();
+  }
+  if (!text.trim()) {
+    setStatus("Output is empty");
+    return;
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setStatus("Output copied");
+  } catch (e) {
+    setStatus(e.message || "Copy failed");
+  }
+}
+
+function updateSqlLogFindCount(current, total) {
+  const el = $("#sql-log-find-count");
+  if (!el) return;
+  if (!total) {
+    el.textContent = "0 / 0";
+    el.classList.toggle("sql-find-empty", !!($("#sql-log-find-input")?.value || "").trim());
+  } else {
+    el.textContent = `${current + 1} / ${total}`;
+    el.classList.remove("sql-find-empty");
+  }
+}
+
+function clearSqlLogMarks() {
+  const out = $("#sql-log-output");
+  if (!out) return;
+  out.querySelectorAll("mark.sql-log-mark").forEach((mark) => {
+    const parent = mark.parentNode;
+    parent.replaceChild(document.createTextNode(mark.textContent), mark);
+    parent.normalize();
+  });
+}
+
+function collectSqlLogMatches(query, matchCase) {
+  const out = $("#sql-log-output");
+  if (!out || !query) return [];
+  clearSqlLogMarks();
+  const walker = document.createTreeWalker(out, NodeFilter.SHOW_TEXT);
+  const matches = [];
+  const needle = matchCase ? query : query.toLowerCase();
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const text = node.nodeValue || "";
+    const hay = matchCase ? text : text.toLowerCase();
+    let from = 0;
+    while (from <= hay.length - needle.length) {
+      const idx = hay.indexOf(needle, from);
+      if (idx < 0) break;
+      matches.push({ node, start: idx, length: needle.length });
+      from = idx + Math.max(1, needle.length);
+    }
+  }
+  // Wrap matches in reverse order so offsets stay valid within each node.
+  const byNode = new Map();
+  for (const m of matches) {
+    if (!byNode.has(m.node)) byNode.set(m.node, []);
+    byNode.get(m.node).push(m);
+  }
+  const marks = [];
+  for (const [node, list] of byNode) {
+    list.sort((a, b) => b.start - a.start);
+    for (const m of list) {
+      if (m.start + m.length > (node.nodeValue || "").length) continue;
+      const range = document.createRange();
+      range.setStart(node, m.start);
+      range.setEnd(node, m.start + m.length);
+      const mark = document.createElement("mark");
+      mark.className = "sql-log-mark";
+      try {
+        range.surroundContents(mark);
+        marks.unshift(mark);
+      } catch {
+        /* skip awkward boundaries */
+      }
+    }
+  }
+  return marks;
+}
+
+function runSqlLogFind(direction = 0) {
+  const input = $("#sql-log-find-input");
+  const out = $("#sql-log-output");
+  if (!input || !out) return;
+  const query = input.value || "";
+  const matchCase = !!$("#sql-log-find-case")?.checked;
+  if (!query) {
+    clearSqlLogMarks();
+    state.sqlLogFindIndex = -1;
+    updateSqlLogFindCount(-1, 0);
+    return;
+  }
+  const marks = collectSqlLogMatches(query, matchCase);
+  if (!marks.length) {
+    state.sqlLogFindIndex = -1;
+    updateSqlLogFindCount(-1, 0);
+    return;
+  }
+  let idx = state.sqlLogFindIndex;
+  if (direction === 0) {
+    idx = Math.min(Math.max(idx, 0), marks.length - 1);
+  } else if (direction > 0) {
+    idx = (idx + 1 + marks.length) % marks.length;
+  } else {
+    idx = (idx - 1 + marks.length) % marks.length;
+  }
+  state.sqlLogFindIndex = idx;
+  marks.forEach((m, i) => m.classList.toggle("current", i === idx));
+  marks[idx].scrollIntoView({ block: "nearest" });
+  updateSqlLogFindCount(idx, marks.length);
+}
+
+function openSqlLogFindBar(seed = "") {
+  expandSqlLog();
+  const bar = $("#sql-log-find-bar");
+  const input = $("#sql-log-find-input");
+  if (!bar || !input) return;
+  bar.hidden = false;
+  if (seed) input.value = seed;
+  else {
+    const sel = window.getSelection?.()?.toString();
+    if (sel && !sel.includes("\n")) input.value = sel;
+  }
+  input.focus();
+  input.select();
+  runSqlLogFind(0);
+}
+
+function closeSqlLogFindBar() {
+  const bar = $("#sql-log-find-bar");
+  if (bar) bar.hidden = true;
+  clearSqlLogMarks();
+  state.sqlLogFindIndex = -1;
+  updateSqlLogFindCount(-1, 0);
+  $("#sql-log-output")?.focus();
+}
+
+function wireSqlLogResize() {
+  const handle = $("#sql-log-resizer");
+  const log = $("#sql-log");
+  const workspace = $("#sql-workspace");
+  if (!handle || !log || !workspace) return;
+
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    const dy = startY - e.clientY;
+    const next = Math.min(workspace.clientHeight * 0.7, Math.max(80, startH + dy));
+    workspace.style.setProperty("--sql-log-height", `${Math.round(next)}px`);
+  };
+
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("active");
+    document.body.classList.remove("resizing-sql-log");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+    const raw = getComputedStyle(workspace).getPropertyValue("--sql-log-height").trim();
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n)) savePrefs({ sqlLogHeight: n });
+  };
+
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || log.classList.contains("minimized")) return;
+    e.preventDefault();
+    dragging = true;
+    startY = e.clientY;
+    startH = log.getBoundingClientRect().height;
+    handle.classList.add("active");
+    document.body.classList.add("resizing-sql-log");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+  });
+}
+
+function wireSqlLog() {
+  applySqlLogLayout();
+  renderSqlLogOutput();
+  wireSqlLogResize();
+
+  $("#btn-sql-log-toggle")?.addEventListener("click", () => toggleSqlLogMinimized());
+  $("#btn-sql-log-clear")?.addEventListener("click", () => clearSqlLog());
+  $("#btn-sql-log-copy")?.addEventListener("click", () => copySqlLog());
+  $("#btn-sql-log-find")?.addEventListener("click", () => openSqlLogFindBar());
+  $("#btn-sql-log-find-next")?.addEventListener("click", () => runSqlLogFind(1));
+  $("#btn-sql-log-find-prev")?.addEventListener("click", () => runSqlLogFind(-1));
+  $("#btn-sql-log-find-close")?.addEventListener("click", () => closeSqlLogFindBar());
+  $("#sql-log-find-input")?.addEventListener("input", () => runSqlLogFind(0));
+  $("#sql-log-find-case")?.addEventListener("change", () => runSqlLogFind(0));
+  $("#sql-log-find-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      runSqlLogFind(e.shiftKey ? -1 : 1);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeSqlLogFindBar();
+    }
+  });
+
+  const out = $("#sql-log-output");
+  out?.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      openSqlLogFindBar();
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
+      // Select all output text
+      e.preventDefault();
+      const range = document.createRange();
+      range.selectNodeContents(out);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  });
+}
+
 async function runSql() {
   if (!state.activeConnectionId && !state.connected) {
     setStatus("Connect to a database first");
@@ -3637,6 +4898,9 @@ async function runSql() {
   if (three && ctx.schema) body.schema = ctx.schema;
   if (!three && !body.database && ctx.schema) body.database = ctx.schema;
 
+  const where = [ctx.database, three ? ctx.schema : null].filter(Boolean).join(" · ");
+  expandSqlLog();
+  appendSqlLog("info", `${formatSqlLogTime()} · Running`, summarizeSqlSnippet(sql, 240) + (where ? `\nContext: ${where}` : ""));
   setStatus("Executing…");
   try {
     const result = await api("/api/query", { method: "POST", body: JSON.stringify(body) });
@@ -3656,33 +4920,52 @@ async function runSql() {
       live.querySchema = ctx.schema;
       live.columnFilters = {};
       live.hiddenColumns = {};
-      live.viewMode = "data";
       if (live.source === "file" || live.sqlFileName) {
         live.title = live.sqlFileName || live.title;
       }
     }
     // Keep the query in the editor after Run.
-    if (editor) editor.value = sqlText;
+    setSqlEditorValue(sqlText);
     state.sqlFileName = live?.sqlFileName || state.sqlFileName;
     state.sqlFilePath = live?.sqlFilePath || state.sqlFilePath;
     updateSqlFileChip(state.sqlFileName);
 
-    const where = [ctx.database, three ? ctx.schema : null].filter(Boolean).join(" · ");
     const ctxChip = $("#data-context");
     if (ctxChip) {
       ctxChip.textContent = where
         || (state.currentTable ? `${state.currentSchema || ""} · ${state.currentTable}` : "Query result");
     }
-    // Show Data panel first, then paint rows (avoids empty-panel glitches).
-    switchTab("data");
-    renderData(result);
+
+    const hasGrid = !result.update && !!result.columns?.length;
+    appendSqlLog(
+      "ok",
+      `${formatSqlLogTime()} · OK${result.executionMs != null ? ` · ${result.executionMs} ms` : ""}`,
+      formatQueryResultLog(result, { sql, where })
+    );
+
+    if (hasGrid) {
+      if (live) live.viewMode = "data";
+      // Show Data panel for result grids; output log keeps the execution summary.
+      switchTab("data");
+      renderData(result);
+    } else {
+      if (live) live.viewMode = "sql";
+      switchTab("sql");
+      renderData(result);
+    }
     updateClearFiltersButton();
     setStatus(where ? `${result.message} · ${where}` : result.message);
   } catch (e) {
     // Preserve editor text even when the query fails.
-    if (editor) editor.value = sqlText;
+    setSqlEditorValue(sqlText);
+    appendSqlLog(
+      "err",
+      `${formatSqlLogTime()} · ERROR`,
+      `${summarizeSqlSnippet(sql, 240)}${where ? `\nContext: ${where}` : ""}\n${e.message || String(e)}`
+    );
+    expandSqlLog();
+    switchTab("sql");
     setStatus(e.message);
-    alert(e.message);
   }
 }
 
@@ -4146,20 +5429,28 @@ function wire() {
   $("#btn-load-sql").onclick = () => loadSqlFile();
   $("#btn-save-sql").onclick = () => saveSqlFile();
   $("#btn-find-sql").onclick = () => openSqlFindBar();
-  $("#btn-sql-find-next").onclick = () => runSqlFind(1);
-  $("#btn-sql-find-prev").onclick = () => runSqlFind(-1);
+  $("#btn-sql-zoom-out")?.addEventListener("click", () => bumpSqlEditorZoom(-1));
+  $("#btn-sql-zoom-in")?.addEventListener("click", () => bumpSqlEditorZoom(1));
+  $("#btn-sql-find-next").onclick = () => runSqlFind(1, { focusEditor: true });
+  $("#btn-sql-find-prev").onclick = () => runSqlFind(-1, { focusEditor: true });
   $("#btn-sql-find-close").onclick = () => closeSqlFindBar();
-  $("#sql-find-input")?.addEventListener("input", () => runSqlFind(0));
-  $("#sql-find-case")?.addEventListener("change", () => runSqlFind(0));
+  $("#sql-find-input")?.addEventListener("input", () => runSqlFind(0, { focusEditor: false }));
+  $("#sql-find-case")?.addEventListener("change", () => runSqlFind(0, { focusEditor: false }));
   $("#sql-find-input")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      runSqlFind(e.shiftKey ? -1 : 1);
+      runSqlFind(e.shiftKey ? -1 : 1, { focusEditor: false });
     } else if (e.key === "Escape") {
       e.preventDefault();
       closeSqlFindBar();
+    } else if ((e.metaKey || e.ctrlKey) && (e.code === "Equal" || e.code === "Minus" || e.key === "=" || e.key === "-" || e.key === "+" || e.key === "_")) {
+      // Allow zoom while find box focused.
+      e.preventDefault();
+      if (e.code === "Minus" || e.key === "-" || e.key === "_") bumpSqlEditorZoom(-1);
+      else bumpSqlEditorZoom(1);
     }
   });
+  wireSqlGlobalShortcuts();
   $("#btn-clear-sql").onclick = () => {
     setSqlEditorContent("", null, null);
     closeSqlFindBar();
@@ -4175,39 +5466,12 @@ function wire() {
   $("#sql-db")?.addEventListener("change", () => {
     onSqlDatabaseChanged().catch((e) => console.error(e));
   });
-  $("#sql-schema")?.addEventListener("change", () => persistSqlContextToActiveTab());
-  $("#sql-editor").addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      if ($("#btn-run")?.disabled) return;
-      runSql();
-    }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-      e.preventDefault();
-      openSqlFindBar();
-    }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "g") {
-      e.preventDefault();
-      if ($("#sql-find-bar")?.hidden) openSqlFindBar();
-      else runSqlFind(e.shiftKey ? -1 : 1);
-    }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      saveSqlFile();
-    }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
-      e.preventDefault();
-      loadSqlFile();
-    }
-    if (e.key === "Escape" && !$("#sql-find-bar")?.hidden) {
-      e.preventDefault();
-      closeSqlFindBar();
-    }
+  $("#sql-schema")?.addEventListener("change", () => {
+    persistSqlContextToActiveTab();
+    ensureSqlMeta({ force: true }).catch(() => {});
   });
-  // Re-run find when the query text changes while the bar is open.
-  $("#sql-editor").addEventListener("input", () => {
-    if (!$("#sql-find-bar")?.hidden) runSqlFind(0);
-  });
+  wireSqlEditor();
+  wireSqlLog();
   updateRunButton();
   updateSqlFileChip();
   $("#data-search").oninput = () => {
