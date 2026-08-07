@@ -119,6 +119,9 @@ public class ConnectionService {
             props.setProperty("allowPublicKeyRetrieval", "true");
             props.setProperty("useSSL", "false");
             props.setProperty("serverTimezone", "UTC");
+            // Remote / cross-region MySQL: fail instead of hanging forever.
+            props.setProperty("connectTimeout", "15000");
+            props.setProperty("socketTimeout", "120000");
         }
 
         try {

@@ -285,39 +285,14 @@ public class DatabaseService {
             items.add(stat("Tables", safeSize(() -> listTables("main"))));
             items.add(stat("Views", safeSize(() -> listViews("main"))));
         } else if (mode == ConnectionMode.THREE_LAYER) {
+            // Connection-level only: avoid scanning every schema (slow on remote servers).
             items.add(stat("Databases", safeSize(this::listDatabases)));
             items.add(stat("Schemas", safeSize(this::listSchemas)));
-            int tables = 0;
-            int views = 0;
-            int procs = 0;
-            int funcs = 0;
-            for (String schema : listSchemas()) {
-                tables += safeSize(() -> listTables(schema));
-                views += safeSize(() -> listViews(schema));
-                procs += safeSize(() -> listProcedures(schema));
-                funcs += safeSize(() -> listFunctions(schema));
-            }
-            items.add(stat("Tables", tables));
-            items.add(stat("Views", views));
-            items.add(stat("Procedures", procs));
-            items.add(stat("Functions", funcs));
         } else {
-            List<String> dbs = listDatabases();
-            items.add(stat("Databases", dbs.size()));
-            int tables = 0;
-            int views = 0;
-            int procs = 0;
-            int funcs = 0;
-            for (String db : dbs) {
-                tables += safeSize(() -> listTables(db));
-                views += safeSize(() -> listViews(db));
-                procs += safeSize(() -> listProcedures(db));
-                funcs += safeSize(() -> listFunctions(db));
-            }
-            items.add(stat("Tables", tables));
-            items.add(stat("Views", views));
-            items.add(stat("Procedures", procs));
-            items.add(stat("Functions", funcs));
+            // MySQL / 2-layer: listing tables across every database is O(n) round-trips and
+            // hangs the UI when there are many remote databases. Show DB count only;
+            // open a database for per-object counts.
+            items.add(stat("Databases", safeSize(this::listDatabases)));
         }
         out.put("items", items);
         return out;

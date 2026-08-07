@@ -520,7 +520,8 @@ async function toggleConnectionNode(profile) {
       setExpanded(profile.id, true);
     }
     renderProfiles();
-    await focusHomeDetails({ scope: "connection" });
+    // Don't await — Details must not block expanding the database list.
+    focusHomeDetails({ scope: "connection" }).catch((e) => console.error(e));
     return;
   }
 
@@ -587,8 +588,10 @@ async function onConnected() {
   setConnectedUi(true);
   const count = Object.keys(state.connectedIds).length;
   setStatus(count > 1 ? `Connected (${count} sessions)` : "Connected");
-  await focusHomeDetails({ scope: "connection" });
+  // Show the database tree immediately. Connection Details used to block this and
+  // scanned every MySQL database for table counts (very slow across regions).
   await loadProfiles();
+  focusHomeDetails({ scope: "connection" }).catch((e) => console.error(e));
 }
 
 async function resetSession() {
