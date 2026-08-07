@@ -1,9 +1,73 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="teal" data-density="comfortable">
+<html lang="en" class="booting" data-theme="teal" data-density="comfortable">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DB Pilot</title>
+  <!-- Inline splash: paints before external CSS/JS to avoid raw HTML flash -->
+  <style>
+    html.booting, html.booting body {
+      margin: 0;
+      min-height: 100%;
+      background: #0c1118;
+      color: #e8eef6;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    html.booting #app,
+    html.booting dialog,
+    html.booting #col-filter-popup {
+      visibility: hidden !important;
+    }
+    #app-loader {
+      position: fixed;
+      inset: 0;
+      z-index: 99999;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      background:
+        radial-gradient(700px 340px at 50% 30%, rgba(45, 212, 191, 0.12), transparent 55%),
+        #0c1118;
+    }
+    html.booting #app-loader { display: flex; }
+    #app-loader .app-loader-mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      background: linear-gradient(145deg, #2dd4bf, #0f766e);
+      box-shadow: 0 10px 30px rgba(45, 212, 191, 0.25);
+      position: relative;
+    }
+    #app-loader .app-loader-mark::after {
+      content: "";
+      position: absolute;
+      inset: 12px 10px 10px;
+      border-top: 5px solid rgba(255, 255, 255, 0.9);
+      border-radius: 2px 2px 8px 8px;
+    }
+    #app-loader .app-loader-title {
+      font-size: 1.15rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+    }
+    #app-loader .app-loader-spin {
+      width: 1.5rem;
+      height: 1.5rem;
+      border: 2px solid rgba(139, 155, 176, 0.25);
+      border-top-color: #2dd4bf;
+      border-radius: 50%;
+      animation: app-loader-spin 0.75s linear infinite;
+    }
+    #app-loader .app-loader-hint {
+      color: #8b9bb0;
+      font-size: 0.85rem;
+    }
+    @keyframes app-loader-spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -11,6 +75,12 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 </head>
 <body>
+  <div id="app-loader" role="status" aria-live="polite" aria-label="Loading DB Pilot">
+    <div class="app-loader-mark" aria-hidden="true"></div>
+    <div class="app-loader-title">DB Pilot</div>
+    <div class="app-loader-spin" aria-hidden="true"></div>
+    <div class="app-loader-hint">Starting…</div>
+  </div>
   <div id="app" class="app">
     <aside class="sidebar" id="sidebar">
       <div class="sidebar-top">
@@ -92,7 +162,10 @@
               <div id="col-visibility-list" class="col-vis-list"></div>
             </div>
           </div>
-          <button type="button" class="btn ghost" id="btn-clear-filters" title="Clear all column filters" hidden>Clear filters</button>
+          <button type="button" class="btn ghost filter-indicator" id="btn-clear-filters" title="Clear all column filters" hidden>
+            <span class="filter-indicator-dot" aria-hidden="true"></span>
+            <span id="filter-indicator-label">Filters</span>
+          </button>
           <div class="export-wrap">
             <button type="button" class="btn ghost" id="btn-export" title="Export data" aria-haspopup="menu" aria-expanded="false">Export ▾</button>
             <div id="export-menu" class="export-menu" hidden role="menu" aria-label="Export format">
