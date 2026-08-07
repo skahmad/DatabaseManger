@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Forge Database Manager</title>
+  <title>DB Pilot</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -16,7 +16,7 @@
       <div class="sidebar-top">
         <div class="logo-mark sm"></div>
         <div class="sidebar-title">
-          <strong>Database Manager</strong>
+          <strong>DB Pilot</strong>
           <span id="conn-pill" class="pill idle">offline</span>
         </div>
         <div class="sidebar-top-actions">
@@ -49,6 +49,10 @@
     <main class="main">
       <div class="workspace-tabbar" aria-label="Open workspace tabs">
         <div id="workspace-tabs" class="workspace-tabs" role="tablist"></div>
+        <div class="ws-tabs-more-wrap">
+          <button type="button" class="btn ghost sm ws-tabs-more" id="ws-tabs-more" hidden title="More open tabs" aria-haspopup="menu" aria-expanded="false">▾</button>
+          <div id="ws-tabs-overflow-menu" class="ws-tabs-overflow-menu" hidden role="menu" aria-label="Hidden tabs"></div>
+        </div>
       </div>
 
       <nav class="tabs" role="tablist" aria-label="View">
@@ -95,12 +99,32 @@
 
       <section id="panel-sql" class="panel">
         <div class="toolbar">
-          <button type="button" class="btn primary" id="btn-run" disabled title="Select a table to run SQL">▶ Run</button>
+          <button type="button" class="btn primary" id="btn-run" disabled title="Connect to run SQL">▶ Run</button>
+          <button type="button" class="btn ghost" id="btn-load-sql" title="Load one or more SQL files">Load…</button>
+          <button type="button" class="btn ghost" id="btn-save-sql" title="Save query to a file">Save…</button>
+          <button type="button" class="btn ghost" id="btn-find-sql" title="Find in query (⌘/Ctrl + F)">Find</button>
           <button type="button" class="btn ghost" id="btn-clear-sql">Clear</button>
+          <label class="inline-field sql-ctx-field" id="sql-db-wrap">Database
+            <select id="sql-db" class="input sql-ctx-select" title="Query database"></select>
+          </label>
+          <label class="inline-field sql-ctx-field" id="sql-schema-wrap" hidden>Schema
+            <select id="sql-schema" class="input sql-ctx-select" title="Query schema"></select>
+          </label>
+          <span id="sql-table-chip" class="context-chip sql-table-chip" hidden></span>
+          <span id="sql-file-chip" class="context-chip sql-file-chip" hidden></span>
           <label class="inline-field">Limit <input type="number" id="row-limit" class="input narrow" value="500" min="1" /></label>
           <span class="hint">⌘/Ctrl + Enter</span>
         </div>
+        <div id="sql-find-bar" class="sql-find-bar" hidden>
+          <input type="text" id="sql-find-input" class="input sql-find-input" placeholder="Find in query…" autocomplete="off" spellcheck="false" />
+          <label class="check sql-find-case"><input type="checkbox" id="sql-find-case" /> Match case</label>
+          <span id="sql-find-count" class="sql-find-count">0 / 0</span>
+          <button type="button" class="btn ghost sm" id="btn-sql-find-prev" title="Previous match">↑</button>
+          <button type="button" class="btn ghost sm" id="btn-sql-find-next" title="Next match">↓</button>
+          <button type="button" class="btn ghost sm" id="btn-sql-find-close" title="Close find">✕</button>
+        </div>
         <textarea id="sql-editor" class="sql-editor" spellcheck="false" placeholder="SELECT * FROM users LIMIT 50;"></textarea>
+        <input type="file" id="sql-file-input" accept=".sql,.txt,text/plain,text/sql" multiple hidden />
       </section>
 
       <section id="panel-data" class="panel">
@@ -220,6 +244,7 @@
   <!-- Context menu: database / schema (items toggled by kind in app.js) -->
   <div id="ctx-menu-db" class="ctx-menu" hidden role="menu">
     <button type="button" class="ctx-item" data-action="properties" role="menuitem">Properties</button>
+    <button type="button" class="ctx-item" data-action="open-sql" role="menuitem">SQL (Query Editor)</button>
     <button type="button" class="ctx-item ctx-db-only" data-action="create-schema" role="menuitem">Create schema…</button>
     <button type="button" class="ctx-item" data-action="create-table" role="menuitem">Create table…</button>
     <button type="button" class="ctx-item" data-action="create-view" role="menuitem">Create view…</button>
@@ -243,6 +268,7 @@
   <!-- Context menu: table -->
   <div id="ctx-menu-table" class="ctx-menu" hidden role="menu">
     <button type="button" class="ctx-item" data-action="open-table" role="menuitem">Open</button>
+    <button type="button" class="ctx-item" data-action="open-sql" role="menuitem">SQL (Query Editor)</button>
     <button type="button" class="ctx-item" data-action="export-table" role="menuitem">Export…</button>
     <button type="button" class="ctx-item" data-action="import-table" role="menuitem">Import…</button>
     <button type="button" class="ctx-item" data-action="manage-indexes" role="menuitem">Indexes…</button>
@@ -255,6 +281,7 @@
   <!-- Context menu: view -->
   <div id="ctx-menu-view" class="ctx-menu" hidden role="menu">
     <button type="button" class="ctx-item" data-action="open-view" role="menuitem">Open</button>
+    <button type="button" class="ctx-item" data-action="open-sql" role="menuitem">SQL (Query Editor)</button>
     <hr class="ctx-sep" />
     <button type="button" class="ctx-item danger" data-action="drop-view" role="menuitem">Drop view…</button>
   </div>

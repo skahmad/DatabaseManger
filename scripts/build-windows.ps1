@@ -1,4 +1,4 @@
-# Build a Windows installable / portable binary for Forge Database Manager.
+# Build a Windows installable / portable binary for DB Pilot.
 # Requires Windows + JDK 21+ (jpackage). Optional: WiX Toolset for .exe / .msi.
 #
 # Usage:
@@ -65,7 +65,7 @@ switch -Regex ($arch) {
     }
 }
 
-$AppName = "Forge Database Manager"
+$AppName = "DB Pilot"
 $AppVersion = "1.0.0"
 $MainClass = "com.forgesystem.dbmanager.Launcher"
 $Vendor = "Forge System"

@@ -1,4 +1,4 @@
-# Forge Database Manager
+# DB Pilot
 
 Desktop database manager for **macOS, Windows, and Linux** with an embedded HTML UI (JavaFX WebView).
 
@@ -52,7 +52,7 @@ Outputs are copied under `binary/` (gitignored).
 ./scripts/build-mac.sh
 ```
 
-Output: `binary/mac/Forge Database Manager-1.0.0.dmg`
+Output: `binary/mac/DB Pilot-1.0.0.dmg`
 
 Open the DMG and drag the app into **Applications**. If Gatekeeper blocks it: right-click → **Open**.
 
@@ -81,7 +81,7 @@ dpkg --print-architecture   # amd64 or arm64
 sudo apt install ./binary/linux/amd64/forge-database-manager_1.0.0_amd64.deb
 # or
 tar -xzf binary/linux/amd64/forge-database-manager-1.0.0-linux-x86_64.tar.gz
-./"Forge Database Manager"/bin/"Forge Database Manager"
+./"DB Pilot"/bin/"DB Pilot"
 ```
 
 Requires a desktop Linux environment with GTK (JavaFX WebView).
@@ -119,7 +119,7 @@ Output: `binary/windows/amd64/` (or `arm64` on ARM Windows)
 binary/windows/amd64/forge-database-manager-1.0.0-windows-x86_64-standalone.zip
 ```
 
-Unzip and run `Forge Database Manager.vbs` (or `Start.vbs`) for no console window. Use `Forge Database Manager.bat` only if you need to see startup errors. Uses the bundled `runtime\` JRE.
+Unzip and run `DB Pilot.vbs` (or `Start.vbs`) for no console window. Use `DB Pilot.bat` only if you need to see startup errors. Uses the bundled `runtime\` JRE.
 
 **Portable JAR zip** (smaller; needs JDK 21 on the Windows PC PATH):
 

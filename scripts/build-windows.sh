@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a Windows installable / portable binary for Forge Database Manager.
+# Build a Windows installable / portable binary for DB Pilot.
 # Must run on Windows (Git Bash / MSYS) with JDK 21+ (jpackage).
 # Cross-building from macOS/Linux is not supported by jpackage.
 #
@@ -92,7 +92,7 @@ case "$ARCH" in
     ;;
 esac
 
-APP_NAME="Forge Database Manager"
+APP_NAME="DB Pilot"
 APP_VERSION="1.0.0"
 MAIN_CLASS="com.forgesystem.dbmanager.Launcher"
 VENDOR="Forge System"

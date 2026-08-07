@@ -69,6 +69,38 @@ public class DatabaseService {
         return dbs;
     }
 
+    /**
+     * List schemas, optionally after switching to {@code database} (PostgreSQL catalog).
+     * Restores the previous catalog afterward when a database override was applied.
+     */
+    public List<String> listSchemas(String database) throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DbType type = connectionService.getProfile().getDbType();
+        String previousCatalog = null;
+        boolean switched = false;
+        if (database != null && !database.isBlank()
+                && (type == DbType.POSTGRESQL || type == DbType.SQLSERVER)) {
+            try {
+                previousCatalog = conn.getCatalog();
+            } catch (SQLException ignored) {
+            }
+            if (previousCatalog == null || !database.equals(previousCatalog)) {
+                conn.setCatalog(database);
+                switched = true;
+            }
+        }
+        try {
+            return listSchemas();
+        } finally {
+            if (switched && previousCatalog != null && !previousCatalog.isBlank()) {
+                try {
+                    conn.setCatalog(previousCatalog);
+                } catch (SQLException ignored) {
+                }
+            }
+        }
+    }
+
     public List<String> listSchemas() throws SQLException {
         Connection conn = connectionService.getConnection();
         DbType type = connectionService.getProfile().getDbType();

@@ -29,6 +29,14 @@ const state = {
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
   importPicked: null,
+  /** Last loaded/saved SQL file name for the editor. */
+  sqlFileName: null,
+  /** Absolute path when loaded/saved via desktop bridge. */
+  sqlFilePath: null,
+  /** Bumped to invalidate in-flight applyWorkspaceTab / refreshSqlContextUi work. */
+  workspaceApplyEpoch: 0,
+  /** SQL editor find: current match index among matches. */
+  sqlFindIndex: -1,
   /** Workspace tabs: DB/SCH context tab (transient) + closable table tabs. */
   workspaceTabs: [],
   activeWorkspaceTabId: null,
@@ -110,9 +118,9 @@ function setConnectedUi(connected) {
 function updateRunButton() {
   const btn = $("#btn-run");
   if (!btn) return;
-  const enabled = !!state.currentTable;
+  const enabled = !!(state.activeConnectionId || state.connected || Object.keys(state.connectedIds || {}).length);
   btn.disabled = !enabled;
-  btn.title = enabled ? "Run SQL (⌘/Ctrl + Enter)" : "Select a table to run SQL";
+  btn.title = enabled ? "Run SQL (⌘/Ctrl + Enter)" : "Connect to run SQL";
 }
 
 /* ── Preferences (view + theme) ──────────────────── */
@@ -573,7 +581,7 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     e.stopPropagation();
     const rect = more.getBoundingClientRect();
     state.activeConnectionId = connectionId;
-    showDbContextMenu(rect.left, rect.bottom + 4, node.schema || node.name, kind);
+    showDbContextMenu(rect.left, rect.bottom + 4, node.schema || node.name, kind, databaseName);
   };
   row.appendChild(more);
 
@@ -644,7 +652,7 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     e.preventDefault();
     e.stopPropagation();
     state.activeConnectionId = connectionId;
-    showDbContextMenu(e.clientX, e.clientY, node.schema || node.name, kind);
+    showDbContextMenu(e.clientX, e.clientY, node.schema || node.name, kind, databaseName);
   };
 
   wrap.append(row, kids);
@@ -902,15 +910,20 @@ function positionContextMenu(menu, x, y) {
   });
 }
 
-function showDbContextMenu(x, y, db, kind = "database") {
+function showDbContextMenu(x, y, db, kind = "database", database = null) {
   for (const sel of CTX_MENUS) {
     const menu = $(sel);
     if (menu) menu.hidden = true;
   }
   state.contextDb = db;
-  state.contextTarget = { type: "db", schema: db, kind };
-  const menu = $("#ctx-menu-db");
   const isSchema = kind === "schema";
+  state.contextTarget = {
+    type: "db",
+    schema: db,
+    kind,
+    database: database || (!isSchema ? db : profileDatabaseName(state.activeConnectionId)) || null,
+  };
+  const menu = $("#ctx-menu-db");
   menu.querySelectorAll(".ctx-db-only").forEach((el) => { el.hidden = isSchema; });
   menu.querySelectorAll(".ctx-schema-only").forEach((el) => { el.hidden = !isSchema; });
   positionContextMenu(menu, x, y);
@@ -929,21 +942,31 @@ function showFolderContextMenu(x, y, schema, kind) {
   positionContextMenu(menu, x, y);
 }
 
-function showTableContextMenu(x, y, schema, table) {
+function showTableContextMenu(x, y, schema, table, database = null) {
   for (const sel of CTX_MENUS) {
     const menu = $(sel);
     if (menu) menu.hidden = true;
   }
-  state.contextTarget = { type: "table", schema, table };
+  state.contextTarget = {
+    type: "table",
+    schema,
+    table,
+    database: database || profileDatabaseName(state.activeConnectionId) || null,
+  };
   positionContextMenu($("#ctx-menu-table"), x, y);
 }
 
-function showViewContextMenu(x, y, schema, view) {
+function showViewContextMenu(x, y, schema, view, database = null) {
   for (const sel of CTX_MENUS) {
     const menu = $(sel);
     if (menu) menu.hidden = true;
   }
-  state.contextTarget = { type: "view", schema, view };
+  state.contextTarget = {
+    type: "view",
+    schema,
+    view,
+    database: database || profileDatabaseName(state.activeConnectionId) || null,
+  };
   positionContextMenu($("#ctx-menu-view"), x, y);
 }
 
@@ -1114,6 +1137,370 @@ function pickImportFileNative() {
   } catch (e) {
     alert(e.message || "Failed to pick file");
   }
+}
+
+function updateSqlFileChip(name = state.sqlFileName) {
+  const chip = $("#sql-file-chip");
+  if (!chip) return;
+  if (name) {
+    chip.hidden = false;
+    chip.textContent = name;
+    chip.title = state.sqlFilePath || name;
+  } else {
+    chip.hidden = true;
+    chip.textContent = "";
+    chip.title = "";
+  }
+}
+
+function setSqlEditorContent(sql, fileName = null, filePath = null) {
+  const editor = $("#sql-editor");
+  if (!editor) return;
+  editor.value = sql ?? "";
+  state.sqlFileName = fileName || null;
+  state.sqlFilePath = filePath || null;
+  updateSqlFileChip(state.sqlFileName);
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (tab) {
+    tab.sql = editor.value;
+    tab.sqlFileName = state.sqlFileName;
+    tab.sqlFilePath = state.sqlFilePath;
+    if (tab.source === "file" && state.sqlFileName) {
+      tab.title = state.sqlFileName;
+      renderWorkspaceTabs();
+    }
+  }
+}
+
+function suggestedSqlFileName() {
+  if (state.sqlFileName) return state.sqlFileName;
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (tab?.sqlFileName) return tab.sqlFileName;
+  const base = (tab?.table || tab?.schema || tab?.querySchema || tab?.database || tab?.queryDatabase || "query")
+    .toString()
+    .replace(/[^\w.-]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "query";
+  return `${base}.sql`;
+}
+
+function sqlFileTabId(pathOrName) {
+  return `sqlfile:${pathOrName || `untitled-${Date.now()}`}`;
+}
+
+/** Open one SQL file as its own workspace tab. */
+async function openSqlFileTab(file, {
+  activate = true,
+  connectionId = null,
+  database = "",
+  schema = "",
+} = {}) {
+  if (!file || file.base64) return null;
+  const cid = connectionId || state.activeConnectionId;
+  const name = file.name || "query.sql";
+  const path = file.path || name;
+  const id = sqlFileTabId(path);
+  const profile = profileById(cid);
+  const dbName = database
+    || state.detailFocus?.database
+    || profileDatabaseName(cid)
+    || "";
+  const schName = schema
+    || (isThreeLayerProfile(profile) ? (state.detailFocus?.schema || "") : "")
+    || "";
+
+  let tab = state.workspaceTabs.find((t) => t.id === id);
+  if (!tab) {
+    tab = {
+      id,
+      kind: "sql",
+      source: "file",
+      title: name,
+      database: dbName,
+      schema: schName,
+      table: null,
+      connectionId: cid,
+      queryDatabase: dbName,
+      querySchema: schName,
+      sqlFileName: name,
+      sqlFilePath: file.path || null,
+      closable: true,
+      pinned: false,
+      viewMode: "sql",
+      sql: file.content ?? "",
+    };
+    state.workspaceTabs.push(tab);
+  } else {
+    tab.sql = file.content ?? tab.sql;
+    tab.sqlFileName = name;
+    tab.sqlFilePath = file.path || tab.sqlFilePath || null;
+    tab.title = name;
+    tab.connectionId = cid || tab.connectionId;
+    tab.queryDatabase = dbName || tab.queryDatabase;
+    tab.querySchema = schName || tab.querySchema;
+    tab.database = dbName || tab.database;
+    tab.schema = schName || tab.schema;
+    tab.viewMode = "sql";
+  }
+
+  if (activate) {
+    state.activeWorkspaceTabId = id;
+    state.currentSchema = schName || null;
+    state.currentTable = null;
+    state.sqlFileName = tab.sqlFileName;
+    state.sqlFilePath = tab.sqlFilePath;
+    setDetailFocus({
+      scope: schName ? "schema" : "database",
+      schema: schName || null,
+      database: dbName,
+      connectionId: cid,
+    });
+    updateRunButton();
+    renderWorkspaceTabs();
+    await applyWorkspaceTab(id);
+  }
+  return tab;
+}
+
+async function openSqlFiles(files) {
+  const list = (files || []).filter((f) => f && !f.error && !f.base64);
+  if (!list.length) {
+    const err = (files || []).find((f) => f?.error);
+    if (err?.error) alert(err.error);
+    else alert("No SQL text files selected");
+    return;
+  }
+  snapshotActiveWorkspaceTab();
+  let lastId = null;
+  for (let i = 0; i < list.length; i++) {
+    const tab = await openSqlFileTab(list[i], {
+      activate: false,
+      connectionId: state.activeConnectionId,
+      database: state.detailFocus?.database || "",
+      schema: isThreeLayerProfile(activeProfile())
+        ? (state.detailFocus?.scope === "schema" ? (state.detailFocus.schema || "") : "")
+        : "",
+    });
+    if (tab) lastId = tab.id;
+  }
+  renderWorkspaceTabs();
+  if (lastId) {
+    state.activeWorkspaceTabId = lastId;
+    await applyWorkspaceTab(lastId);
+  }
+  const names = list.map((f) => f.name || "file").join(", ");
+  setStatus(list.length === 1
+    ? `Loaded ${names}`
+    : `Loaded ${list.length} SQL files`);
+  switchTab("sql");
+}
+
+function applyLoadedSqlFile(payload) {
+  if (!payload) return;
+  if (payload.error) {
+    alert(payload.error);
+    return;
+  }
+  if (payload.base64) {
+    alert("Binary files cannot be loaded into the SQL editor. Choose a .sql or .txt file.");
+    return;
+  }
+  openSqlFiles([payload]).catch((e) => alert(e.message || "Failed to open SQL file"));
+}
+
+function loadSqlFile() {
+  try {
+    if (window.javaApp && typeof window.javaApp.pickSqlFiles === "function") {
+      const raw = window.javaApp.pickSqlFiles();
+      if (!raw) return;
+      const payload = JSON.parse(raw);
+      if (payload.error) {
+        alert(payload.error);
+        return;
+      }
+      const files = Array.isArray(payload.files) ? payload.files : [payload];
+      openSqlFiles(files).catch((e) => alert(e.message || "Failed to open SQL files"));
+      return;
+    }
+    if (window.javaApp && typeof window.javaApp.pickSqlFile === "function") {
+      const raw = window.javaApp.pickSqlFile();
+      if (!raw) return;
+      applyLoadedSqlFile(JSON.parse(raw));
+      return;
+    }
+  } catch (e) {
+    alert(e.message || "Failed to open SQL file");
+    return;
+  }
+  // Browser / fallback: hidden multi file input
+  const input = $("#sql-file-input");
+  if (!input) {
+    alert("File picker unavailable");
+    return;
+  }
+  input.value = "";
+  input.click();
+}
+
+function onSqlFileInputChange(e) {
+  const files = [...(e.target?.files || [])];
+  if (!files.length) return;
+  Promise.all(files.map((file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: file.name, content: String(reader.result ?? "") });
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+    reader.readAsText(file);
+  })))
+    .then((loaded) => openSqlFiles(loaded))
+    .catch((err) => alert(err.message || "Failed to read SQL files"));
+}
+
+function collectSqlFindMatches(text, query, matchCase) {
+  if (!query) return [];
+  const hay = matchCase ? text : text.toLowerCase();
+  const needle = matchCase ? query : query.toLowerCase();
+  const matches = [];
+  let from = 0;
+  while (from <= hay.length - needle.length) {
+    const idx = hay.indexOf(needle, from);
+    if (idx < 0) break;
+    matches.push(idx);
+    from = idx + Math.max(1, needle.length);
+  }
+  return matches;
+}
+
+function updateSqlFindCount(current, total) {
+  const el = $("#sql-find-count");
+  if (!el) return;
+  if (!total) {
+    el.textContent = "0 / 0";
+    el.classList.toggle("sql-find-empty", !!($("#sql-find-input")?.value || "").trim());
+  } else {
+    el.textContent = `${current + 1} / ${total}`;
+    el.classList.remove("sql-find-empty");
+  }
+}
+
+function selectSqlFindMatch(start, length) {
+  const editor = $("#sql-editor");
+  if (!editor || start < 0) return;
+  editor.focus();
+  editor.setSelectionRange(start, start + length);
+  // Keep the match in view when possible.
+  try {
+    const before = editor.value.slice(0, start);
+    const lines = before.split("\n").length;
+    const lineHeight = parseFloat(getComputedStyle(editor).lineHeight) || 18;
+    editor.scrollTop = Math.max(0, (lines - 3) * lineHeight);
+  } catch {
+    /* ignore */
+  }
+}
+
+function runSqlFind(direction = 0) {
+  const editor = $("#sql-editor");
+  const input = $("#sql-find-input");
+  if (!editor || !input) return;
+  const query = input.value || "";
+  const matchCase = !!$("#sql-find-case")?.checked;
+  const matches = collectSqlFindMatches(editor.value, query, matchCase);
+  if (!matches.length) {
+    state.sqlFindIndex = -1;
+    updateSqlFindCount(-1, 0);
+    return;
+  }
+
+  let idx = state.sqlFindIndex;
+  if (direction === 0) {
+    // Prefer the match at/after the caret.
+    const caret = editor.selectionStart || 0;
+    idx = matches.findIndex((m) => m >= caret);
+    if (idx < 0) idx = 0;
+  } else if (direction > 0) {
+    idx = (idx + 1 + matches.length) % matches.length;
+  } else {
+    idx = (idx - 1 + matches.length) % matches.length;
+  }
+  state.sqlFindIndex = idx;
+  updateSqlFindCount(idx, matches.length);
+  selectSqlFindMatch(matches[idx], query.length);
+}
+
+function openSqlFindBar(seed = "") {
+  const bar = $("#sql-find-bar");
+  const input = $("#sql-find-input");
+  const editor = $("#sql-editor");
+  if (!bar || !input) return;
+  bar.hidden = false;
+  if (seed) {
+    input.value = seed;
+  } else if (!input.value && editor) {
+    const selected = editor.value.slice(editor.selectionStart, editor.selectionEnd);
+    if (selected && !selected.includes("\n")) input.value = selected;
+  }
+  input.focus();
+  input.select();
+  runSqlFind(0);
+}
+
+function closeSqlFindBar() {
+  const bar = $("#sql-find-bar");
+  if (bar) bar.hidden = true;
+  state.sqlFindIndex = -1;
+  updateSqlFindCount(-1, 0);
+  $("#sql-editor")?.focus();
+}
+
+function saveSqlFile() {
+  const sql = $("#sql-editor")?.value ?? "";
+  if (!sql.trim()) {
+    alert("SQL editor is empty");
+    return;
+  }
+  const suggested = suggestedSqlFileName();
+  try {
+    if (window.javaApp && typeof window.javaApp.saveSqlFile === "function") {
+      const raw = window.javaApp.saveSqlFile(suggested, sql);
+      if (!raw) return;
+      const payload = JSON.parse(raw);
+      if (payload.error) {
+        alert(payload.error);
+        return;
+      }
+      state.sqlFileName = payload.name || suggested;
+      state.sqlFilePath = payload.path || state.sqlFilePath;
+      updateSqlFileChip(state.sqlFileName);
+      const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+      if (tab) {
+        tab.sql = sql;
+        tab.sqlFileName = state.sqlFileName;
+        tab.sqlFilePath = state.sqlFilePath;
+        if (tab.source === "file" || tab.kind === "sql") {
+          tab.title = state.sqlFileName;
+          tab.source = tab.source || "file";
+          renderWorkspaceTabs();
+        }
+      }
+      setStatus(`Saved ${state.sqlFileName}`);
+      return;
+    }
+  } catch (e) {
+    alert(e.message || "Failed to save SQL file");
+    return;
+  }
+  // Browser fallback: download
+  const blob = new Blob([sql], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = suggested;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  state.sqlFileName = suggested;
+  updateSqlFileChip(state.sqlFileName);
+  setStatus(`Saved ${suggested}`);
 }
 
 function addCreateTableColumnRow(defaults = {}) {
@@ -1365,9 +1752,30 @@ async function handleContextAction(action) {
         hideAllContextMenus();
         if (target.tabId) closeWorkspaceTab(target.tabId);
         break;
+      case "open-sql": {
+        hideAllContextMenus();
+        const three = isThreeLayerProfile(activeProfile());
+        const dbName = target.database
+          || (target.kind === "database" ? target.schema : null)
+          || (!three ? target.schema : null)
+          || profileDatabaseName(state.activeConnectionId)
+          || "";
+        const schemaName = three
+          ? (target.kind === "schema" || target.type === "table" || target.type === "view"
+            ? (target.schema || "")
+            : "")
+          : "";
+        await openSqlEditor({
+          connectionId: state.activeConnectionId,
+          database: dbName,
+          schema: schemaName,
+          table: target.table || target.view || null,
+        });
+        break;
+      }
       case "open-table":
         hideAllContextMenus();
-        await openTable(target.schema, target.table);
+        await openTable(target.schema, target.table, state.activeConnectionId, target.database);
         break;
       case "export-table":
         openExportModal({ schema: target.schema, table: target.table, scope: "table" });
@@ -1466,16 +1874,16 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
         e.stopPropagation();
         const rect = more.getBoundingClientRect();
         if (connectionId) state.activeConnectionId = connectionId;
-        if (kind === "table") showTableContextMenu(rect.left, rect.bottom + 4, schema, name);
-        else showViewContextMenu(rect.left, rect.bottom + 4, schema, name);
+        if (kind === "table") showTableContextMenu(rect.left, rect.bottom + 4, schema, name, database);
+        else showViewContextMenu(rect.left, rect.bottom + 4, schema, name, database);
       };
       item.appendChild(more);
       item.oncontextmenu = (e) => {
         e.preventDefault();
         e.stopPropagation();
         if (connectionId) state.activeConnectionId = connectionId;
-        if (kind === "table") showTableContextMenu(e.clientX, e.clientY, schema, name);
-        if (kind === "view") showViewContextMenu(e.clientX, e.clientY, schema, name);
+        if (kind === "table") showTableContextMenu(e.clientX, e.clientY, schema, name, database);
+        if (kind === "view") showViewContextMenu(e.clientX, e.clientY, schema, name, database);
       };
     }
     item.onclick = async (e) => {
@@ -1556,6 +1964,19 @@ function workspaceTabTooltip(tab) {
     || profileDatabaseName(tab.connectionId || state.activeConnectionId)
     || "";
 
+  if (tab.kind === "sql") {
+    if (tab.source === "file" || tab.sqlFileName) {
+      const tip = [connName, tab.sqlFileName || tab.title].filter(Boolean).join(" · ");
+      return tab.sqlFilePath ? `${tip}\n${tab.sqlFilePath}` : tip;
+    }
+    const db = tab.queryDatabase || tab.database || database;
+    const sch = tab.querySchema || tab.schema || schema;
+    if (threeLayer) {
+      return [connName, db, sch].filter(Boolean).join(" · ");
+    }
+    return [connName, db || sch].filter(Boolean).join(" · ");
+  }
+
   if (threeLayer) {
     const parts = [connName];
     if (database) parts.push(database);
@@ -1593,9 +2014,23 @@ function contextTabTitle(focus = state.detailFocus) {
 
 function contextTabBadge(tab) {
   if (tab.kind === "table") return "TBL";
+  if (tab.kind === "sql") return tab.source === "file" || tab.sqlFileName ? "FILE" : "SQL";
   const scope = tab.detailFocus?.scope || tab.scope;
   if (scope === "schema") return "SCH";
   return "DB";
+}
+
+/** Visible title in the workspace tab bar. */
+function workspaceTabLabel(tab) {
+  if (!tab) return "Tab";
+  if (tab.source === "file" || tab.sqlFileName) {
+    return tab.sqlFileName || tab.title || "query.sql";
+  }
+  if (tab.kind === "sql") {
+    return tab.title || tab.querySchema || tab.queryDatabase || "Query";
+  }
+  if (tab.kind === "table") return tab.table || tab.title || "Table";
+  return tab.title || contextTabTitle(tab.detailFocus) || "Database";
 }
 
 function removeContextTabs() {
@@ -1683,7 +2118,7 @@ function showEmptyWorkspace() {
   closeColumnVisibilityMenu();
   updateClearFiltersButton();
   $("#data-context").textContent = "No table selected";
-  $("#sql-editor").value = "";
+  setSqlEditorContent("", null);
   $("#ddl-view").textContent = "Select a table and open DDL.";
   renderStructure([]);
   renderData(null);
@@ -1709,17 +2144,127 @@ function snapshotActiveWorkspaceTab() {
   tab.hiddenColumns = { ...(state.hiddenColumns || {}) };
   tab.columnFilters = { ...(state.columnFilters || {}) };
   tab.sql = $("#sql-editor")?.value ?? tab.sql;
+  tab.sqlFileName = state.sqlFileName;
+  tab.sqlFilePath = state.sqlFilePath;
   tab.ddl = $("#ddl-view")?.textContent ?? tab.ddl;
   tab.detailFocus = { ...(state.detailFocus || {}) };
+  const ctx = readSqlContextFromUi();
+  tab.queryDatabase = ctx.database;
+  tab.querySchema = ctx.schema;
+  if (tab.kind === "sql") {
+    tab.database = ctx.database || tab.database;
+    tab.schema = ctx.schema || tab.schema;
+  }
+}
+
+function closeWorkspaceTabsOverflowMenu() {
+  const menu = $("#ws-tabs-overflow-menu");
+  const btn = $("#ws-tabs-more");
+  if (menu) menu.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function toggleWorkspaceTabsOverflowMenu() {
+  const menu = $("#ws-tabs-overflow-menu");
+  const btn = $("#ws-tabs-more");
+  if (!menu || !btn || btn.hidden) return;
+  if (!menu.hidden) {
+    closeWorkspaceTabsOverflowMenu();
+    return;
+  }
+  // Ensure items exist before opening (e.g. after a partial layout).
+  if (!menu.childElementCount) layoutWorkspaceTabOverflow({ keepMenuOpen: false });
+  if (!menu.childElementCount) return;
+  menu.hidden = false;
+  btn.setAttribute("aria-expanded", "true");
+}
+
+function layoutWorkspaceTabOverflow({ keepMenuOpen = false } = {}) {
+  const root = $("#workspace-tabs");
+  const moreBtn = $("#ws-tabs-more");
+  const menu = $("#ws-tabs-overflow-menu");
+  if (!root || !moreBtn || !menu) return;
+
+  const wasOpen = keepMenuOpen && !menu.hidden;
+  const tabs = [...root.querySelectorAll(".ws-tab")];
+  tabs.forEach((t) => { t.hidden = false; });
+  moreBtn.hidden = true;
+  menu.hidden = true;
+  menu.innerHTML = "";
+  moreBtn.setAttribute("aria-expanded", "false");
+
+  if (tabs.length <= 1) return;
+
+  // Reserve space for the more button while measuring.
+  moreBtn.hidden = false;
+  moreBtn.textContent = "▾";
+  const fits = () => root.scrollWidth <= root.clientWidth + 1;
+
+  if (fits()) {
+    moreBtn.hidden = true;
+    return;
+  }
+
+  const overflow = [];
+  // Hide trailing non-active tabs first, then leading ones, keep active visible.
+  for (let i = tabs.length - 1; i >= 0 && !fits(); i--) {
+    const tabEl = tabs[i];
+    if (tabEl.classList.contains("active") || tabEl.hidden) continue;
+    tabEl.hidden = true;
+    overflow.unshift(tabEl);
+  }
+  for (let i = 0; i < tabs.length && !fits(); i++) {
+    const tabEl = tabs[i];
+    if (tabEl.classList.contains("active") || tabEl.hidden) continue;
+    tabEl.hidden = true;
+    overflow.push(tabEl);
+  }
+
+  if (!overflow.length) {
+    moreBtn.hidden = true;
+    return;
+  }
+
+  moreBtn.hidden = false;
+  moreBtn.textContent = `▾ ${overflow.length}`;
+  for (const tabEl of overflow) {
+    const tabId = tabEl.dataset.tabId;
+    const tab = state.workspaceTabs.find((t) => t.id === tabId);
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "ws-overflow-item" + (tabId === state.activeWorkspaceTabId ? " active" : "");
+    item.role = "menuitem";
+    item.innerHTML =
+      `<span class="ws-overflow-kind">${escapeHtml(contextTabBadge(tab || {}))}</span>`
+      + `<span class="ws-overflow-label">${escapeHtml(workspaceTabLabel(tab) || tabEl.textContent || "Tab")}</span>`;
+    item.title = tab ? workspaceTabTooltip(tab) : "";
+    item.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeWorkspaceTabsOverflowMenu();
+      activateWorkspaceTab(tabId).catch((err) => alert(err.message));
+    };
+    menu.appendChild(item);
+  }
+  if (wasOpen) {
+    menu.hidden = false;
+    moreBtn.setAttribute("aria-expanded", "true");
+  }
 }
 
 function renderWorkspaceTabs() {
   const root = $("#workspace-tabs");
   if (!root) return;
+  closeWorkspaceTabsOverflowMenu();
   root.innerHTML = "";
   sortWorkspaceTabs();
   for (const tab of state.workspaceTabs) {
+    // Keep file-tab titles synced to the file name.
+    if ((tab.source === "file" || tab.sqlFileName) && tab.sqlFileName) {
+      tab.title = tab.sqlFileName;
+    }
     const canClose = !tab.pinned && tab.closable !== false;
+    const label = workspaceTabLabel(tab);
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "ws-tab"
@@ -1732,7 +2277,7 @@ function renderWorkspaceTabs() {
     btn.title = tab.pinned ? `${tip} (pinned — double-click to unpin)` : `${tip} (double-click to pin)`;
     btn.innerHTML =
       `<span class="ws-tab-kind">${escapeHtml(contextTabBadge(tab))}</span>`
-      + `<span class="ws-tab-label">${escapeHtml(tab.title)}</span>`
+      + `<span class="ws-tab-label">${escapeHtml(label)}</span>`
       + `<span class="ws-tab-close" data-close-tab="${escapeHtml(tab.id)}" title="Close" aria-label="Close">×</span>`;
     btn.onclick = (e) => {
       const close = e.target.closest("[data-close-tab]");
@@ -1763,17 +2308,21 @@ function renderWorkspaceTabs() {
     };
     root.appendChild(btn);
   }
+  requestAnimationFrame(() => layoutWorkspaceTabOverflow());
 }
 
 async function activateWorkspaceTab(tabId, { forceReload = false } = {}) {
   if (!tabId) return;
-  if (tabId !== state.activeWorkspaceTabId) {
+  const same = tabId === state.activeWorkspaceTabId;
+  if (!same) {
     snapshotActiveWorkspaceTab();
   }
   const tab = state.workspaceTabs.find((t) => t.id === tabId);
   if (!tab) return;
   state.activeWorkspaceTabId = tabId;
   renderWorkspaceTabs();
+  // Re-clicking the active workspace tab must not wipe query results / editor state.
+  if (same && !forceReload) return;
   await applyWorkspaceTab(tabId, { forceReload });
 }
 
@@ -1784,36 +2333,119 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
   }
   const tab = state.workspaceTabs.find((t) => t.id === tabId);
   if (!tab) return;
+  const epoch = ++state.workspaceApplyEpoch;
 
   if (tab.kind === "context" || tab.kind === "home") {
     state.currentSchema = null;
     state.currentTable = null;
     state.columns = [];
-    state.result = null;
-    state.page = 1;
-    state.hiddenColumns = {};
-    state.columnFilters = {};
+    state.page = tab.page || 1;
+    state.hiddenColumns = { ...(tab.hiddenColumns || {}) };
+    state.columnFilters = { ...(tab.columnFilters || {}) };
     closeColumnFilterPopup();
     closeColumnVisibilityMenu();
     updateClearFiltersButton();
     if (tab.detailFocus) state.detailFocus = { ...tab.detailFocus };
     tab.title = contextTabTitle(state.detailFocus);
+    tab.queryDatabase = tab.queryDatabase
+      || tab.detailFocus?.database
+      || profileDatabaseName(tab.connectionId)
+      || "";
+    tab.querySchema = tab.querySchema
+      ?? (tab.detailFocus?.scope === "schema" ? (tab.detailFocus.schema || "") : "");
     renderWorkspaceTabs();
     updateRunButton();
-    $("#data-context").textContent = "No table selected";
     $("#sql-editor").value = tab.sql || "";
+    state.sqlFileName = tab.sqlFileName || null;
+    state.sqlFilePath = tab.sqlFilePath || null;
+    updateSqlFileChip(state.sqlFileName);
     $("#ddl-view").textContent = tab.ddl || "Select a table and open DDL.";
     renderStructure([]);
-    renderData(null);
-    updateContextMeta(tab.title || "");
+    // Keep prior query results on DB/SCH tabs (do not wipe on re-apply).
+    state.result = tab.result || null;
+    const ctxLabel = sqlContextLabel(tab);
+    $("#data-context").textContent = tab.result
+      ? (ctxLabel || "Query result")
+      : "No table selected";
     switchTab(tab.viewMode || "details", { skipTitle: true });
+    renderData(tab.result || null);
+    updateContextMeta(tab.title || "");
+    await refreshSqlContextUi();
+    if (epoch !== state.workspaceApplyEpoch) return;
+    // Re-assert editor/results in case an older refresh raced.
+    if ($("#sql-editor") && tab.sql != null) $("#sql-editor").value = tab.sql;
+    if (tab.result) {
+      state.result = tab.result;
+      renderData(tab.result);
+    }
+    return;
+  }
+
+  if (tab.kind === "sql") {
+    if (tab.connectionId) state.activeConnectionId = tab.connectionId;
+    state.currentSchema = tab.schema || tab.querySchema || null;
+    state.currentTable = null;
+    state.columns = [];
+    state.hiddenColumns = { ...(tab.hiddenColumns || {}) };
+    state.columnFilters = { ...(tab.columnFilters || {}) };
+    closeColumnFilterPopup();
+    closeColumnVisibilityMenu();
+    updateClearFiltersButton();
+    if (tab.source === "file" || tab.sqlFileName) {
+      tab.title = tab.sqlFileName || tab.title || "query.sql";
+    }
+    setDetailFocus({
+      scope: tab.schema || tab.querySchema ? "schema" : "database",
+      schema: tab.schema || tab.querySchema || null,
+      database: tab.database || tab.queryDatabase || profileDatabaseName(tab.connectionId),
+      connectionId: tab.connectionId,
+    });
+    updateRunButton();
+    $("#data-context").textContent = tab.result
+      ? (sqlContextLabel(tab) || "Query result")
+      : (sqlContextLabel(tab) || "Query");
+    $("#sql-editor").value = tab.sql || "";
+    state.sqlFileName = tab.sqlFileName || null;
+    state.sqlFilePath = tab.sqlFilePath || null;
+    updateSqlFileChip(state.sqlFileName);
+    $("#ddl-view").textContent = "Run a query to explore objects, or open a table for DDL.";
+    renderStructure([]);
+    state.result = tab.result || null;
+    state.page = tab.page || 1;
+    switchTab(tab.viewMode || "sql", { skipTitle: true });
+    renderData(tab.result || null);
+    await refreshSqlContextUi();
+    if (epoch !== state.workspaceApplyEpoch) return;
+    // File/query tabs: never let a stale refresh wipe the editor or result grid.
+    if ($("#sql-editor") && tab.sql != null) $("#sql-editor").value = tab.sql;
+    if (tab.sqlFileName) {
+      tab.title = tab.sqlFileName;
+      state.sqlFileName = tab.sqlFileName;
+      updateSqlFileChip(state.sqlFileName);
+    }
+    if (tab.result) {
+      state.result = tab.result;
+      renderData(tab.result);
+    }
     return;
   }
 
   if (tab.connectionId) state.activeConnectionId = tab.connectionId;
   state.currentSchema = tab.schema;
   state.currentTable = tab.table;
-  setDetailFocus({ scope: "table", schema: tab.schema, table: tab.table });
+  setDetailFocus({
+    scope: "table",
+    schema: tab.schema,
+    table: tab.table,
+    database: tab.database || profileDatabaseName(tab.connectionId),
+    connectionId: tab.connectionId,
+  });
+  if (tab.queryDatabase == null) {
+    tab.queryDatabase = tab.database || profileDatabaseName(tab.connectionId) || "";
+  }
+  if (tab.querySchema == null) {
+    tab.querySchema = isThreeLayerProfile(profileById(tab.connectionId)) ? (tab.schema || "") : "";
+  }
   updateRunButton();
   $("#data-context").textContent = `${tab.schema} · ${tab.table}`;
   updateContextMeta(`${tab.schema} · ${tab.table}`);
@@ -1829,14 +2461,19 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     state.result = tab.result;
     state.page = tab.page || 1;
     $("#sql-editor").value = tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 500}`;
+    state.sqlFileName = tab.sqlFileName || null;
+    state.sqlFilePath = tab.sqlFilePath || null;
+    updateSqlFileChip(state.sqlFileName);
     $("#ddl-view").textContent = tab.ddl || "";
     renderStructure(tab.columns);
     renderData(tab.result);
     switchTab(tab.viewMode || "data", { skipTitle: true });
+    await refreshSqlContextUi();
     return;
   }
 
   await loadTableIntoActiveTab(tab);
+  await refreshSqlContextUi();
 }
 
 async function loadTableIntoActiveTab(tab) {
@@ -1936,6 +2573,7 @@ async function openTable(schema, table, connectionId, database = null) {
   removeContextTabs();
 
   let tab = state.workspaceTabs.find((t) => t.id === id);
+  const three = isThreeLayerProfile(profile);
   if (!tab) {
     tab = {
       id,
@@ -1945,6 +2583,8 @@ async function openTable(schema, table, connectionId, database = null) {
       table,
       database: dbName,
       connectionId: cid,
+      queryDatabase: dbName,
+      querySchema: three ? schema : "",
       closable: true,
       pinned: false,
       viewMode: "data",
@@ -1955,6 +2595,8 @@ async function openTable(schema, table, connectionId, database = null) {
     tab.schema = schema;
     tab.table = table;
     tab.database = dbName || tab.database;
+    tab.queryDatabase = tab.queryDatabase || dbName;
+    if (tab.querySchema == null) tab.querySchema = three ? schema : "";
     tab.title = table;
   }
 
@@ -1965,6 +2607,298 @@ async function openTable(schema, table, connectionId, database = null) {
   updateRunButton();
   renderWorkspaceTabs();
   await applyWorkspaceTab(id, { forceReload: !tab.columns || !tab.result });
+}
+
+function sqlTabId(connectionId, database, schema) {
+  return `sql:${connectionId || state.activeConnectionId || ""}:${database || ""}:${schema || ""}`;
+}
+
+function sqlContextLabel(tab = {}) {
+  const profile = profileById(tab.connectionId || state.activeConnectionId);
+  const three = isThreeLayerProfile(profile);
+  const db = tab.queryDatabase || tab.database || "";
+  const sch = tab.querySchema || tab.schema || "";
+  const table = tab.table || state.currentTable || "";
+  if (three) {
+    return [db, sch, table].filter(Boolean).join(" · ") || "Query";
+  }
+  return [db || sch, table].filter(Boolean).join(" · ") || "Query";
+}
+
+function readSqlContextFromUi() {
+  return {
+    database: ($("#sql-db")?.value || "").trim(),
+    schema: ($("#sql-schema")?.value || "").trim(),
+  };
+}
+
+function fillSelectOptions(select, values, selected, { allowEmpty = true, emptyLabel = "—" } = {}) {
+  if (!select) return;
+  const prev = selected ?? select.value;
+  select.innerHTML = "";
+  if (allowEmpty) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = emptyLabel;
+    select.appendChild(opt);
+  }
+  for (const value of values || []) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = value;
+    select.appendChild(opt);
+  }
+  if (prev && [...select.options].some((o) => o.value === prev)) {
+    select.value = prev;
+  } else if (!allowEmpty && select.options.length) {
+    select.selectedIndex = 0;
+  } else {
+    select.value = "";
+  }
+}
+
+async function loadSqlDatabaseOptions() {
+  const cid = state.activeConnectionId;
+  if (!cid) return [];
+  try {
+    return await api(withConnectionId("/api/databases", cid));
+  } catch {
+    const fallback = profileDatabaseName(cid);
+    return fallback ? [fallback] : [];
+  }
+}
+
+async function loadSqlSchemaOptions(database) {
+  const cid = state.activeConnectionId;
+  if (!cid) return [];
+  const profile = activeProfile();
+  if (!isThreeLayerProfile(profile)) return [];
+  try {
+    const q = database ? `?database=${encodeURIComponent(database)}` : "";
+    return await api(withConnectionId(`/api/schemas${q}`, cid));
+  } catch {
+    return [];
+  }
+}
+
+function desiredSqlContextFromTab(tab) {
+  if (!tab) {
+    return {
+      database: state.detailFocus?.database || profileDatabaseName() || "",
+      schema: state.detailFocus?.scope === "schema" ? (state.detailFocus.schema || "") : "",
+      table: state.currentTable || "",
+    };
+  }
+  if (tab.kind === "table") {
+    const three = isThreeLayerProfile(profileById(tab.connectionId));
+    return {
+      database: tab.queryDatabase || tab.database || profileDatabaseName(tab.connectionId) || "",
+      schema: tab.querySchema != null
+        ? tab.querySchema
+        : (three ? (tab.schema || "") : ""),
+      table: tab.table || "",
+    };
+  }
+  if (tab.kind === "sql") {
+    return {
+      database: tab.queryDatabase || tab.database || profileDatabaseName(tab.connectionId) || "",
+      schema: tab.querySchema || tab.schema || "",
+      table: "",
+    };
+  }
+  // context / home
+  const focus = tab.detailFocus || state.detailFocus || {};
+  const three = isThreeLayerProfile(profileById(tab.connectionId || focus.connectionId));
+  return {
+    database: tab.queryDatabase
+      || focus.database
+      || profileDatabaseName(tab.connectionId)
+      || "",
+    schema: tab.querySchema != null
+      ? tab.querySchema
+      : (three && focus.scope === "schema" ? (focus.schema || "") : ""),
+    table: "",
+  };
+}
+
+async function refreshSqlContextUi() {
+  const dbSel = $("#sql-db");
+  const schSel = $("#sql-schema");
+  const schWrap = $("#sql-schema-wrap");
+  const tableChip = $("#sql-table-chip");
+  if (!dbSel || !schSel) return;
+
+  const epoch = state.workspaceApplyEpoch;
+  const editorBefore = $("#sql-editor")?.value;
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  const profile = activeProfile() || profileById(tab?.connectionId);
+  const three = isThreeLayerProfile(profile);
+  const desired = desiredSqlContextFromTab(tab);
+
+  if (schWrap) schWrap.hidden = !three;
+
+  const databases = await loadSqlDatabaseOptions();
+  if (epoch !== state.workspaceApplyEpoch) return;
+  fillSelectOptions(dbSel, databases, desired.database, {
+    allowEmpty: true,
+    emptyLabel: "Database…",
+  });
+
+  if (three) {
+    const schemas = await loadSqlSchemaOptions(dbSel.value || desired.database);
+    if (epoch !== state.workspaceApplyEpoch) return;
+    fillSelectOptions(schSel, schemas, desired.schema, {
+      allowEmpty: true,
+      emptyLabel: "Schema…",
+    });
+  } else {
+    schSel.innerHTML = "";
+    schSel.value = "";
+  }
+
+  if (tableChip) {
+    if (desired.table) {
+      tableChip.hidden = false;
+      tableChip.textContent = `Table: ${desired.table}`;
+      tableChip.title = desired.table;
+    } else {
+      tableChip.hidden = true;
+      tableChip.textContent = "";
+    }
+  }
+
+  // Prefer live editor text / tab.sql over whatever an older apply had.
+  const liveTab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  const keepSql = $("#sql-editor")?.value ?? editorBefore ?? liveTab?.sql;
+  persistSqlContextToActiveTab();
+  if (liveTab && keepSql != null) liveTab.sql = keepSql;
+  if ($("#sql-editor") && keepSql != null) $("#sql-editor").value = keepSql;
+}
+
+function persistSqlContextToActiveTab() {
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (!tab) return;
+  const ctx = readSqlContextFromUi();
+  tab.queryDatabase = ctx.database;
+  tab.querySchema = ctx.schema;
+  // Always keep editor text on the tab (prevents wipe after async refresh/apply).
+  if ($("#sql-editor")) {
+    tab.sql = $("#sql-editor").value;
+  }
+  if (tab.kind === "sql") {
+    tab.database = ctx.database || tab.database;
+    tab.schema = ctx.schema || tab.schema;
+    // File tabs keep the filename; only untitled SQL tabs follow db/schema.
+    if (tab.source === "file" || tab.sqlFileName) {
+      const fileTitle = tab.sqlFileName || tab.title || "query.sql";
+      if (tab.title !== fileTitle) {
+        tab.title = fileTitle;
+        renderWorkspaceTabs();
+      }
+    } else {
+      const nextTitle = ctx.schema || ctx.database || tab.title || "Query";
+      if (tab.title !== nextTitle) {
+        tab.title = nextTitle;
+        renderWorkspaceTabs();
+      }
+    }
+  }
+}
+
+async function onSqlDatabaseChanged() {
+  persistSqlContextToActiveTab();
+  const profile = activeProfile();
+  if (!isThreeLayerProfile(profile)) return;
+  const schSel = $("#sql-schema");
+  const schemas = await loadSqlSchemaOptions($("#sql-db")?.value || "");
+  const keep = schSel?.value || "";
+  fillSelectOptions(schSel, schemas, keep, { allowEmpty: true, emptyLabel: "Schema…" });
+  persistSqlContextToActiveTab();
+}
+
+/** Open SQL editor at database, schema, or table level. */
+async function openSqlEditor({
+  connectionId = null,
+  database = "",
+  schema = "",
+  table = null,
+} = {}) {
+  const cid = connectionId || state.activeConnectionId;
+  if (cid) {
+    state.activeConnectionId = cid;
+    await api("/api/session/active", {
+      method: "POST",
+      body: JSON.stringify({ id: cid }),
+    }).catch(() => {});
+  }
+
+  // Table / view: reuse the table workspace tab and switch to SQL.
+  if (table) {
+    await openTable(schema, table, cid, database);
+    const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+    if (tab) {
+      tab.queryDatabase = database || tab.database || profileDatabaseName(cid) || "";
+      tab.querySchema = isThreeLayerProfile(profileById(cid)) ? (schema || "") : "";
+      tab.viewMode = "sql";
+    }
+    switchTab("sql");
+    await refreshSqlContextUi();
+    setStatus(`SQL editor · ${sqlContextLabel(tab || { database, schema, table })}`);
+    return;
+  }
+
+  await openSqlTab({ connectionId: cid, database, schema });
+}
+
+async function openSqlTab({ connectionId = null, database = "", schema = "" } = {}) {
+  const cid = connectionId || state.activeConnectionId;
+  const dbName = database || profileDatabaseName(cid) || "";
+  const schName = schema || "";
+  const id = sqlTabId(cid, dbName, schName);
+  snapshotActiveWorkspaceTab();
+  removeContextTabs();
+
+  let tab = state.workspaceTabs.find((t) => t.id === id);
+  if (!tab) {
+    tab = {
+      id,
+      kind: "sql",
+      title: schName || dbName || "Query",
+      database: dbName,
+      schema: schName,
+      table: null,
+      connectionId: cid,
+      queryDatabase: dbName,
+      querySchema: schName,
+      closable: true,
+      pinned: false,
+      viewMode: "sql",
+      sql: "",
+    };
+    state.workspaceTabs.push(tab);
+  } else {
+    tab.connectionId = cid;
+    tab.database = dbName || tab.database;
+    tab.schema = schName;
+    tab.queryDatabase = dbName;
+    tab.querySchema = schName;
+    tab.title = schName || dbName || "Query";
+    tab.viewMode = "sql";
+  }
+
+  state.activeWorkspaceTabId = id;
+  state.currentSchema = schName || null;
+  state.currentTable = null;
+  setDetailFocus({
+    scope: schName ? "schema" : "database",
+    schema: schName || null,
+    database: dbName,
+    connectionId: cid,
+  });
+  updateRunButton();
+  renderWorkspaceTabs();
+  await applyWorkspaceTab(id);
+  setStatus(`SQL editor · ${sqlContextLabel(tab)}`);
 }
 
 function quoteIdent(name) {
@@ -2075,6 +3009,9 @@ function switchTab(name, { skipTitle = false } = {}) {
   }
   if (name === "details") {
     refreshDetails().catch((e) => console.error(e));
+  }
+  if (name === "sql") {
+    refreshSqlContextUi().catch((e) => console.error(e));
   }
 }
 
@@ -2546,28 +3483,76 @@ function renderStructure(cols) {
 }
 
 async function runSql() {
-  if (!state.currentTable) {
-    setStatus("Select a table first");
+  if (!state.activeConnectionId && !state.connected) {
+    setStatus("Connect to a database first");
     return;
   }
-  const sql = $("#sql-editor").value.trim();
+  const editor = $("#sql-editor");
+  const sqlText = editor?.value ?? "";
+  const sql = sqlText.trim();
   if (!sql) return;
+
+  // Cancel any in-flight tab apply/refresh that could wipe editor/results.
+  state.workspaceApplyEpoch += 1;
+
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (tab) tab.sql = sqlText;
+  persistSqlContextToActiveTab();
+  if (tab) tab.sql = sqlText; // keep full editor text even if persist raced
+
+  const ctx = readSqlContextFromUi();
+  const profile = activeProfile();
+  const three = isThreeLayerProfile(profile);
+  const body = { sql };
+  if (ctx.database) body.database = ctx.database;
+  // 2-layer: database dropdown is enough. 3-layer: schema is optional (db-level when empty).
+  if (three && ctx.schema) body.schema = ctx.schema;
+  if (!three && !body.database && ctx.schema) body.database = ctx.schema;
+
   setStatus("Executing…");
   try {
-    const result = await api("/api/query", { method: "POST", body: JSON.stringify({ sql }) });
+    const result = await api("/api/query", { method: "POST", body: JSON.stringify(body) });
+    state.workspaceApplyEpoch += 1;
     state.result = result;
     state.page = 1;
-    const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
-    if (tab && tab.kind === "table") {
-      tab.result = result;
-      tab.page = 1;
-      tab.sql = sql;
-      tab.viewMode = "data";
+    // Fresh query result — don't keep prior column filters that can hide all rows.
+    state.columnFilters = {};
+    state.hiddenColumns = {};
+    closeColumnFilterPopup();
+    const live = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+    if (live && (live.kind === "table" || live.kind === "sql" || live.kind === "context" || live.kind === "home")) {
+      live.result = result;
+      live.page = 1;
+      live.sql = sqlText;
+      live.queryDatabase = ctx.database;
+      live.querySchema = ctx.schema;
+      live.columnFilters = {};
+      live.hiddenColumns = {};
+      live.viewMode = "data";
+      if (live.source === "file" || live.sqlFileName) {
+        live.title = live.sqlFileName || live.title;
+      }
     }
-    renderData(result);
+    // Keep the query in the editor after Run.
+    if (editor) editor.value = sqlText;
+    state.sqlFileName = live?.sqlFileName || state.sqlFileName;
+    state.sqlFilePath = live?.sqlFilePath || state.sqlFilePath;
+    updateSqlFileChip(state.sqlFileName);
+
+    const where = [ctx.database, three ? ctx.schema : null].filter(Boolean).join(" · ");
+    const ctxChip = $("#data-context");
+    if (ctxChip) {
+      ctxChip.textContent = where
+        || (state.currentTable ? `${state.currentSchema || ""} · ${state.currentTable}` : "Query result");
+    }
+    // Show Data panel first, then paint rows (avoids empty-panel glitches).
     switchTab("data");
-    setStatus(result.message);
+    renderData(result);
+    updateClearFiltersButton();
+    setStatus(where ? `${result.message} · ${where}` : result.message);
   } catch (e) {
+    // Preserve editor text even when the query fails.
+    if (editor) editor.value = sqlText;
     setStatus(e.message);
     alert(e.message);
   }
@@ -3030,15 +4015,73 @@ function wire() {
   };
 
   $("#btn-run").onclick = () => runSql();
-  $("#btn-clear-sql").onclick = () => { $("#sql-editor").value = ""; };
+  $("#btn-load-sql").onclick = () => loadSqlFile();
+  $("#btn-save-sql").onclick = () => saveSqlFile();
+  $("#btn-find-sql").onclick = () => openSqlFindBar();
+  $("#btn-sql-find-next").onclick = () => runSqlFind(1);
+  $("#btn-sql-find-prev").onclick = () => runSqlFind(-1);
+  $("#btn-sql-find-close").onclick = () => closeSqlFindBar();
+  $("#sql-find-input")?.addEventListener("input", () => runSqlFind(0));
+  $("#sql-find-case")?.addEventListener("change", () => runSqlFind(0));
+  $("#sql-find-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      runSqlFind(e.shiftKey ? -1 : 1);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeSqlFindBar();
+    }
+  });
+  $("#btn-clear-sql").onclick = () => {
+    setSqlEditorContent("", null, null);
+    closeSqlFindBar();
+  };
+  $("#sql-file-input")?.addEventListener("change", onSqlFileInputChange);
+  $("#ws-tabs-more")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    toggleWorkspaceTabsOverflowMenu();
+  });
+  $("#ws-tabs-overflow-menu")?.addEventListener("click", (e) => e.stopPropagation());
+  $("#ws-tabs-overflow-menu")?.addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("#sql-db")?.addEventListener("change", () => {
+    onSqlDatabaseChanged().catch((e) => console.error(e));
+  });
+  $("#sql-schema")?.addEventListener("change", () => persistSqlContextToActiveTab());
   $("#sql-editor").addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
-      if (!state.currentTable) return;
+      if ($("#btn-run")?.disabled) return;
       runSql();
     }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      openSqlFindBar();
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "g") {
+      e.preventDefault();
+      if ($("#sql-find-bar")?.hidden) openSqlFindBar();
+      else runSqlFind(e.shiftKey ? -1 : 1);
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      saveSqlFile();
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+      e.preventDefault();
+      loadSqlFile();
+    }
+    if (e.key === "Escape" && !$("#sql-find-bar")?.hidden) {
+      e.preventDefault();
+      closeSqlFindBar();
+    }
+  });
+  // Re-run find when the query text changes while the bar is open.
+  $("#sql-editor").addEventListener("input", () => {
+    if (!$("#sql-find-bar")?.hidden) runSqlFind(0);
   });
   updateRunButton();
+  updateSqlFileChip();
   $("#data-search").oninput = () => {
     state.page = 1;
     renderData(state.result);
@@ -3075,15 +4118,20 @@ function wire() {
   updateClearFiltersButton();
   $("#col-visibility-menu")?.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("pointerdown", (e) => {
+    if (!e.target.closest(".ws-tabs-more-wrap")) closeWorkspaceTabsOverflowMenu();
     if (e.target.closest(".col-vis-wrap")) return;
     closeColumnVisibilityMenu();
     if (e.target.closest("#col-filter-popup") || e.target.closest("#data-table thead th.col-filterable")) return;
     closeColumnFilterPopup();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeColumnFilterPopup();
+    if (e.key === "Escape") {
+      closeColumnFilterPopup();
+      closeWorkspaceTabsOverflowMenu();
+    }
   });
   window.addEventListener("resize", () => {
+    layoutWorkspaceTabOverflow({ keepMenuOpen: !$("#ws-tabs-overflow-menu")?.hidden });
     if (state.filterPopupColumn) closeColumnFilterPopup();
   });
   $("#btn-export-csv").onclick = exportCsv;
@@ -3099,6 +4147,7 @@ function wire() {
   $$(".tabs .tab").forEach((t) => t.onclick = () => {
     closeColumnVisibilityMenu();
     closeColumnFilterPopup();
+    closeWorkspaceTabsOverflowMenu();
     switchTab(t.dataset.tab);
   });
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a macOS .app + .dmg installable for Forge Database Manager.
+# Build a macOS .app + .dmg installable for DB Pilot.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,7 +30,7 @@ case "$ARCH" in
   *) echo "Unsupported Mac arch: $ARCH" >&2; exit 1 ;;
 esac
 
-APP_NAME="Forge Database Manager"
+APP_NAME="DB Pilot"
 APP_VERSION="1.0.0"
 MAIN_CLASS="com.forgesystem.dbmanager.Launcher"
 VENDOR="Forge System"

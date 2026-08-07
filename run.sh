@@ -16,5 +16,5 @@ if [[ -z "${JAVA_HOME:-}" ]]; then
 fi
 [[ -n "${JAVA_HOME:-}" ]] && export PATH="$JAVA_HOME/bin:$PATH"
 
-echo "Starting Forge Database Manager (desktop + embedded HTML UI)"
+echo "Starting DB Pilot (desktop + embedded HTML UI)"
 exec mvn -q javafx:run
