@@ -1,0 +1,2 @@
+c51f95ea005cc7f24aedfa6efa5da0c6c62d4fe9f1fb37623240e8f53b89d069  forge-database-manager-1.0.0-windows-x86_64-standalone.zip
+c51f95ea005cc7f24aedfa6efa5da0c6c62d4fe9f1fb37623240e8f53b89d069  (reassembled from .part-*)
