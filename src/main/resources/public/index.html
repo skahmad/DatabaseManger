@@ -113,6 +113,9 @@
           <button type="button" class="btn ghost" id="btn-load-sql" title="Load one or more SQL files">Load…</button>
           <button type="button" class="btn ghost" id="btn-save-sql" title="Save query to a file">Save…</button>
           <button type="button" class="btn ghost" id="btn-find-sql" title="Find in query (⌘/Ctrl + F)">Find</button>
+          <button type="button" class="btn ghost sm" id="btn-sql-zoom-out" title="Zoom out (⌘/Ctrl + −)">A−</button>
+          <button type="button" class="btn ghost sm" id="btn-sql-zoom-in" title="Zoom in (⌘/Ctrl + =)">A+</button>
+          <span id="sql-zoom-label" class="sql-zoom-label" title="Editor text zoom">100%</span>
           <button type="button" class="btn ghost" id="btn-clear-sql">Clear</button>
           <label class="inline-field sql-ctx-field" id="sql-db-wrap">Database
             <select id="sql-db" class="input sql-ctx-select" title="Query database"></select>
@@ -133,7 +136,42 @@
           <button type="button" class="btn ghost sm" id="btn-sql-find-next" title="Next match">↓</button>
           <button type="button" class="btn ghost sm" id="btn-sql-find-close" title="Close find">✕</button>
         </div>
-        <textarea id="sql-editor" class="sql-editor" spellcheck="false" placeholder="SELECT * FROM users LIMIT 50;"></textarea>
+        <div class="sql-workspace" id="sql-workspace">
+          <div class="sql-editor-shell" id="sql-editor-shell">
+            <div class="sql-gutter" id="sql-gutter" aria-hidden="true"></div>
+            <div class="sql-code-pane">
+              <pre class="sql-highlight" id="sql-highlight" aria-hidden="true"></pre>
+              <textarea id="sql-editor" class="sql-editor" spellcheck="false" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="SELECT * FROM users LIMIT 50;"></textarea>
+            </div>
+            <div id="sql-suggest" class="sql-suggest" hidden role="listbox" aria-label="SQL suggestions"></div>
+          </div>
+          <div class="sql-editor-status" id="sql-editor-status" aria-live="polite">
+            <span id="sql-cursor-pos">Ln 1, Col 1</span>
+            <span id="sql-editor-hint" class="sql-editor-hint">Tab indent · Ctrl+Space suggest · Ctrl+F find · Ctrl± zoom · ⌘/Ctrl+Enter run</span>
+          </div>
+          <div class="sql-log-resizer" id="sql-log-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize output" title="Drag to resize output"></div>
+          <aside class="sql-log" id="sql-log" aria-label="Query output">
+            <div class="sql-log-head">
+              <button type="button" class="btn ghost sm sql-log-toggle" id="btn-sql-log-toggle" title="Minimize / expand output" aria-expanded="true">▾</button>
+              <strong class="sql-log-title">Output</strong>
+              <span id="sql-log-meta" class="sql-log-meta"></span>
+              <div class="sql-log-actions">
+                <button type="button" class="btn ghost sm" id="btn-sql-log-find" title="Find in output (⌘/Ctrl + F)">Find</button>
+                <button type="button" class="btn ghost sm" id="btn-sql-log-copy" title="Copy output">Copy</button>
+                <button type="button" class="btn ghost sm" id="btn-sql-log-clear" title="Clear output">Clear</button>
+              </div>
+            </div>
+            <div id="sql-log-find-bar" class="sql-find-bar sql-log-find-bar" hidden>
+              <input type="text" id="sql-log-find-input" class="input sql-find-input" placeholder="Find in output…" autocomplete="off" spellcheck="false" />
+              <label class="check sql-find-case"><input type="checkbox" id="sql-log-find-case" /> Match case</label>
+              <span id="sql-log-find-count" class="sql-find-count">0 / 0</span>
+              <button type="button" class="btn ghost sm" id="btn-sql-log-find-prev" title="Previous match">↑</button>
+              <button type="button" class="btn ghost sm" id="btn-sql-log-find-next" title="Next match">↓</button>
+              <button type="button" class="btn ghost sm" id="btn-sql-log-find-close" title="Close find">✕</button>
+            </div>
+            <pre id="sql-log-output" class="sql-log-output" tabindex="0"></pre>
+          </aside>
+        </div>
         <input type="file" id="sql-file-input" accept=".sql,.txt,text/plain,text/sql" multiple hidden />
       </section>
 
