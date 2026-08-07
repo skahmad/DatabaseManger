@@ -68,12 +68,11 @@
       <nav id="view-tabs" class="tabs" role="tablist" aria-label="View" hidden>
         <div class="tabs-left" id="view-tabs-left">
           <button type="button" class="tab active" data-tab="details">Details</button>
-          <button type="button" class="tab" data-tab="sql">SQL</button>
           <button type="button" class="tab" data-tab="data">Data</button>
           <button type="button" class="tab" data-tab="structure">Structure</button>
-          <button type="button" class="tab" data-tab="ddl">DDL</button>
         </div>
         <div class="tabs-right" id="view-tabs-right">
+          <button type="button" class="btn ghost sm" id="btn-back-to-sql" hidden title="Back to SQL editor">← SQL</button>
           <input type="text" id="data-search" class="input tabs-search" placeholder="Search rows…" autocomplete="off" spellcheck="false" />
           <div class="pager-controls" aria-label="Pagination">
             <button type="button" class="btn ghost pager-btn" id="btn-page-prev" title="Previous page" aria-label="Previous page" disabled>←</button>
@@ -91,8 +90,13 @@
             </div>
           </div>
           <button type="button" class="btn ghost" id="btn-clear-filters" title="Clear all column filters" hidden>Clear filters</button>
-          <button type="button" class="btn ghost" id="btn-export-csv">CSV</button>
-          <button type="button" class="btn ghost" id="btn-export-json">JSON</button>
+          <div class="export-wrap">
+            <button type="button" class="btn ghost" id="btn-export" title="Export data" aria-haspopup="menu" aria-expanded="false">Export ▾</button>
+            <div id="export-menu" class="export-menu" hidden role="menu" aria-label="Export format">
+              <button type="button" class="export-menu-item" id="btn-export-csv" role="menuitem">CSV</button>
+              <button type="button" class="export-menu-item" id="btn-export-json" role="menuitem">JSON</button>
+            </div>
+          </div>
         </div>
       </nav>
 
@@ -176,10 +180,6 @@
       </section>
 
       <section id="panel-data" class="panel">
-        <div class="toolbar">
-          <button type="button" class="btn ghost sm" id="btn-back-to-sql" hidden title="Back to SQL editor">← SQL</button>
-          <span id="data-context" class="context-chip">No table selected</span>
-        </div>
         <div class="table-wrap">
           <table id="data-table">
             <thead></thead>
@@ -190,21 +190,26 @@
       </section>
 
       <section id="panel-structure" class="panel">
-        <div class="table-wrap">
-          <table id="structure-table">
-            <thead>
-              <tr>
-                <th>Column</th><th>Type</th><th>Nullable</th><th>PK</th><th>Auto</th><th>Default</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-          <div id="structure-empty" class="empty">Select a table to view structure.</div>
+        <div class="structure-layout">
+          <div class="structure-section structure-columns">
+            <div class="structure-section-head">Columns</div>
+            <div class="table-wrap">
+              <table id="structure-table">
+                <thead>
+                  <tr>
+                    <th>Column</th><th>Type</th><th>Nullable</th><th>PK</th><th>Auto</th><th>Default</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+              <div id="structure-empty" class="empty">Select a table to view structure.</div>
+            </div>
+          </div>
+          <div class="structure-section structure-ddl">
+            <div class="structure-section-head">DDL</div>
+            <pre id="ddl-view" class="ddl-view">Select a table to view DDL.</pre>
+          </div>
         </div>
-      </section>
-
-      <section id="panel-ddl" class="panel">
-        <pre id="ddl-view" class="ddl-view">Select a table and open DDL.</pre>
       </section>
 
       <footer class="status-bar">

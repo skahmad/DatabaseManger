@@ -2341,8 +2341,8 @@ function openSqlFindBar(seed = "") {
   const input = $("#sql-find-input");
   const editor = getSqlEditor();
   if (!bar || !input) return;
-  // Ensure SQL panel is visible.
-  if (!isSqlPanelActive()) switchTab("sql");
+  // Ensure SQL panel is visible for SQL workspace tabs.
+  if (!isSqlPanelActive() && activeWorkspaceTab()?.kind === "sql") switchTab("sql");
   bar.hidden = false;
   bar.removeAttribute("hidden");
   if (seed) {
@@ -2947,6 +2947,7 @@ function workspaceTabLabel(tab) {
     return tab.sqlFileName || tab.title || "query.sql";
   }
   if (tab.kind === "sql") {
+    if (tab.table) return tab.table;
     return tab.title || tab.querySchema || tab.queryDatabase || "Query";
   }
   if (tab.kind === "table") return tab.table || tab.title || "Table";
@@ -3037,9 +3038,8 @@ function showEmptyWorkspace() {
   updateContextMeta("");
   closeColumnVisibilityMenu();
   updateClearFiltersButton();
-  $("#data-context").textContent = "No table selected";
   setSqlEditorContent("", null);
-  $("#ddl-view").textContent = "Select a table and open DDL.";
+  $("#ddl-view").textContent = "Select a table to view DDL.";
   renderStructure([]);
   renderData(null);
   renderWorkspaceTabs();
@@ -3279,14 +3279,10 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     state.sqlFileName = tab.sqlFileName || null;
     state.sqlFilePath = tab.sqlFilePath || null;
     updateSqlFileChip(state.sqlFileName);
-    $("#ddl-view").textContent = tab.ddl || "Select a table and open DDL.";
+    $("#ddl-view").textContent = tab.ddl || "Select a table to view DDL.";
     renderStructure([]);
     // Keep prior query results on DB/SCH tabs (do not wipe on re-apply).
     state.result = tab.result || null;
-    const ctxLabel = sqlContextLabel(tab);
-    $("#data-context").textContent = tab.result
-      ? (ctxLabel || "Query result")
-      : "No table selected";
     switchTab(tab.viewMode || "details", { skipTitle: true });
     renderData(tab.result || null);
     updateContextMeta(tab.title || "");
@@ -3304,7 +3300,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
   if (tab.kind === "sql") {
     if (tab.connectionId) state.activeConnectionId = tab.connectionId;
     state.currentSchema = tab.schema || tab.querySchema || null;
-    state.currentTable = null;
+    state.currentTable = tab.table || null;
     state.columns = [];
     state.hiddenColumns = { ...(tab.hiddenColumns || {}) };
     state.columnFilters = { ...(tab.columnFilters || {}) };
@@ -3313,17 +3309,17 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     updateClearFiltersButton();
     if (tab.source === "file" || tab.sqlFileName) {
       tab.title = tab.sqlFileName || tab.title || "query.sql";
+    } else if (tab.table) {
+      tab.title = tab.table;
     }
     setDetailFocus({
-      scope: tab.schema || tab.querySchema ? "schema" : "database",
+      scope: tab.table ? "table" : (tab.schema || tab.querySchema ? "schema" : "database"),
       schema: tab.schema || tab.querySchema || null,
+      table: tab.table || null,
       database: tab.database || tab.queryDatabase || profileDatabaseName(tab.connectionId),
       connectionId: tab.connectionId,
     });
     updateRunButton();
-    $("#data-context").textContent = tab.result
-      ? (sqlContextLabel(tab) || "Query result")
-      : (sqlContextLabel(tab) || "Query");
     setSqlEditorValue(tab.sql || "");
     state.sqlFileName = tab.sqlFileName || null;
     state.sqlFilePath = tab.sqlFilePath || null;
@@ -3332,7 +3328,10 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     renderStructure([]);
     state.result = tab.result || null;
     state.page = tab.page || 1;
-    switchTab(tab.viewMode || "sql", { skipTitle: true });
+    // SQL workspace tabs use the SQL panel (or Data for result grids).
+    const mode = (tab.viewMode === "data" && tab.result) ? "data" : "sql";
+    tab.viewMode = mode;
+    switchTab(mode, { skipTitle: true });
     renderData(tab.result || null);
     await refreshSqlContextUi();
     if (epoch !== state.workspaceApplyEpoch) return;
@@ -3342,6 +3341,8 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
       tab.title = tab.sqlFileName;
       state.sqlFileName = tab.sqlFileName;
       updateSqlFileChip(state.sqlFileName);
+    } else if (tab.table) {
+      tab.title = tab.table;
     }
     if (tab.result) {
       state.result = tab.result;
@@ -3367,7 +3368,6 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     tab.querySchema = isThreeLayerProfile(profileById(tab.connectionId)) ? (tab.schema || "") : "";
   }
   updateRunButton();
-  $("#data-context").textContent = `${tab.schema} · ${tab.table}`;
   updateContextMeta(`${tab.schema} · ${tab.table}`);
 
   state.hiddenColumns = { ...(tab.hiddenColumns || {}) };
@@ -3387,7 +3387,10 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     $("#ddl-view").textContent = tab.ddl || "";
     renderStructure(tab.columns);
     renderData(tab.result);
-    switchTab(tab.viewMode || "data", { skipTitle: true });
+    const cachedMode = tab.viewMode === "sql" || tab.viewMode === "ddl"
+      ? (tab.viewMode === "ddl" ? "structure" : "data")
+      : (tab.viewMode || "data");
+    switchTab(cachedMode, { skipTitle: true });
     await refreshSqlContextUi();
     return;
   }
@@ -3426,7 +3429,9 @@ async function loadTableIntoActiveTab(tab) {
   live.ddl = ddlText;
   live.sql = sql;
   live.page = 1;
-  live.viewMode = live.viewMode === "details" ? "data" : (live.viewMode || "data");
+  if (live.viewMode === "details" || live.viewMode === "sql") live.viewMode = "data";
+  else if (live.viewMode === "ddl") live.viewMode = "structure";
+  else live.viewMode = live.viewMode || "data";
 
   if (state.activeWorkspaceTabId !== live.id) return;
 
@@ -3441,7 +3446,6 @@ async function loadTableIntoActiveTab(tab) {
   state.currentTable = table;
   setSqlEditorValue(sql);
   $("#ddl-view").textContent = ddlText;
-  $("#data-context").textContent = `${schema} · ${table}`;
   renderStructure(cols);
   renderData(rows);
   updateContextMeta(`${schema} · ${table}`);
@@ -3526,7 +3530,9 @@ async function openTable(schema, table, connectionId, database = null) {
       replace.columnFilters = {};
       replace.sqlFileName = null;
       replace.sqlFilePath = null;
-      replace.viewMode = replace.viewMode === "details" ? "data" : (replace.viewMode || "data");
+      if (replace.viewMode === "details" || replace.viewMode === "sql") replace.viewMode = "data";
+      else if (replace.viewMode === "ddl") replace.viewMode = "structure";
+      else replace.viewMode = replace.viewMode || "data";
       if (state.activeWorkspaceTabId === oldId) state.activeWorkspaceTabId = id;
       tab = replace;
     } else {
@@ -3567,6 +3573,10 @@ async function openTable(schema, table, connectionId, database = null) {
 
 function sqlTabId(connectionId, database, schema) {
   return `sql:${connectionId || state.activeConnectionId || ""}:${database || ""}:${schema || ""}`;
+}
+
+function sqlTableTabId(connectionId, schema, table) {
+  return `sqltable:${connectionId || state.activeConnectionId || ""}:${schema || ""}.${table || ""}`;
 }
 
 function sqlContextLabel(tab = {}) {
@@ -3659,7 +3669,7 @@ function desiredSqlContextFromTab(tab) {
     return {
       database: tab.queryDatabase || tab.database || profileDatabaseName(tab.connectionId) || "",
       schema: tab.querySchema || tab.schema || "",
-      table: "",
+      table: tab.table || "",
     };
   }
   // context / home
@@ -3791,66 +3801,78 @@ async function openSqlEditor({
     }).catch(() => {});
   }
 
-  // Table / view: reuse the table workspace tab and switch to SQL.
-  if (table) {
-    await openTable(schema, table, cid, database);
-    const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
-    if (tab) {
-      tab.queryDatabase = database || tab.database || profileDatabaseName(cid) || "";
-      tab.querySchema = isThreeLayerProfile(profileById(cid)) ? (schema || "") : "";
-      tab.viewMode = "sql";
-    }
-    switchTab("sql");
-    await refreshSqlContextUi();
-    setStatus(`SQL editor · ${sqlContextLabel(tab || { database, schema, table })}`);
-    return;
-  }
-
-  await openSqlTab({ connectionId: cid, database, schema });
+  // Table / view: always open a dedicated SQL workspace tab.
+  await openSqlTab({
+    connectionId: cid,
+    database,
+    schema,
+    table: table || null,
+  });
 }
 
-async function openSqlTab({ connectionId = null, database = "", schema = "" } = {}) {
+async function openSqlTab({
+  connectionId = null,
+  database = "",
+  schema = "",
+  table = null,
+} = {}) {
   const cid = connectionId || state.activeConnectionId;
-  const dbName = database || profileDatabaseName(cid) || "";
-  const schName = schema || "";
-  const id = sqlTabId(cid, dbName, schName);
+  const profile = profileById(cid);
+  const three = isThreeLayerProfile(profile);
+  const dbName = database
+    || (!three && schema ? schema : null)
+    || profileDatabaseName(cid)
+    || "";
+  const schName = three ? (schema || "") : "";
+  const tableName = table || null;
+  const id = tableName
+    ? sqlTableTabId(cid, schema || schName || dbName, tableName)
+    : sqlTabId(cid, dbName, schName);
   snapshotActiveWorkspaceTab();
   removeContextTabs();
+
+  const limit = Number($("#row-limit")?.value) || 500;
+  const defaultSql = tableName
+    ? `SELECT * FROM ${quoteIdent(tableName)} LIMIT ${limit}`
+    : "";
 
   let tab = state.workspaceTabs.find((t) => t.id === id);
   if (!tab) {
     tab = {
       id,
       kind: "sql",
-      title: schName || dbName || "Query",
+      title: tableName || schName || dbName || "Query",
       database: dbName,
-      schema: schName,
-      table: null,
+      schema: three ? schName : (schema || ""),
+      table: tableName,
       connectionId: cid,
       queryDatabase: dbName,
-      querySchema: schName,
+      querySchema: three ? schName : "",
       closable: true,
       pinned: false,
       viewMode: "sql",
-      sql: "",
+      sql: defaultSql,
     };
     state.workspaceTabs.push(tab);
   } else {
     tab.connectionId = cid;
     tab.database = dbName || tab.database;
-    tab.schema = schName;
+    tab.schema = three ? schName : (schema || tab.schema || "");
+    tab.table = tableName;
     tab.queryDatabase = dbName;
-    tab.querySchema = schName;
-    tab.title = schName || dbName || "Query";
+    tab.querySchema = three ? schName : "";
+    tab.title = tableName || schName || dbName || tab.title || "Query";
     tab.viewMode = "sql";
+    if (tableName && !String(tab.sql || "").trim()) tab.sql = defaultSql;
   }
 
   state.activeWorkspaceTabId = id;
-  state.currentSchema = schName || null;
-  state.currentTable = null;
+  state.currentSchema = (three ? schName : (schema || dbName)) || null;
+  state.currentTable = tableName;
   setDetailFocus({
-    scope: schName ? "schema" : "database",
-    schema: schName || null,
+    scope: tableName ? "table" : (schName ? "schema" : "database"),
+    schema: three ? (schName || null) : (schema || dbName || null),
+    table: tableName,
     database: dbName,
     connectionId: cid,
   });
@@ -3957,7 +3979,7 @@ function isTableWorkspaceActive(tab = activeWorkspaceTab()) {
 }
 
 /**
- * View tabs (Details/SQL/Data/Structure/DDL) only for table workspace tabs.
+ * View tabs (Details/Data/Structure) only for table workspace tabs.
  * Non-table query results keep the data tool strip (search/pager/export).
  */
 function updateViewTabBarVisibility() {
@@ -4000,17 +4022,26 @@ function switchTab(name, { skipTitle = false } = {}) {
   const isTable = isTableWorkspaceActive(tab);
   let target = name;
 
-  // Without a table, Structure/DDL/Details don't apply to SQL tabs.
+  // Table tabs no longer have an SQL view — use a dedicated SQL workspace tab instead.
+  if (isTable && target === "sql") {
+    target = "data";
+  }
+  // DDL merged into Structure.
+  if (target === "ddl") target = "structure";
+
+  // Without a table workspace tab, Structure/Details don't apply to SQL tabs.
   if (!isTable) {
     if (tab?.kind === "sql") {
       target = (name === "data" && (state.result || tab.result)) ? "data" : "sql";
     } else if (tab?.kind === "context" || tab?.kind === "home") {
-      if (name === "sql") target = "sql";
-      else if (name === "data" && (state.result || tab.result)) target = "data";
+      if (name === "data" && (state.result || tab.result)) target = "data";
       else target = "details";
     } else if (!tab) {
       target = "details";
     }
+  } else if (tab.viewMode === "sql") {
+    // Migrate any persisted table tab that still points at the removed SQL view.
+    target = target === "sql" ? "data" : target;
   }
 
   state.currentTab = target;
@@ -4308,6 +4339,23 @@ function closeColumnVisibilityMenu() {
   if (menu) menu.hidden = true;
 }
 
+function closeExportMenu() {
+  const menu = $("#export-menu");
+  const btn = $("#btn-export");
+  if (menu) menu.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function toggleExportMenu() {
+  const menu = $("#export-menu");
+  const btn = $("#btn-export");
+  if (!menu || !btn) return;
+  const open = menu.hidden;
+  closeColumnVisibilityMenu();
+  menu.hidden = !open;
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
 function renderColumnVisibilityList(columns) {
   const list = $("#col-visibility-list");
   if (!list) return;
@@ -4353,6 +4401,7 @@ function toggleColumnVisibilityMenu() {
   const menu = $("#col-visibility-menu");
   if (!menu) return;
   const open = menu.hidden;
+  closeExportMenu();
   if (open) {
     renderColumnVisibilityList(state.result?.columns || []);
     menu.hidden = false;
@@ -4930,12 +4979,6 @@ async function runSql() {
     state.sqlFilePath = live?.sqlFilePath || state.sqlFilePath;
     updateSqlFileChip(state.sqlFileName);
 
-    const ctxChip = $("#data-context");
-    if (ctxChip) {
-      ctxChip.textContent = where
-        || (state.currentTable ? `${state.currentSchema || ""} · ${state.currentTable}` : "Query result");
-    }
-
     const hasGrid = !result.update && !!result.columns?.length;
     appendSqlLog(
       "ok",
@@ -5509,16 +5552,19 @@ function wire() {
   $("#col-filter-popup")?.addEventListener("pointerdown", (e) => e.stopPropagation());
   updateClearFiltersButton();
   $("#col-visibility-menu")?.addEventListener("click", (e) => e.stopPropagation());
+  $("#export-menu")?.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("pointerdown", (e) => {
     if (!e.target.closest(".ws-tabs-more-wrap")) closeWorkspaceTabsOverflowMenu();
-    if (e.target.closest(".col-vis-wrap")) return;
-    closeColumnVisibilityMenu();
+    if (!e.target.closest(".col-vis-wrap")) closeColumnVisibilityMenu();
+    if (!e.target.closest(".export-wrap")) closeExportMenu();
     if (e.target.closest("#col-filter-popup") || e.target.closest("#data-table thead th.col-filterable")) return;
     closeColumnFilterPopup();
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeColumnFilterPopup();
+      closeColumnVisibilityMenu();
+      closeExportMenu();
       closeWorkspaceTabsOverflowMenu();
     }
   });
@@ -5526,8 +5572,18 @@ function wire() {
     layoutWorkspaceTabOverflow({ keepMenuOpen: !$("#ws-tabs-overflow-menu")?.hidden });
     if (state.filterPopupColumn) closeColumnFilterPopup();
   });
-  $("#btn-export-csv").onclick = exportCsv;
-  $("#btn-export-json").onclick = exportJson;
+  $("#btn-export")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleExportMenu();
+  });
+  $("#btn-export-csv").onclick = () => {
+    closeExportMenu();
+    exportCsv();
+  };
+  $("#btn-export-json").onclick = () => {
+    closeExportMenu();
+    exportJson();
+  };
   $("#btn-page-prev").onclick = () => {
     state.page -= 1;
     renderData(state.result);
@@ -5538,6 +5594,7 @@ function wire() {
   };
   $$(".tabs .tab").forEach((t) => t.onclick = () => {
     closeColumnVisibilityMenu();
+    closeExportMenu();
     closeColumnFilterPopup();
     closeWorkspaceTabsOverflowMenu();
     switchTab(t.dataset.tab);
