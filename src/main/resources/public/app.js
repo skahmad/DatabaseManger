@@ -22,7 +22,7 @@ const state = {
   columns: [],
   result: null,
   page: 1,
-  pageSize: 50,
+  pageSize: 1000,
   contextDb: null,
   contextTarget: null,
   expandedProfileIds: {},
@@ -315,6 +315,28 @@ function wirePrefs() {
   applyPrefs();
   wireSidebarResize();
 }
+
+/** Native system menu bar (File / Settings) → UI actions. */
+window.dbPilotMenu = {
+  newConnection: () => openNewConnection(),
+  openSql: () => loadSqlFile(),
+  saveSql: () => saveSqlFile(),
+  setTheme: (theme) => {
+    if (!THEMES.includes(theme)) return;
+    savePrefs({ theme });
+    applyPrefs();
+  },
+  setZoom: (zoom) => {
+    savePrefs({ zoom: normalizeZoom(zoom) });
+    applyPrefs();
+  },
+  setDensity: (density) => {
+    if (!DENSITIES.includes(density)) return;
+    savePrefs({ density });
+    applyPrefs();
+    applySqlEditorZoom(loadPrefs().sqlEditorZoom ?? 100, { persist: false });
+  },
+};
 
 /* ── Profiles / sidebar connection tree ──────────── */
 
@@ -3383,7 +3405,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     state.columns = tab.columns;
     state.result = tab.result;
     state.page = tab.page || 1;
-    setSqlEditorValue(tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 500}`);
+    setSqlEditorValue(tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 1000}`);
     state.sqlFileName = tab.sqlFileName || null;
     state.sqlFilePath = tab.sqlFilePath || null;
     updateSqlFileChip(state.sqlFileName);
@@ -3402,17 +3424,101 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
   await refreshSqlContextUi();
 }
 
+function dataPageSize() {
+  return Math.max(1, state.pageSize || 1000);
+}
+
+function usesServerTablePaging(result = state.result, tab = activeWorkspaceTab()) {
+  if (!tab || tab.kind !== "table") return false;
+  const tableTotal = Number(result?.totalRows);
+  if (!Number.isFinite(tableTotal) || tableTotal < 0) return false;
+  const loaded = result?.rows?.length || 0;
+  const filtered = filteredRows(result).length;
+  // Client filters apply only to the loaded page — keep paging local then.
+  return filtered === loaded;
+}
+
+function tablePageSql(table, page, pageSize) {
+  const offset = Math.max(0, (page - 1) * pageSize);
+  if (offset > 0) {
+    return `SELECT * FROM ${quoteIdent(table)} LIMIT ${pageSize} OFFSET ${offset}`;
+  }
+  return `SELECT * FROM ${quoteIdent(table)} LIMIT ${pageSize}`;
+}
+
+async function fetchTableRowsPage(tab, page) {
+  const pageSize = dataPageSize();
+  const offset = Math.max(0, (Math.max(1, page) - 1) * pageSize);
+  const cid = tab.connectionId || state.activeConnectionId;
+  const base = `/api/databases/${encodeURIComponent(tab.schema)}/tables/${encodeURIComponent(tab.table)}`;
+  return api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}`, cid));
+}
+
+async function loadTablePage(page) {
+  const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+  if (!tab || tab.kind !== "table") return;
+  const pageSize = dataPageSize();
+  const tableTotal = Number(tab.result?.totalRows);
+  const totalPages = Number.isFinite(tableTotal) && tableTotal > 0
+    ? Math.max(1, Math.ceil(tableTotal / pageSize))
+    : 1;
+  const next = Math.min(totalPages, Math.max(1, page));
+  setStatus(`Loading page ${next}…`);
+  try {
+    const rows = await fetchTableRowsPage(tab, next);
+    const live = state.workspaceTabs.find((t) => t.id === tab.id);
+    if (!live) return;
+    const sql = tablePageSql(tab.table, next, pageSize);
+    live.result = rows;
+    live.page = next;
+    live.sql = sql;
+    if (state.activeWorkspaceTabId !== live.id) return;
+    state.result = rows;
+    state.page = next;
+    setSqlEditorValue(sql);
+    renderData(rows);
+    setStatus(rows.message || `Page ${next} of ${totalPages}`);
+  } catch (e) {
+    setStatus(e.message || "Failed to load page");
+  }
+}
+
+async function changeDataPage(delta) {
+  const result = state.result;
+  if (!result) return;
+  const pageSize = dataPageSize();
+  const current = state.page || 1;
+
+  if (usesServerTablePaging(result)) {
+    const tableTotal = Number(result.totalRows) || 0;
+    const totalPages = Math.max(1, Math.ceil(tableTotal / pageSize) || 1);
+    const next = Math.min(totalPages, Math.max(1, current + delta));
+    if (next === current) return;
+    await loadTablePage(next);
+    return;
+  }
+
+  const rows = filteredRows(result);
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize) || 1);
+  const next = Math.min(totalPages, Math.max(1, current + delta));
+  if (next === current) return;
+  state.page = next;
+  const tab = activeWorkspaceTab();
+  if (tab) tab.page = next;
+  renderData(result);
+}
+
 async function loadTableIntoActiveTab(tab) {
   const schema = tab.schema;
   const table = tab.table;
   const cid = tab.connectionId || state.activeConnectionId;
   updateContextMeta("Loading…");
   setStatus(`Loading ${table}…`);
-  const limit = Number($("#row-limit").value) || 500;
+  const pageSize = dataPageSize();
   const base = `/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}`;
   const [cols, rows] = await Promise.all([
     api(withConnectionId(`${base}/columns`, cid)),
-    api(withConnectionId(`${base}/rows?limit=${limit}`, cid)),
+    api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=0`, cid)),
   ]);
   let ddlText = "DDL unavailable";
   try {
@@ -3421,7 +3527,7 @@ async function loadTableIntoActiveTab(tab) {
   } catch {
     /* ignore */
   }
-  const sql = `SELECT * FROM ${quoteIdent(table)} LIMIT ${limit}`;
+  const sql = tablePageSql(table, 1, pageSize);
 
   // Tab may have been closed while loading
   const live = state.workspaceTabs.find((t) => t.id === tab.id);
@@ -3834,7 +3940,7 @@ async function openSqlTab({
   snapshotActiveWorkspaceTab();
   removeContextTabs();
 
-  const limit = Number($("#row-limit")?.value) || 500;
+  const limit = Number($("#row-limit")?.value) || 1000;
   const defaultSql = tableName
     ? `SELECT * FROM ${quoteIdent(tableName)} LIMIT ${limit}`
     : "";
@@ -4489,12 +4595,39 @@ function renderData(result) {
   thead.appendChild(head);
 
   const rows = filteredRows(result);
-  const pageSize = Math.max(1, state.pageSize || 50);
-  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize) || 1);
-  if (state.page > totalPages) state.page = totalPages;
-  if (state.page < 1) state.page = 1;
-  const start = (state.page - 1) * pageSize;
-  const pageRows = rows.slice(start, start + pageSize);
+  const pageSize = dataPageSize();
+  const loadedTotal = result.rows?.length || 0;
+  const isFiltered = rows.length !== loadedTotal;
+  const tableTotal = Number(result.totalRows);
+  const hasTableTotal = Number.isFinite(tableTotal) && tableTotal >= 0;
+  const serverPaging = usesServerTablePaging(result);
+
+  let totalPages;
+  let pageRows;
+  let from;
+  let end;
+  let pagerTotal;
+
+  if (serverPaging) {
+    totalPages = Math.max(1, Math.ceil(tableTotal / pageSize) || 1);
+    if (state.page > totalPages) state.page = totalPages;
+    if (state.page < 1) state.page = 1;
+    // Current page was fetched from the server — show all loaded rows.
+    pageRows = rows;
+    const offset = (state.page - 1) * pageSize;
+    from = rows.length ? offset + 1 : 0;
+    end = rows.length ? offset + rows.length : 0;
+    pagerTotal = tableTotal;
+  } else {
+    totalPages = Math.max(1, Math.ceil(rows.length / pageSize) || 1);
+    if (state.page > totalPages) state.page = totalPages;
+    if (state.page < 1) state.page = 1;
+    const start = (state.page - 1) * pageSize;
+    pageRows = rows.slice(start, start + pageSize);
+    from = rows.length ? start + 1 : 0;
+    end = rows.length ? Math.min(start + pageRows.length, rows.length) : 0;
+    pagerTotal = rows.length;
+  }
 
   for (const row of pageRows) {
     const tr = document.createElement("tr");
@@ -4512,17 +4645,16 @@ function renderData(result) {
     tbody.appendChild(tr);
   }
 
-  const end = rows.length ? Math.min(start + pageRows.length, rows.length) : 0;
-  const from = rows.length ? start + 1 : 0;
   const schemaBit = state.currentSchema ? `${state.currentSchema} · ` : "";
   const tableBit = state.currentTable ? `${state.currentTable} · ` : "";
   updateContextMeta(
     `${schemaBit}${tableBit}${rows.length} row${rows.length === 1 ? "" : "s"}` +
-    (rows.length !== (result.rows?.length || 0) ? ` (filtered from ${result.rows.length})` : "") +
+    (isFiltered ? ` (filtered from ${loadedTotal})` : "") +
+    (hasTableTotal && !isFiltered && tableTotal !== loadedTotal ? ` of ${tableTotal}` : "") +
     ` · showing ${from}–${end}` +
     (result.executionMs != null ? ` · ${result.executionMs} ms` : "")
   );
-  updatePager(from, end, rows.length, totalPages);
+  updatePager(from, end, pagerTotal, totalPages);
   updateColumnsButton(result.columns);
   updateClearFiltersButton();
   updateViewTabBarVisibility();
@@ -5588,12 +5720,10 @@ function wire() {
     exportJson();
   };
   $("#btn-page-prev").onclick = () => {
-    state.page -= 1;
-    renderData(state.result);
+    changeDataPage(-1).catch((e) => setStatus(e.message || "Failed to change page"));
   };
   $("#btn-page-next").onclick = () => {
-    state.page += 1;
-    renderData(state.result);
+    changeDataPage(1).catch((e) => setStatus(e.message || "Failed to change page"));
   };
   $$(".tabs .tab").forEach((t) => t.onclick = () => {
     closeColumnVisibilityMenu();

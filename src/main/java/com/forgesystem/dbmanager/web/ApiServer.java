@@ -543,13 +543,18 @@ public class ApiServer {
         requireConnected(ctx);
         String schema = ctx.pathParam("schema");
         String table = ctx.pathParam("table");
-        int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(500);
+        int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(1000);
+        int offset = ctx.queryParamAsClass("offset", Integer.class).getOrDefault(0);
         try {
             connectionService.useDatabase(schema);
         } catch (Exception ignored) {
         }
-        QueryResult result = databaseService.previewTable(schema, table, limit);
-        ctx.json(toResultJson(result));
+        QueryResult result = databaseService.previewTable(schema, table, limit, offset);
+        Map<String, Object> json = toResultJson(result);
+        json.put("totalRows", databaseService.countTableRows(schema, table));
+        json.put("offset", Math.max(0, offset));
+        json.put("limit", Math.max(1, limit));
+        ctx.json(json);
     }
 
     private void query(Context ctx) throws Exception {

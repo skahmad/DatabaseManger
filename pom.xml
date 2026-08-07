@@ -111,6 +111,17 @@
                 <version>0.0.8</version>
                 <configuration>
                     <mainClass>${main.class}</mainClass>
+                    <!--
+                      macOS: rename app menu / dock from "java".
+                      Do not put spaces in these values — the JavaFX Maven plugin
+                      splits options on whitespace and "Pilot" becomes the main class.
+                      The spaced display name "DB Pilot" is applied in Launcher.
+                    -->
+                    <options>
+                        <option>-Dapple.awt.application.name=DBPilot</option>
+                        <option>-Dapple.laf.useScreenMenuBar=true</option>
+                        <option>-Xdock:name=DBPilot</option>
+                    </options>
                 </configuration>
             </plugin>
             <plugin>
@@ -119,6 +130,16 @@
                 <version>3.5.0</version>
                 <configuration>
                     <mainClass>${main.class}</mainClass>
+                    <systemProperties>
+                        <systemProperty>
+                            <key>apple.awt.application.name</key>
+                            <value>DBPilot</value>
+                        </systemProperty>
+                        <systemProperty>
+                            <key>apple.laf.useScreenMenuBar</key>
+                            <value>true</value>
+                        </systemProperty>
+                    </systemProperties>
                 </configuration>
             </plugin>
             <plugin>
