@@ -4292,9 +4292,19 @@ function activeColumnFilterCount() {
   return Object.values(state.columnFilters || {}).filter(isColumnFilterActive).length;
 }
 
-function updateClearFiltersButton() {
+function updateFilterIndicators() {
+  const n = activeColumnFilterCount();
   const clearBtn = $("#btn-clear-filters");
-  if (clearBtn) clearBtn.hidden = activeColumnFilterCount() === 0;
+  const label = $("#filter-indicator-label");
+  if (clearBtn) clearBtn.hidden = n === 0;
+  if (label) label.textContent = n === 1 ? "1 filter" : `${n} filters`;
+
+  const search = $("#data-search");
+  if (search) search.classList.toggle("has-filter", !!(search.value || "").trim());
+}
+
+function updateClearFiltersButton() {
+  updateFilterIndicators();
 }
 
 function isColumnFilterActive(filter) {
@@ -4600,9 +4610,17 @@ function renderData(result) {
     label.textContent = c;
     const mark = document.createElement("span");
     mark.className = "col-filter-mark";
-    mark.textContent = "▾";
-    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = "●";
+    mark.title = "Filter active";
+    mark.setAttribute("aria-label", "Filter active");
     th.append(label, mark);
+    if (isColumnFilterActive(state.columnFilters?.[c])) {
+      const f = state.columnFilters[c];
+      const opMeta = COLUMN_FILTER_OPS.find((o) => o.id === f.op);
+      th.title = opMeta?.needsValue
+        ? `Filtered: ${opMeta.label} “${f.value || ""}” · click to edit · right-click to hide`
+        : `Filtered: ${opMeta?.label || f.op} · click to edit · right-click to hide`;
+    }
     th.onclick = (e) => {
       e.stopPropagation();
       closeColumnVisibilityMenu();
@@ -5688,6 +5706,7 @@ function wire() {
   updateSqlFileChip();
   $("#data-search").oninput = () => {
     state.page = 1;
+    updateFilterIndicators();
     renderData(state.result);
   };
   $("#btn-columns").onclick = (e) => {
@@ -5772,6 +5791,35 @@ function wire() {
   });
 }
 
+function hideAppLoader() {
+  document.documentElement.classList.remove("booting");
+  const loader = $("#app-loader");
+  if (loader) {
+    loader.hidden = true;
+    loader.setAttribute("aria-hidden", "true");
+  }
+}
+
+async function waitForStylesheet() {
+  const sheets = [...document.styleSheets].filter((s) => {
+    try {
+      return !!(s.href && s.href.includes("styles.css"));
+    } catch {
+      return false;
+    }
+  });
+  if (!sheets.length) return;
+  // Give the stylesheet a moment if rules aren't readable yet.
+  for (let i = 0; i < 20; i++) {
+    try {
+      if (sheets.some((s) => s.cssRules && s.cssRules.length)) return;
+    } catch {
+      /* cross-origin / not ready */
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 async function boot() {
   wire();
   setConnectedUi(false);
@@ -5801,9 +5849,14 @@ async function boot() {
     setStatus("Ready");
     showEmptyWorkspace();
   }
+  await waitForStylesheet();
+  // One paint with styles applied before revealing the UI.
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  hideAppLoader();
 }
 
 boot().catch((e) => {
   console.error(e);
   showError($("#sidebar-error"), e.message);
+  hideAppLoader();
 });
