@@ -331,12 +331,12 @@ function fileBaseName(path) {
 
 function profileDetail(p) {
   if (p.fileBased || ["SQLITE", "H2_FILE"].includes(p.dbType)) {
-    return `${p.displayType} · ${fileBaseName(p.database) || ""}`;
+    return fileBaseName(p.database) || "file database";
   }
   if (p.useSshTunnel || p.sshTunnel) {
-    return `${p.displayType} · ${p.host} via ${p.sshHost || "SSH"}`;
+    return `${p.host || "host"} via ${p.sshHost || "SSH"}`;
   }
-  return `${p.displayType} · ${p.host}${p.database ? " / " + p.database : ""}`;
+  return p.host || "host";
 }
 
 function isLiveProfile(p) {
@@ -399,8 +399,11 @@ function renderProfiles() {
     row.appendChild(caret);
     const label = document.createElement("span");
     label.className = "tree-label";
-    label.innerHTML = `<strong>${escapeHtml(p.name || "Untitled")}</strong>`
-      + `<span class="conn-meta">${escapeHtml(profileDetail(p))}${live ? " · live" : ""}</span>`;
+    const liveDot = live
+      ? `<span class="conn-live-dot" title="Connected" aria-label="Connected"></span>`
+      : "";
+    label.innerHTML = `<strong>${escapeHtml(p.name || "Untitled")}${liveDot}</strong>`
+      + `<span class="conn-meta">${escapeHtml(profileDetail(p))}</span>`;
     row.appendChild(label);
 
     const more = document.createElement("button");
