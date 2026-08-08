@@ -29,6 +29,11 @@ const state = {
   pendingExpandProfileId: null,
   connectedIds: {},
   activeConnectionId: null,
+  /**
+   * Explorer tree cache per connection:
+   * { [connectionId]: { explorer, objects: { [schema]: { tables, views, procs, funcs } } } }
+   */
+  explorerCache: {},
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
   importPicked: null,
@@ -605,6 +610,7 @@ async function resetSession() {
   state.result = null;
   state.page = 1;
   state.expandedProfileIds = {};
+  invalidateExplorerCache();
   setDetailFocus({ scope: "connection" });
   updateContextMeta("");
   resetWorkspaceTabs();
@@ -639,6 +645,7 @@ async function disconnectCurrent(profileId) {
   await api("/api/disconnect/" + encodeURIComponent(id), { method: "POST", body: "{}" });
   delete state.connectedIds[id];
   setExpanded(id, false);
+  invalidateExplorerCache(id);
   closeWorkspaceTabsForConnection(id);
   if (state.activeConnectionId === id) {
     state.activeConnectionId = Object.keys(state.connectedIds)[0] || null;
@@ -662,6 +669,7 @@ async function deleteConnection(profile) {
   } finally {
     delete state.connectedIds[profile.id];
     setExpanded(profile.id, false);
+    invalidateExplorerCache(profile.id);
   }
   await api("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" });
   closeWorkspaceTabsForConnection(profile.id);
@@ -688,17 +696,92 @@ function withConnectionId(path, connectionId) {
   return `${path}${join}connectionId=${encodeURIComponent(connectionId)}`;
 }
 
-async function loadTree() {
+function explorerCacheEntry(connectionId) {
+  if (!connectionId) return { explorer: null, objects: {} };
+  if (!state.explorerCache[connectionId]) {
+    state.explorerCache[connectionId] = { explorer: null, objects: {} };
+  }
+  return state.explorerCache[connectionId];
+}
+
+/** Clear explorer + schema-object cache for one connection, or all when omitted. */
+function invalidateExplorerCache(connectionId) {
+  if (!connectionId) {
+    state.explorerCache = {};
+    return;
+  }
+  delete state.explorerCache[connectionId];
+}
+
+function invalidateSchemaObjectsCache(connectionId, schema) {
+  if (!connectionId || schema == null || schema === "") return;
+  const entry = state.explorerCache[connectionId];
+  if (!entry) return;
+  delete entry.objects[schema];
+}
+
+async function fetchExplorer(connectionId, { force = false } = {}) {
+  const entry = explorerCacheEntry(connectionId);
+  if (!force && entry.explorer) return entry.explorer;
+  const explorer = await api(withConnectionId("/api/explorer", connectionId));
+  entry.explorer = explorer;
+  // Drop stale nested object lists when the database/schema set is refreshed.
+  if (force) entry.objects = {};
+  return explorer;
+}
+
+async function fetchSchemaObjects(connectionId, schema, { force = false } = {}) {
+  const entry = explorerCacheEntry(connectionId);
+  if (!force && entry.objects[schema]) return entry.objects[schema];
+  const base = `/api/databases/${encodeURIComponent(schema)}`;
+  const [tables, views, procs, funcs] = await Promise.all([
+    api(withConnectionId(`${base}/tables`, connectionId)),
+    api(withConnectionId(`${base}/views`, connectionId)),
+    api(withConnectionId(`${base}/procedures`, connectionId)),
+    api(withConnectionId(`${base}/functions`, connectionId)),
+  ]);
+  const data = { tables, views, procs, funcs };
+  entry.objects[schema] = data;
+  return data;
+}
+
+function findExplorerTreeNode(connectionId, schema) {
+  if (!connectionId || schema == null) return null;
+  const nodes = document.querySelectorAll(
+    `.tree-node[data-tree-connection-id="${CSS.escape(connectionId)}"]`
+  );
+  for (const el of nodes) {
+    if (el.dataset.treeSchema === schema) return el;
+  }
+  return null;
+}
+
+/**
+ * Invalidate cache then re-render. Pass schema to refresh only that DB/schema's objects.
+ * Used after create/drop/rename so the tree does not keep stale lists.
+ */
+async function loadTree(opts = {}) {
+  const cid = opts.connectionId || state.activeConnectionId;
+  if (opts.schema && cid) {
+    invalidateSchemaObjectsCache(cid, opts.schema);
+  } else if (cid) {
+    invalidateExplorerCache(cid);
+  } else {
+    invalidateExplorerCache();
+  }
   renderProfiles();
 }
 
-async function loadTreeInto(container, connectionId) {
+async function loadTreeInto(container, connectionId, { force = false } = {}) {
   if (!container) return;
-  container.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
   container.hidden = false;
+  const hasCache = !force && !!explorerCacheEntry(connectionId).explorer;
+  if (!hasCache) {
+    container.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
+  }
   try {
     // Use connectionId on the request — do not steal active session from siblings.
-    const explorer = await api(withConnectionId("/api/explorer", connectionId));
+    const explorer = await fetchExplorer(connectionId, { force });
     container.innerHTML = "";
     const nodes = explorer.nodes || [];
     if (!nodes.length) {
@@ -719,8 +802,12 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
   const databaseName = kind === "database"
     ? (node.name || null)
     : (parentDatabase || null);
+  const schemaKey = node.schema || node.name || "";
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
+  wrap.dataset.treeKind = kind;
+  wrap.dataset.treeSchema = schemaKey;
+  if (connectionId) wrap.dataset.treeConnectionId = connectionId;
 
   const row = document.createElement("div");
   row.className = "tree-row";
@@ -747,6 +834,50 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
   kids.hidden = true;
   let loaded = false;
   const childSchemas = Array.isArray(node.children) ? node.children : null;
+
+  async function fillChildren({ force = false } = {}) {
+    kids.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
+    try {
+      if (childSchemas && layout === "database-schemas" && force) {
+        // Re-fetch explorer so schema children under this database stay current.
+        const explorer = await fetchExplorer(connectionId, { force: true });
+        const fresh = (explorer.nodes || []).find((n) => (n.name || "") === (node.name || ""));
+        const schemas = Array.isArray(fresh?.children) ? fresh.children : childSchemas;
+        kids.innerHTML = "";
+        for (const schemaNode of schemas) {
+          kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId, node.name));
+        }
+        loaded = true;
+        return;
+      }
+      if (childSchemas) {
+        kids.innerHTML = "";
+        for (const schemaNode of childSchemas) {
+          kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId, node.name));
+        }
+        loaded = true;
+        return;
+      }
+      const schema = node.schema || node.name;
+      const dbForObjects = databaseName || profileDatabaseName(connectionId);
+      const objects = await fetchSchemaObjects(connectionId, schema, { force });
+      kids.innerHTML = "";
+      kids.appendChild(folder("Tables", "tbl", schema, objects.tables, "table", connectionId, dbForObjects));
+      kids.appendChild(folder("Views", "vw", schema, objects.views, "view", connectionId, dbForObjects));
+      kids.appendChild(folder("Procedures", "db", schema, objects.procs, "proc", connectionId, dbForObjects));
+      kids.appendChild(folder("Functions", "db", schema, objects.funcs, "func", connectionId, dbForObjects));
+      loaded = true;
+    } catch (err) {
+      kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
+      loaded = false;
+    }
+  }
+
+  wrap.reloadTreeChildren = async () => {
+    kids.hidden = false;
+    loaded = false;
+    await fillChildren({ force: true });
+  };
 
   row.onclick = async (e) => {
     if (e.target.closest(".tree-more")) return;
@@ -775,34 +906,15 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
 
     kids.hidden = !kids.hidden;
     if (kids.hidden || loaded) return;
-    loaded = true;
-    kids.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
-    try {
-      if (childSchemas) {
-        kids.innerHTML = "";
-        for (const schemaNode of childSchemas) {
-          kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId, node.name));
-        }
-        return;
-      }
-      const schema = node.schema || node.name;
-      const dbForObjects = databaseName || profileDatabaseName(connectionId);
-      const base = `/api/databases/${encodeURIComponent(schema)}`;
-      const [tables, views, procs, funcs] = await Promise.all([
-        api(withConnectionId(`${base}/tables`, connectionId)),
-        api(withConnectionId(`${base}/views`, connectionId)),
-        api(withConnectionId(`${base}/procedures`, connectionId)),
-        api(withConnectionId(`${base}/functions`, connectionId)),
-      ]);
-      kids.innerHTML = "";
-      kids.appendChild(folder("Tables", "tbl", schema, tables, "table", connectionId, dbForObjects));
-      kids.appendChild(folder("Views", "vw", schema, views, "view", connectionId, dbForObjects));
-      kids.appendChild(folder("Procedures", "db", schema, procs, "proc", connectionId, dbForObjects));
-      kids.appendChild(folder("Functions", "db", schema, funcs, "func", connectionId, dbForObjects));
-    } catch (err) {
-      kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
-      loaded = false;
+    // Use cache when available — only the first expand (or Refresh) hits the API.
+    const schema = node.schema || node.name;
+    const cachedObjects = !childSchemas && schema
+      ? explorerCacheEntry(connectionId).objects[schema]
+      : null;
+    if (!childSchemas && !cachedObjects) {
+      // show loading inside fillChildren
     }
+    await fillChildren({ force: false });
   };
 
   row.oncontextmenu = (e) => {
@@ -2629,6 +2741,21 @@ async function handleContextAction(action) {
         hideAllContextMenus();
         await disconnectCurrent(target.profile?.id);
         break;
+      case "conn-refresh": {
+        hideAllContextMenus();
+        const profile = target.profile;
+        if (!profile || !isLiveProfile(profile)) break;
+        invalidateExplorerCache(profile.id);
+        state.activeConnectionId = profile.id;
+        setExpanded(profile.id, true);
+        await api("/api/session/active", {
+          method: "POST",
+          body: JSON.stringify({ id: profile.id }),
+        }).catch(() => {});
+        renderProfiles();
+        setStatus(`Refreshed databases for “${profile.name || "Untitled"}”`);
+        break;
+      }
       case "conn-edit":
         hideAllContextMenus();
         if (target.profile) openEditConnection(target.profile);
@@ -2640,6 +2767,27 @@ async function handleContextAction(action) {
       case "conn-properties":
         if (target.profile) await openConnectionProperties(target.profile);
         break;
+      case "refresh-tree": {
+        hideAllContextMenus();
+        const cid = state.activeConnectionId;
+        if (!cid || !schema) break;
+        const nodeEl = findExplorerTreeNode(cid, schema);
+        if (nodeEl?.reloadTreeChildren) {
+          if (target.kind === "database") {
+            invalidateExplorerCache(cid);
+          } else {
+            invalidateSchemaObjectsCache(cid, schema);
+          }
+          await nodeEl.reloadTreeChildren();
+        } else if (target.kind === "database") {
+          await loadTree({ connectionId: cid });
+        } else {
+          invalidateSchemaObjectsCache(cid, schema);
+          await loadTree({ connectionId: cid, schema });
+        }
+        setStatus(`Refreshed “${schema}”`);
+        break;
+      }
       case "properties":
         await openDatabaseProperties(schema);
         break;
