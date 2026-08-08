@@ -34,6 +34,23 @@ const state = {
    * { [connectionId]: { explorer, objects: { [schema]: { tables, views, procs, funcs } } } }
    */
   explorerCache: {},
+  /** Unified sidebar search: entity = db | sch | tbl */
+  explorerSearch: {
+    entity: "db",
+    query: "",
+    matches: [],
+    activeIndex: 0,
+    scanToken: 0,
+    scanning: false,
+    /** True while a one-time path reveal is running (paint stays unlocked). */
+    revealing: false,
+    /** `${entity}\\0${query}` — when this changes, paths may be auto-opened once. */
+    revealKey: "",
+    /** Connection ids already auto-opened for the current revealKey. */
+    revealedConnIds: {},
+    /** Connection ids the user collapsed while a search is active. */
+    userCollapsedConnIds: {},
+  },
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
   importPicked: null,
@@ -297,6 +314,60 @@ function wireSidebarResize() {
   });
 }
 
+function wireExplorerSearch() {
+  const input = $("#explorer-search");
+  if (!input) return;
+
+  let debounce = null;
+  const run = () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => refreshExplorerSearch(), 120);
+  };
+
+  input.addEventListener("input", run);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      closeExplorerEntityMenu();
+      const m = (state.explorerSearch.matches || [])[0];
+      if (m) openExplorerSearchMatch(m).catch((err) => showError($("#sidebar-error"), err.message));
+      else $("#conn-tree")?.querySelector(".tree-row.search-hit")?.click();
+    } else if (e.key === "Escape") {
+      const menu = $("#explorer-entity-menu");
+      if (menu && !menu.hidden) {
+        e.preventDefault();
+        closeExplorerEntityMenu();
+        return;
+      }
+      input.value = "";
+      refreshExplorerSearch();
+    }
+  });
+
+  const chip = $("#explorer-entity-chip");
+  chip?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    toggleExplorerEntityMenu();
+  });
+
+  $$(".explorer-entity-option").forEach((opt) => {
+    opt.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setExplorerSearchEntity(opt.dataset.entity);
+      input.focus();
+    });
+  });
+
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#explorer-search-field")) return;
+    closeExplorerEntityMenu();
+  });
+
+  setExplorerSearchEntity(state.explorerSearch.entity || "db", { refresh: false });
+}
+
 function wirePrefs() {
   $$(".pref-theme").forEach((el) => {
     el.onchange = () => {
@@ -366,31 +437,638 @@ function profileDetail(p) {
   return p.host || "host";
 }
 
-function connectionSearchQuery() {
-  return ($("#conn-search")?.value || "").trim().toLowerCase();
+const EXPLORER_SEARCH_ENTITIES = ["db", "sch", "tbl", "vw", "proc", "func"];
+const EXPLORER_SEARCH_META = {
+  db: { label: "Database", chip: "DB", placeholder: "Search databases…", badge: "DB", badgeClass: "db", empty: "No databases match. Connect and expand a connection first." },
+  sch: { label: "Schema", chip: "SCH", placeholder: "Search schemas…", badge: "SCH", badgeClass: "vw", empty: "No schemas match. Connect and expand a connection first." },
+  tbl: { label: "Table", chip: "TBL", placeholder: "Search tables…", badge: "TBL", badgeClass: "tbl", empty: "No tables match. Connect and expand a database, or wait while indexes load." },
+  vw: { label: "View", chip: "VW", placeholder: "Search views…", badge: "VW", badgeClass: "vw", empty: "No views match. Connect and expand a database, or wait while indexes load." },
+  proc: { label: "Procedure", chip: "PROC", placeholder: "Search procedures…", badge: "PROC", badgeClass: "db", empty: "No procedures match. Connect and expand a database, or wait while indexes load." },
+  func: { label: "Function", chip: "FN", placeholder: "Search functions…", badge: "FN", badgeClass: "db", empty: "No functions match. Connect and expand a database, or wait while indexes load." },
+};
+
+function explorerSearchQuery() {
+  return (state.explorerSearch?.query
+    || $("#explorer-search")?.value
+    || "").trim().toLowerCase();
 }
 
-function profileMatchesSearch(p, query) {
-  if (!query) return true;
-  const haystack = [
-    p.name,
-    p.host,
-    p.database,
-    p.displayType,
-    p.dbType,
-    p.sshHost,
-    p.username,
-    profileDetail(p),
-    fileBaseName(p.database),
-  ].filter(Boolean).join(" ").toLowerCase();
-  return haystack.includes(query);
+function explorerSearchEntity() {
+  const entity = state.explorerSearch?.entity || "db";
+  return EXPLORER_SEARCH_ENTITIES.includes(entity) ? entity : "db";
 }
 
-function filteredProfiles() {
-  const q = connectionSearchQuery();
-  const list = state.profiles || [];
-  if (!q) return list;
-  return list.filter((p) => profileMatchesSearch(p, q));
+function closeExplorerEntityMenu() {
+  const menu = $("#explorer-entity-menu");
+  const chip = $("#explorer-entity-chip");
+  if (menu) menu.hidden = true;
+  if (chip) chip.setAttribute("aria-expanded", "false");
+}
+
+function openExplorerEntityMenu() {
+  const menu = $("#explorer-entity-menu");
+  const chip = $("#explorer-entity-chip");
+  if (!menu || !chip) return;
+  const current = explorerSearchEntity();
+  menu.querySelectorAll(".explorer-entity-option").forEach((opt) => {
+    opt.setAttribute("aria-selected", opt.dataset.entity === current ? "true" : "false");
+  });
+  menu.hidden = false;
+  chip.setAttribute("aria-expanded", "true");
+}
+
+function toggleExplorerEntityMenu() {
+  const menu = $("#explorer-entity-menu");
+  if (!menu || !menu.hidden) closeExplorerEntityMenu();
+  else openExplorerEntityMenu();
+}
+
+function setExplorerSearchEntity(entity, { refresh = true } = {}) {
+  const next = EXPLORER_SEARCH_ENTITIES.includes(entity) ? entity : "db";
+  state.explorerSearch.entity = next;
+  const meta = EXPLORER_SEARCH_META[next] || EXPLORER_SEARCH_META.db;
+  const chipLabel = $("#explorer-entity-chip-label");
+  if (chipLabel) chipLabel.textContent = meta.chip;
+  const chip = $("#explorer-entity-chip");
+  if (chip) chip.title = `Search ${meta.label.toLowerCase()}s`;
+  const input = $("#explorer-search");
+  if (input) input.placeholder = meta.placeholder || "Search…";
+  $$(".explorer-entity-option").forEach((opt) => {
+    opt.setAttribute("aria-selected", opt.dataset.entity === next ? "true" : "false");
+  });
+  closeExplorerEntityMenu();
+  if (refresh) refreshExplorerSearch();
+}
+
+function needsExplorerObjectIndex(entity = explorerSearchEntity()) {
+  return entity === "tbl" || entity === "vw" || entity === "proc" || entity === "func";
+}
+
+function connectionLabel(connectionId) {
+  const p = (state.profiles || []).find((x) => x.id === connectionId);
+  return p?.name || "Connection";
+}
+
+function pushObjectSearchMatches(out, {
+  entity, connectionId, connName, schema, names, kind, badge, badgeClass, query,
+}) {
+  for (const name of names || []) {
+    if (!String(name).toLowerCase().includes(query)) continue;
+    out.push({
+      entity,
+      connectionId,
+      name,
+      schema,
+      database: schema,
+      kind,
+      path: `${connName} · ${schema}`,
+      badge,
+      badgeClass,
+    });
+  }
+}
+
+/** Collect explorer matches from cache for the selected entity type. */
+function collectExplorerSearchMatches(query, entity) {
+  const q = (query || "").trim().toLowerCase();
+  if (!q) return [];
+  const out = [];
+  const liveIds = Object.keys(state.connectedIds || {}).filter((id) => state.connectedIds[id]);
+  const ids = liveIds.length
+    ? liveIds
+    : Object.keys(state.explorerCache || {});
+  const meta = EXPLORER_SEARCH_META[entity] || EXPLORER_SEARCH_META.db;
+
+  for (const connectionId of ids) {
+    const entry = state.explorerCache[connectionId];
+    if (!entry?.explorer) continue;
+    const connName = connectionLabel(connectionId);
+    const nodes = entry.explorer.nodes || [];
+    const layout = entry.explorer.layout || "";
+
+    if (entity === "db") {
+      for (const node of nodes) {
+        if ((node.kind || "database") !== "database") continue;
+        const name = node.name || "";
+        if (!name.toLowerCase().includes(q)) continue;
+        out.push({
+          entity: "db",
+          connectionId,
+          name,
+          schema: node.schema || name,
+          database: name,
+          path: connName,
+          badge: meta.badge,
+          badgeClass: meta.badgeClass,
+        });
+      }
+    } else if (entity === "sch") {
+      for (const node of nodes) {
+        const kind = node.kind || "database";
+        if (kind === "schema") {
+          const name = node.name || "";
+          if (!name.toLowerCase().includes(q)) continue;
+          out.push({
+            entity: "sch",
+            connectionId,
+            name,
+            schema: node.schema || name,
+            database: null,
+            path: connName,
+            badge: meta.badge,
+            badgeClass: meta.badgeClass,
+          });
+          continue;
+        }
+        if (kind === "database" && Array.isArray(node.children)) {
+          for (const child of node.children) {
+            const name = child.name || "";
+            if (!name.toLowerCase().includes(q)) continue;
+            out.push({
+              entity: "sch",
+              connectionId,
+              name,
+              schema: child.schema || name,
+              database: node.name || null,
+              path: `${connName} · ${node.name}`,
+              badge: meta.badge,
+              badgeClass: meta.badgeClass,
+            });
+          }
+        } else if (kind === "database" && layout !== "database-schemas") {
+          // MySQL 2-layer: database acts as schema namespace too.
+          const name = node.name || "";
+          if (!name.toLowerCase().includes(q)) continue;
+          out.push({
+            entity: "sch",
+            connectionId,
+            name,
+            schema: node.schema || name,
+            database: name,
+            path: connName,
+            badge: meta.badge,
+            badgeClass: meta.badgeClass,
+          });
+        }
+      }
+    } else if (needsExplorerObjectIndex(entity)) {
+      const objects = entry.objects || {};
+      for (const [schema, bag] of Object.entries(objects)) {
+        if (entity === "tbl") {
+          pushObjectSearchMatches(out, {
+            entity, connectionId, connName, schema, query: q,
+            names: bag.tables, kind: "table",
+            badge: meta.badge, badgeClass: meta.badgeClass,
+          });
+        } else if (entity === "vw") {
+          pushObjectSearchMatches(out, {
+            entity, connectionId, connName, schema, query: q,
+            names: bag.views, kind: "view",
+            badge: meta.badge, badgeClass: meta.badgeClass,
+          });
+        } else if (entity === "proc") {
+          pushObjectSearchMatches(out, {
+            entity, connectionId, connName, schema, query: q,
+            names: bag.procs, kind: "procedure",
+            badge: meta.badge, badgeClass: meta.badgeClass,
+          });
+        } else if (entity === "func") {
+          pushObjectSearchMatches(out, {
+            entity, connectionId, connName, schema, query: q,
+            names: bag.funcs, kind: "function",
+            badge: meta.badge, badgeClass: meta.badgeClass,
+          });
+        }
+      }
+    }
+  }
+
+  out.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return out.slice(0, 200);
+}
+
+function schemasToIndexForSearch(connectionId) {
+  const entry = explorerCacheEntry(connectionId);
+  const explorer = entry.explorer;
+  if (!explorer) return [];
+  const schemas = [];
+  for (const node of explorer.nodes || []) {
+    const kind = node.kind || "database";
+    if (kind === "schema") {
+      schemas.push(node.schema || node.name);
+    } else if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        schemas.push(child.schema || child.name);
+      }
+    } else if (kind === "database") {
+      schemas.push(node.schema || node.name);
+    }
+  }
+  return [...new Set(schemas.filter(Boolean))];
+}
+
+/** For table/view/proc/func search, load missing schema object lists on live connections. */
+async function ensureExplorerSearchIndex() {
+  const entity = explorerSearchEntity();
+  const query = explorerSearchQuery();
+  if (!needsExplorerObjectIndex(entity) || query.length < 2) return;
+
+  const liveIds = Object.keys(state.connectedIds || {}).filter((id) => state.connectedIds[id]);
+  if (!liveIds.length) return;
+
+  const token = ++state.explorerSearch.scanToken;
+  state.explorerSearch.scanning = true;
+  const status = $("#explorer-search-status");
+
+  try {
+    for (const connectionId of liveIds) {
+      if (token !== state.explorerSearch.scanToken) return;
+      let explorer = explorerCacheEntry(connectionId).explorer;
+      if (!explorer) {
+        try {
+          explorer = await fetchExplorer(connectionId);
+        } catch {
+          continue;
+        }
+      }
+      const schemas = schemasToIndexForSearch(connectionId);
+      let done = 0;
+      for (const schema of schemas) {
+        if (token !== state.explorerSearch.scanToken) return;
+        if (explorerCacheEntry(connectionId).objects[schema]) {
+          done += 1;
+          continue;
+        }
+        if (status) {
+          status.hidden = false;
+          status.textContent = `Indexing ${connectionLabel(connectionId)}… ${done + 1}/${schemas.length}`;
+        }
+        try {
+          await fetchSchemaObjects(connectionId, schema);
+        } catch {
+          /* skip unreachable schemas */
+        }
+        done += 1;
+        if (token === state.explorerSearch.scanToken) {
+          applyExplorerSearchToTree();
+        }
+      }
+    }
+  } finally {
+    if (token === state.explorerSearch.scanToken) {
+      state.explorerSearch.scanning = false;
+      applyExplorerSearchToTree();
+    }
+  }
+}
+
+function clearExplorerSearchFilterClasses() {
+  const tree = $("#conn-tree");
+  if (!tree) return;
+  tree.classList.remove("is-searching");
+  tree.querySelectorAll(".search-miss, .search-hit").forEach((el) => {
+    el.classList.remove("search-miss", "search-hit");
+  });
+}
+
+function resetExplorerSearchDomState() {
+  clearExplorerSearchFilterClasses();
+  const tree = $("#conn-tree");
+  if (!tree) return;
+  tree.querySelectorAll("[data-search-opened],[data-user-collapsed]").forEach((el) => {
+    delete el.dataset.searchOpened;
+    delete el.dataset.userCollapsed;
+  });
+}
+
+function searchLeafKind(entity) {
+  return ({ tbl: "table", vw: "view", proc: "proc", func: "func" })[entity] || null;
+}
+
+function markSearchOpened(node, kids) {
+  if (!node || !kids) return;
+  // Respect manual collapse during an active search.
+  if (node.dataset.userCollapsed === "1") return;
+  if (node.classList.contains("conn-node")) {
+    const id = node.dataset.profileId;
+    if (id && state.explorerSearch.userCollapsedConnIds[id]) return;
+    // Keep state in sync with DOM — otherwise later clicks invert expand/collapse.
+    if (id) setExpanded(id, true);
+  }
+  if (kids.hidden) {
+    node.dataset.searchOpened = "1";
+    kids.hidden = false;
+  }
+  const caret = node.querySelector(":scope > .tree-row .tree-caret");
+  if (caret) caret.textContent = "▾";
+}
+
+/** Open paths to current matches once — never re-force after the user collapses. */
+async function expandTreeForSearchMatches(matches, entity) {
+  const tree = $("#conn-tree");
+  if (!tree || !matches?.length) return;
+
+  const byConn = new Map();
+  for (const m of matches) {
+    if (!byConn.has(m.connectionId)) byConn.set(m.connectionId, []);
+    byConn.get(m.connectionId).push(m);
+  }
+
+  for (const [connectionId, list] of byConn) {
+    if (state.explorerSearch.userCollapsedConnIds[connectionId]) continue;
+    const conn = tree.querySelector(`.conn-node[data-profile-id="${CSS.escape(connectionId)}"]`);
+    if (!conn || conn.dataset.userCollapsed === "1") continue;
+    const connKids = conn.querySelector(":scope > .conn-children");
+    markSearchOpened(conn, connKids);
+
+    if (entity === "db") continue;
+
+    const schemas = [...new Set(list.map((m) => m.schema).filter(Boolean))];
+    for (const schema of schemas) {
+      const dbNode = [...conn.querySelectorAll(".tree-node[data-tree-kind='database']")]
+        .find((n) => {
+          const kids = n.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']");
+          return [...kids].some((s) => s.dataset.treeSchema === schema);
+        });
+      if (dbNode && dbNode.dataset.userCollapsed !== "1" && dbNode.expandForSearch) {
+        await dbNode.expandForSearch();
+      }
+
+      const node = findExplorerTreeNode(connectionId, schema);
+      if (!node || node.dataset.userCollapsed === "1" || !node.expandForSearch) continue;
+      await node.expandForSearch();
+      if (!needsExplorerObjectIndex(entity)) continue;
+      const want = searchLeafKind(entity);
+      const folder = [...node.querySelectorAll(":scope > .tree-children > .tree-node[data-folder-kind]")]
+        .find((el) => el.dataset.folderKind === want);
+      if (folder && folder.dataset.userCollapsed !== "1") {
+        markSearchOpened(folder, folder.querySelector(":scope > .tree-children"));
+      }
+    }
+  }
+}
+
+/** Apply search-miss / search-hit classes only (no expand/collapse mutation). */
+function paintExplorerSearchFilter(matches, entity) {
+  const tree = $("#conn-tree");
+  if (!tree) return;
+  tree.classList.add("is-searching");
+  const matchConnIds = new Set((matches || []).map((m) => m.connectionId));
+
+  for (const conn of tree.querySelectorAll(".conn-node")) {
+    const id = conn.dataset.profileId;
+    const hide = !matchConnIds.has(id)
+      && !(state.explorerSearch.scanning && isLiveProfile({ id }));
+    conn.classList.toggle("search-miss", hide);
+    conn.classList.toggle("search-hit", matchConnIds.has(id));
+  }
+
+  if (entity === "db") {
+    // Filter databases only — leave descendants unmarked so expand/collapse still shows content.
+    for (const node of tree.querySelectorAll(".tree-node[data-tree-kind='database']")) {
+      const cid = node.dataset.treeConnectionId;
+      const key = node.dataset.treeSchema;
+      const hit = matches.some((m) => m.connectionId === cid && (m.name === key || m.schema === key));
+      node.classList.toggle("search-miss", !hit);
+      node.classList.toggle("search-hit", hit);
+      node.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
+    }
+    return;
+  }
+
+  if (entity === "sch") {
+    // Filter schemas (and DB parents) only — do not hide tables/folders under a hit schema.
+    for (const node of tree.querySelectorAll(".tree-node[data-tree-kind='database']")) {
+      const cid = node.dataset.treeConnectionId;
+      const dbName = node.dataset.treeSchema;
+      const childSchemas = [...node.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']")];
+      if (childSchemas.length) {
+        let any = false;
+        for (const sch of childSchemas) {
+          const key = sch.dataset.treeSchema;
+          const hit = matches.some((m) => m.connectionId === cid && (m.name === key || m.schema === key));
+          sch.classList.toggle("search-miss", !hit);
+          sch.classList.toggle("search-hit", hit);
+          sch.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
+          if (hit) any = true;
+        }
+        node.classList.toggle("search-miss", !any);
+        node.classList.toggle("search-hit", any);
+      } else {
+        const hit = matches.some((m) => m.connectionId === cid && (m.name === dbName || m.schema === dbName));
+        node.classList.toggle("search-miss", !hit);
+        node.classList.toggle("search-hit", hit);
+        node.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
+      }
+    }
+    return;
+  }
+
+  const wantKind = searchLeafKind(entity);
+  for (const leaf of tree.querySelectorAll(".tree-leaf")) {
+    const hit = matches.some((m) => (
+      m.connectionId === leaf.dataset.treeConnectionId
+      && m.schema === leaf.dataset.treeSchema
+      && m.name === leaf.dataset.treeTable
+      && leaf.dataset.treeKind === wantKind
+    ));
+    leaf.classList.toggle("search-miss", !hit);
+    leaf.classList.toggle("search-hit", hit);
+    leaf.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
+  }
+  for (const folder of tree.querySelectorAll(".tree-node[data-folder-kind]")) {
+    const visibleLeaf = folder.dataset.folderKind === wantKind
+      && !!folder.querySelector(".tree-leaf.search-hit");
+    folder.classList.toggle("search-miss", !visibleLeaf);
+    folder.classList.toggle("search-hit", visibleLeaf);
+  }
+  for (const node of tree.querySelectorAll(
+    ".tree-node[data-tree-kind='database'], .tree-node[data-tree-kind='schema']"
+  )) {
+    const hasHit = !!node.querySelector(".tree-leaf.search-hit, .tree-node[data-folder-kind].search-hit");
+    node.classList.toggle("search-miss", !hasHit);
+    node.classList.toggle("search-hit", hasHit);
+  }
+}
+
+/** Update search-miss/hit classes + status only (never toggles expand/collapse). */
+function syncExplorerSearchFilter() {
+  const status = $("#explorer-search-status");
+  const tree = $("#conn-tree");
+  if (!tree) return;
+
+  const q = explorerSearchQuery();
+  const entity = explorerSearchEntity();
+
+  if (!q) {
+    const wasSearching = tree.classList.contains("is-searching")
+      || !!state.explorerSearch.revealKey
+      || !!(state.explorerSearch.matches || []).length;
+    state.explorerSearch.scanToken += 1;
+    state.explorerSearch.scanning = false;
+    state.explorerSearch.matches = [];
+    state.explorerSearch.revealKey = "";
+    state.explorerSearch.revealedConnIds = {};
+    state.explorerSearch.userCollapsedConnIds = {};
+    resetExplorerSearchDomState();
+    if (status) status.hidden = true;
+    if (wasSearching) renderProfiles();
+    return;
+  }
+
+  const matches = collectExplorerSearchMatches(q, entity);
+  state.explorerSearch.matches = matches;
+  clearExplorerSearchFilterClasses();
+  paintExplorerSearchFilter(matches, entity);
+
+  if (status) {
+    if (state.explorerSearch.scanning) {
+      status.hidden = false;
+    } else if (!matches.length) {
+      status.hidden = false;
+      status.textContent = EXPLORER_SEARCH_META[entity]?.empty || "No matches";
+    } else {
+      status.hidden = false;
+      status.textContent = `${matches.length} match${matches.length === 1 ? "" : "es"} in list`;
+    }
+  }
+}
+
+/**
+ * One-time open for match connections not yet revealed (and not user-collapsed).
+ * Safe to call after indexing finds additional connections — does not re-force
+ * connections the user already collapsed/expanded.
+ */
+async function revealExplorerSearchPaths() {
+  const q = explorerSearchQuery();
+  if (!q || state.explorerSearch.revealing) return;
+  state.explorerSearch.revealing = true;
+  try {
+    const entity = explorerSearchEntity();
+    const matches = collectExplorerSearchMatches(q, entity);
+    state.explorerSearch.matches = matches;
+
+    const pendingIds = [...new Set(matches.map((m) => m.connectionId))]
+      .filter((id) => (
+        state.connectedIds[id]
+        && !state.explorerSearch.userCollapsedConnIds[id]
+        && !state.explorerSearch.revealedConnIds[id]
+      ));
+    if (!pendingIds.length) return;
+
+    let needRerender = false;
+    for (const id of pendingIds) {
+      state.explorerSearch.revealedConnIds[id] = true;
+      if (!isExpanded(id)) {
+        setExpanded(id, true);
+        needRerender = true;
+      }
+    }
+    if (needRerender) {
+      renderProfiles();
+      // Children load async; loadTreeInto paints + opens nested match paths.
+      return;
+    }
+
+    const subset = matches.filter((m) => pendingIds.includes(m.connectionId));
+    await expandTreeForSearchMatches(subset, entity);
+    syncExplorerSearchFilter();
+  } finally {
+    state.explorerSearch.revealing = false;
+  }
+}
+
+/** Paint filter, then reveal any not-yet-opened match connections. */
+async function applyExplorerSearchToTree() {
+  const q = explorerSearchQuery();
+  if (!q) {
+    syncExplorerSearchFilter();
+    return;
+  }
+  syncExplorerSearchFilter();
+  await revealExplorerSearchPaths();
+}
+
+function refreshExplorerSearch() {
+  const input = $("#explorer-search");
+  state.explorerSearch.query = (input?.value || "").trim();
+  const q = explorerSearchQuery();
+  const entity = explorerSearchEntity();
+  const key = q ? `${entity}\0${q}` : "";
+  if (key !== state.explorerSearch.revealKey) {
+    state.explorerSearch.revealKey = key;
+    state.explorerSearch.revealedConnIds = {};
+    state.explorerSearch.userCollapsedConnIds = {};
+  }
+  state.explorerSearch.activeIndex = 0;
+  applyExplorerSearchToTree().catch(() => {});
+  if (needsExplorerObjectIndex(entity) && q.length >= 2) {
+    ensureExplorerSearchIndex().catch(() => {});
+  }
+}
+
+function routineSearchSql(match) {
+  const ident = String(match.name || "").replace(/`/g, "``");
+  if (match.entity === "func") {
+    return `SELECT \`${ident}\`(/* args */);`;
+  }
+  return `CALL \`${ident}\`(/* args */);`;
+}
+
+async function openExplorerSearchMatch(match) {
+  if (!match) return;
+  hideAllContextMenus();
+  state.activeConnectionId = match.connectionId;
+  setExpanded(match.connectionId, true);
+  await api("/api/session/active", {
+    method: "POST",
+    body: JSON.stringify({ id: match.connectionId }),
+  }).catch(() => {});
+
+  if (match.entity === "db") {
+    await focusHomeDetails({
+      scope: "database",
+      database: match.database || match.name,
+      schema: match.schema || match.name,
+      connectionId: match.connectionId,
+    });
+    renderProfiles();
+    setStatus(`Opened database ${match.name}`);
+    return;
+  }
+  if (match.entity === "sch") {
+    await focusHomeDetails({
+      scope: "schema",
+      schema: match.schema || match.name,
+      database: match.database || profileDatabaseName(match.connectionId),
+      connectionId: match.connectionId,
+    });
+    renderProfiles();
+    setStatus(`Opened schema ${match.name}`);
+    return;
+  }
+  if (match.entity === "proc" || match.entity === "func") {
+    await openSqlEditor({
+      connectionId: match.connectionId,
+      database: match.database || match.schema,
+      schema: match.schema,
+      table: null,
+    });
+    const sql = routineSearchSql(match);
+    setSqlEditorValue(sql);
+    const tab = activeWorkspaceTab();
+    if (tab) tab.sql = sql;
+    setStatus(`Opened ${match.entity === "func" ? "function" : "procedure"} ${match.name}`);
+    return;
+  }
+  // Table or view
+  await openTable(
+    match.schema,
+    match.name,
+    match.connectionId,
+    match.database || match.schema
+  );
+  setStatus(`Opened ${match.name}`);
 }
 
 function isLiveProfile(p) {
@@ -433,11 +1111,7 @@ function renderProfiles() {
     return;
   }
 
-  const profiles = filteredProfiles();
-  if (!profiles.length) {
-    tree.innerHTML = `<div class="profile-empty">No connections match “${escapeHtml(connectionSearchQuery())}”.</div>`;
-    return;
-  }
+  const profiles = state.profiles || [];
 
   for (const p of profiles) {
     const wrap = document.createElement("div");
@@ -509,6 +1183,25 @@ function renderProfiles() {
   }
 }
 
+function connNodeEl(profileId) {
+  const tree = $("#conn-tree");
+  if (!tree || profileId == null) return null;
+  return tree.querySelector(`.conn-node[data-profile-id="${CSS.escape(String(profileId))}"]`);
+}
+
+/** Sync active/selected classes on connection rows without rebuilding the tree. */
+function paintConnRowActiveState() {
+  const tree = $("#conn-tree");
+  if (!tree) return;
+  tree.querySelectorAll(".conn-node").forEach((node) => {
+    const id = node.dataset.profileId;
+    const row = node.querySelector(":scope > .conn-row");
+    if (!row) return;
+    row.classList.toggle("active", id === state.selectedProfileId);
+    row.classList.toggle("active-session", id === state.activeConnectionId);
+  });
+}
+
 async function toggleConnectionNode(profile) {
   showError($("#sidebar-error"), "");
 
@@ -519,12 +1212,48 @@ async function toggleConnectionNode(profile) {
       body: JSON.stringify({ id: profile.id }),
     });
     state.activeConnectionId = profile.id;
-    if (isExpanded(profile.id)) {
+
+    const wrap = connNodeEl(profile.id);
+    const kids = wrap?.querySelector(":scope > .conn-children");
+    const caret = wrap?.querySelector(":scope > .tree-row .tree-caret");
+    // Trust the DOM — search may have opened a shell without isExpanded staying in sync.
+    const currentlyOpen = kids ? !kids.hidden : isExpanded(profile.id);
+
+    if (currentlyOpen) {
+      // Collapse in-place — do not renderProfiles() (that fights search + wipes nested expand).
       setExpanded(profile.id, false);
+      if (explorerSearchQuery()) {
+        state.explorerSearch.userCollapsedConnIds[profile.id] = true;
+      }
+      if (wrap) delete wrap.dataset.searchOpened;
+      if (kids) kids.hidden = true;
+      if (caret) caret.textContent = "▸";
     } else {
       setExpanded(profile.id, true);
+      delete state.explorerSearch.userCollapsedConnIds[profile.id];
+      if (wrap) delete wrap.dataset.userCollapsed;
+      if (explorerSearchQuery()) {
+        state.explorerSearch.revealedConnIds[profile.id] = true;
+      }
+      if (!kids) {
+        renderProfiles();
+      } else {
+        kids.hidden = false;
+        if (caret) caret.textContent = "▾";
+        if (!kids.childElementCount) {
+          await loadTreeInto(kids, profile.id);
+        } else if (explorerSearchQuery()) {
+          const entity = explorerSearchEntity();
+          const matches = (state.explorerSearch.matches || [])
+            .filter((m) => m.connectionId === profile.id);
+          if (matches.length && entity !== "db") {
+            await expandTreeForSearchMatches(matches, entity);
+          }
+          syncExplorerSearchFilter();
+        }
+      }
     }
-    renderProfiles();
+    paintConnRowActiveState();
     // Don't await — Details must not block expanding the database list.
     focusHomeDetails({ scope: "connection" }).catch((e) => console.error(e));
     return;
@@ -552,30 +1281,48 @@ async function accessConnection(profile, credentials = null) {
     return;
   }
 
+  const startConnectProgress = () => {
+    const host = findConnectionTreeNode(profile.id);
+    return beginTreeLoading(host, "Connecting…", { determinate: true });
+  };
+
   const fileBased = profile.fileBased || ["SQLITE", "H2_FILE"].includes(profile.dbType);
   if (fileBased) {
     setStatus("Connecting…");
-    await api("/api/connect/" + encodeURIComponent(profile.id), {
-      method: "POST",
-      body: "{}",
-    });
-    await onConnected();
+    const progress = startConnectProgress();
+    progress.setProgress(30);
+    try {
+      await api("/api/connect/" + encodeURIComponent(profile.id), {
+        method: "POST",
+        body: "{}",
+      });
+      progress.setProgress(100);
+      await onConnected();
+    } finally {
+      progress.end();
+    }
     return;
   }
 
   // Connect with credentials from the add/edit form, or stored password — skip re-prompt.
   if (credentials || profile.hasPassword) {
     setStatus("Connecting…");
+    const progress = startConnectProgress();
+    progress.setProgress(25);
+    progress.setLabel("Connecting…");
     try {
       await api("/api/connect/" + encodeURIComponent(profile.id), {
         method: "POST",
         body: JSON.stringify(credentials || {}),
       });
+      progress.setProgress(100);
       await onConnected();
       return;
     } catch (err) {
       if (credentials) throw err;
       // Stored password failed — fall through to prompt.
+    } finally {
+      progress.end();
     }
   }
 
@@ -696,6 +1443,78 @@ function withConnectionId(path, connectionId) {
   return `${path}${join}connectionId=${encodeURIComponent(connectionId)}`;
 }
 
+/**
+ * Show an inline progress bar under a tree node row (connection / DB / schema / table).
+ * Returns { setLabel, setProgress, end }.
+ */
+function beginTreeLoading(host, label = "Loading…", { determinate = false } = {}) {
+  const noop = {
+    setLabel() {},
+    setProgress() {},
+    end() {},
+  };
+  if (!host) return noop;
+
+  host.classList.add("is-loading");
+  const row = host.querySelector(":scope > .tree-row");
+  if (row) row.classList.add("loading");
+
+  let bar = host.querySelector(":scope > .tree-progress");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "tree-progress";
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-busy", "true");
+    bar.innerHTML = `
+      <div class="tree-progress-track"><div class="tree-progress-bar"></div></div>
+      <span class="tree-progress-label"></span>`;
+    if (row) row.insertAdjacentElement("afterend", bar);
+    else host.prepend(bar);
+  }
+
+  const labelEl = bar.querySelector(".tree-progress-label");
+  const barEl = bar.querySelector(".tree-progress-bar");
+  bar.hidden = false;
+  bar.dataset.mode = determinate ? "determinate" : "indeterminate";
+  if (labelEl) labelEl.textContent = label;
+  bar.setAttribute("aria-valuetext", label);
+  if (determinate && barEl) {
+    bar.style.setProperty("--tree-progress", "8%");
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    bar.setAttribute("aria-valuenow", "8");
+  } else {
+    bar.removeAttribute("aria-valuenow");
+  }
+
+  let ended = false;
+  return {
+    setLabel(text) {
+      if (ended || !text) return;
+      if (labelEl) labelEl.textContent = text;
+      bar.setAttribute("aria-valuetext", text);
+    },
+    setProgress(pct) {
+      if (ended || !determinate) return;
+      const n = Math.max(0, Math.min(100, Math.round(pct)));
+      bar.style.setProperty("--tree-progress", `${n}%`);
+      bar.setAttribute("aria-valuenow", String(n));
+    },
+    end() {
+      if (ended) return;
+      ended = true;
+      host.classList.remove("is-loading");
+      if (row) row.classList.remove("loading");
+      bar.remove();
+    },
+  };
+}
+
+function findConnectionTreeNode(profileId) {
+  if (!profileId) return null;
+  return document.querySelector(`.conn-node[data-profile-id="${CSS.escape(profileId)}"]`);
+}
+
 function explorerCacheEntry(connectionId) {
   if (!connectionId) return { explorer: null, objects: {} };
   if (!state.explorerCache[connectionId]) {
@@ -730,18 +1549,43 @@ async function fetchExplorer(connectionId, { force = false } = {}) {
   return explorer;
 }
 
-async function fetchSchemaObjects(connectionId, schema, { force = false } = {}) {
+async function fetchSchemaObjects(connectionId, schema, { force = false, onProgress } = {}) {
   const entry = explorerCacheEntry(connectionId);
   if (!force && entry.objects[schema]) return entry.objects[schema];
   const base = `/api/databases/${encodeURIComponent(schema)}`;
+  const stages = [
+    ["Loading tables…", "tables"],
+    ["Loading views…", "views"],
+    ["Loading procedures…", "procs"],
+    ["Loading functions…", "funcs"],
+  ];
+  let done = 0;
+  const bump = (label) => {
+    done += 1;
+    onProgress?.(label, Math.round((done / stages.length) * 100));
+  };
+  onProgress?.("Loading tables…", 8);
   const [tables, views, procs, funcs] = await Promise.all([
-    api(withConnectionId(`${base}/tables`, connectionId)),
-    api(withConnectionId(`${base}/views`, connectionId)),
-    api(withConnectionId(`${base}/procedures`, connectionId)),
-    api(withConnectionId(`${base}/functions`, connectionId)),
+    api(withConnectionId(`${base}/tables`, connectionId)).then((r) => {
+      bump("Loading views…");
+      return r;
+    }),
+    api(withConnectionId(`${base}/views`, connectionId)).then((r) => {
+      bump("Loading procedures…");
+      return r;
+    }),
+    api(withConnectionId(`${base}/procedures`, connectionId)).then((r) => {
+      bump("Loading functions…");
+      return r;
+    }),
+    api(withConnectionId(`${base}/functions`, connectionId)).then((r) => {
+      bump("Finishing…");
+      return r;
+    }),
   ]);
   const data = { tables, views, procs, funcs };
   entry.objects[schema] = data;
+  onProgress?.("Done", 100);
   return data;
 }
 
@@ -774,14 +1618,32 @@ async function loadTree(opts = {}) {
 
 async function loadTreeInto(container, connectionId, { force = false } = {}) {
   if (!container) return;
+  if (!isExpanded(connectionId) || state.explorerSearch.userCollapsedConnIds[connectionId]) {
+    container.hidden = true;
+    return;
+  }
   container.hidden = false;
   const hasCache = !force && !!explorerCacheEntry(connectionId).explorer;
+  const host = container.closest(".conn-node") || container.parentElement;
+  const progress = hasCache
+    ? null
+    : beginTreeLoading(host, "Loading databases…", { determinate: true });
   if (!hasCache) {
-    container.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
+    container.innerHTML = "";
+    progress?.setProgress(12);
   }
   try {
     // Use connectionId on the request — do not steal active session from siblings.
+    progress?.setLabel("Fetching databases…");
+    progress?.setProgress(35);
     const explorer = await fetchExplorer(connectionId, { force });
+    // User may have collapsed this connection while the request was in flight.
+    if (!isExpanded(connectionId) || state.explorerSearch.userCollapsedConnIds[connectionId]) {
+      container.hidden = true;
+      return;
+    }
+    progress?.setProgress(85);
+    progress?.setLabel("Building tree…");
     container.innerHTML = "";
     const nodes = explorer.nodes || [];
     if (!nodes.length) {
@@ -791,8 +1653,33 @@ async function loadTreeInto(container, connectionId, { force = false } = {}) {
     for (const node of nodes) {
       container.appendChild(renderExplorerNode(node, explorer.layout, connectionId));
     }
+    progress?.setProgress(100);
+    if (!isExpanded(connectionId) || state.explorerSearch.userCollapsedConnIds[connectionId]) {
+      container.hidden = true;
+      return;
+    }
+    if (explorerSearchQuery()) {
+      const entity = explorerSearchEntity();
+      const matches = collectExplorerSearchMatches(explorerSearchQuery(), entity)
+        .filter((m) => m.connectionId === connectionId);
+      state.explorerSearch.revealedConnIds[connectionId] = true;
+      if (matches.length && entity !== "db"
+        && !state.explorerSearch.userCollapsedConnIds[connectionId]) {
+        await expandTreeForSearchMatches(matches, entity);
+      }
+      syncExplorerSearchFilter();
+      // Pick up any other match connections indexing may have found.
+      revealExplorerSearchPaths().catch(() => {});
+    }
   } catch (e) {
     container.innerHTML = `<div class="error-text">${escapeHtml(e.message)}</div>`;
+  } finally {
+    progress?.end();
+    if (!isExpanded(connectionId) || state.explorerSearch.userCollapsedConnIds[connectionId]) {
+      container.hidden = true;
+      const caret = host?.querySelector(":scope > .tree-row .tree-caret");
+      if (caret) caret.textContent = "▸";
+    }
   }
 }
 
@@ -836,18 +1723,33 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
   const childSchemas = Array.isArray(node.children) ? node.children : null;
 
   async function fillChildren({ force = false } = {}) {
-    kids.innerHTML = `<div class="hint" style="padding:.35rem">Loading…</div>`;
+    const schema = node.schema || node.name;
+    const needsNetwork = force
+      || (childSchemas && layout === "database-schemas" && force)
+      || (!childSchemas && !(explorerCacheEntry(connectionId).objects[schema]));
+    const loadingLabel = childSchemas
+      ? "Loading schemas…"
+      : (kind === "schema" ? "Loading schema objects…" : "Loading database objects…");
+    const progress = needsNetwork
+      ? beginTreeLoading(wrap, loadingLabel, { determinate: true })
+      : null;
+    if (needsNetwork) kids.innerHTML = "";
     try {
       if (childSchemas && layout === "database-schemas" && force) {
         // Re-fetch explorer so schema children under this database stay current.
+        progress?.setProgress(20);
+        progress?.setLabel("Refreshing schemas…");
         const explorer = await fetchExplorer(connectionId, { force: true });
+        progress?.setProgress(80);
         const fresh = (explorer.nodes || []).find((n) => (n.name || "") === (node.name || ""));
         const schemas = Array.isArray(fresh?.children) ? fresh.children : childSchemas;
         kids.innerHTML = "";
         for (const schemaNode of schemas) {
           kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId, node.name));
         }
+        progress?.setProgress(100);
         loaded = true;
+        if (explorerSearchQuery()) syncExplorerSearchFilter();
         return;
       }
       if (childSchemas) {
@@ -856,20 +1758,32 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
           kids.appendChild(renderExplorerNode(schemaNode, "schema-objects", connectionId, node.name));
         }
         loaded = true;
+        if (explorerSearchQuery()) syncExplorerSearchFilter();
         return;
       }
-      const schema = node.schema || node.name;
       const dbForObjects = databaseName || profileDatabaseName(connectionId);
-      const objects = await fetchSchemaObjects(connectionId, schema, { force });
+      progress?.setProgress(15);
+      progress?.setLabel("Loading tables…");
+      const objects = await fetchSchemaObjects(connectionId, schema, {
+        force,
+        onProgress: (stage, pct) => {
+          progress?.setLabel(stage);
+          progress?.setProgress(pct);
+        },
+      });
       kids.innerHTML = "";
       kids.appendChild(folder("Tables", "tbl", schema, objects.tables, "table", connectionId, dbForObjects));
       kids.appendChild(folder("Views", "vw", schema, objects.views, "view", connectionId, dbForObjects));
       kids.appendChild(folder("Procedures", "db", schema, objects.procs, "proc", connectionId, dbForObjects));
       kids.appendChild(folder("Functions", "db", schema, objects.funcs, "func", connectionId, dbForObjects));
+      progress?.setProgress(100);
       loaded = true;
+      if (explorerSearchQuery()) syncExplorerSearchFilter();
     } catch (err) {
       kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
       loaded = false;
+    } finally {
+      progress?.end();
     }
   }
 
@@ -877,6 +1791,11 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     kids.hidden = false;
     loaded = false;
     await fillChildren({ force: true });
+  };
+
+  wrap.expandForSearch = async () => {
+    markSearchOpened(wrap, kids);
+    if (!loaded) await fillChildren({ force: false });
   };
 
   row.onclick = async (e) => {
@@ -905,6 +1824,10 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     }
 
     kids.hidden = !kids.hidden;
+    // Manual toggle owns expand state for this search session.
+    delete wrap.dataset.searchOpened;
+    if (kids.hidden) wrap.dataset.userCollapsed = "1";
+    else delete wrap.dataset.userCollapsed;
     if (kids.hidden || loaded) return;
     // Use cache when available — only the first expand (or Refresh) hits the API.
     const schema = node.schema || node.name;
@@ -2956,6 +3879,9 @@ async function handleContextAction(action) {
 function folder(label, badge, schema, items, kind, connectionId, database = null) {
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
+  wrap.dataset.folderKind = kind;
+  if (connectionId) wrap.dataset.treeConnectionId = connectionId;
+  wrap.dataset.treeSchema = schema;
   const row = document.createElement("div");
   row.className = "tree-row";
   row.innerHTML = `<span class="badge ${badge}">${badge.toUpperCase()}</span><span class="tree-label">${label} (${items.length})</span>`;
@@ -2983,12 +3909,25 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
   const kids = document.createElement("div");
   kids.className = "tree-children";
   kids.hidden = true;
+  wrap.expandForSearch = async () => {
+    markSearchOpened(wrap, kids);
+  };
   row.onclick = (e) => {
     if (e.target.closest(".tree-more")) return;
     e.stopPropagation();
     kids.hidden = !kids.hidden;
+    delete wrap.dataset.searchOpened;
+    if (kids.hidden) wrap.dataset.userCollapsed = "1";
+    else delete wrap.dataset.userCollapsed;
   };
   for (const name of items) {
+    const leaf = document.createElement("div");
+    leaf.className = "tree-node tree-leaf";
+    leaf.dataset.treeKind = kind;
+    leaf.dataset.treeSchema = schema;
+    leaf.dataset.treeTable = name;
+    if (connectionId) leaf.dataset.treeConnectionId = connectionId;
+
     const item = document.createElement("div");
     item.className = "tree-row";
     item.innerHTML = `<span class="tree-label">${escapeHtml(name)}</span>`;
@@ -3028,10 +3967,19 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
             body: JSON.stringify({ id: connectionId }),
           }).catch(() => {});
         }
-        await openTable(schema, name, connectionId, database);
+        const progress = beginTreeLoading(leaf, `Loading ${name}…`, { determinate: true });
+        progress.setProgress(20);
+        try {
+          progress.setLabel(`Loading ${name}…`);
+          await openTable(schema, name, connectionId, database);
+          progress.setProgress(100);
+        } finally {
+          progress.end();
+        }
       }
     };
-    kids.appendChild(item);
+    leaf.appendChild(item);
+    kids.appendChild(leaf);
   }
   if (!items.length) {
     kids.innerHTML = `<div class="hint" style="padding:.35rem">(empty)</div>`;
@@ -4272,7 +5220,8 @@ function isTableWorkspaceActive(tab = activeWorkspaceTab()) {
 }
 
 /**
- * View tabs (Details/Data/Structure) only for table workspace tabs.
+ * View tabs (Details/Data) only for table workspace tabs.
+ * Structure is opened from the Details panel button, not a top tab.
  * Non-table query results keep the data tool strip (search/pager/export).
  */
 function updateViewTabBarVisibility() {
@@ -4308,6 +5257,19 @@ function updateViewTabBarVisibility() {
   if (backBtn) {
     backBtn.hidden = isTable || !onData || !(tab && (tab.kind === "sql" || tab.kind === "context" || tab.kind === "home"));
   }
+  updateStructureEntryButton();
+}
+
+/** Show Details → Structure only when a table workspace is active. */
+function updateStructureEntryButton() {
+  const btn = $("#btn-view-structure");
+  if (!btn) return;
+  const tab = activeWorkspaceTab();
+  const show = isTableWorkspaceActive(tab) && state.currentTab === "details";
+  btn.hidden = !show;
+  if (show && tab) {
+    btn.title = `View structure for ${tab.schema}.${tab.table}`;
+  }
 }
 
 function switchTab(name, { skipTitle = false } = {}) {
@@ -4337,10 +5299,16 @@ function switchTab(name, { skipTitle = false } = {}) {
     target = target === "sql" ? "data" : target;
   }
 
+  // Structure is a Details sub-view — only available for table tabs.
+  if (target === "structure" && !isTable) {
+    target = "details";
+  }
+
   state.currentTab = target;
   if (tab) tab.viewMode = target;
 
-  $$(".tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === target));
+  const tabHighlight = target === "structure" ? "details" : target;
+  $$(".tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tabHighlight));
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${target}`));
   updateViewTabBarVisibility();
 
@@ -4351,12 +5319,20 @@ function switchTab(name, { skipTitle = false } = {}) {
       updateContextMeta(state.detailFocus.schema);
     } else if (state.detailFocus?.scope === "database" && state.detailFocus.database) {
       updateContextMeta(state.detailFocus.database);
-    } else if (target !== "details") {
+    } else if (target !== "details" && target !== "structure") {
       updateContextMeta("");
     }
   }
   if (target === "details") {
     refreshDetails().catch((e) => console.error(e));
+  }
+  if (target === "structure") {
+    const st = $("#structure-title");
+    const ss = $("#structure-subtitle");
+    if (st && state.currentTable) st.textContent = state.currentTable;
+    if (ss && state.currentSchema && state.currentTable) {
+      ss.textContent = `${state.currentSchema} · columns & DDL`;
+    }
   }
   if (target === "sql") {
     refreshSqlContextUi().catch((e) => console.error(e));
@@ -5418,7 +6394,7 @@ function escapeHtml(s) {
 function wire() {
   wirePrefs();
   $("#btn-refresh-profiles").onclick = () => loadProfiles().catch(console.error);
-  $("#conn-search")?.addEventListener("input", () => renderProfiles());
+  wireExplorerSearch();
   $("#btn-new-connection").onclick = openNewConnection;
   $("#btn-cancel-conn").onclick = () => {
     state.editingProfileId = null;
@@ -5784,6 +6760,12 @@ function wire() {
     const form = e.target;
     const base = state.pendingProfile;
     if (!base) return;
+    const progress = beginTreeLoading(
+      findConnectionTreeNode(base.id),
+      "Connecting…",
+      { determinate: true }
+    );
+    progress.setProgress(25);
     try {
       setStatus("Connecting…");
       await api("/api/connect/" + encodeURIComponent(base.id), {
@@ -5797,12 +6779,15 @@ function wire() {
           saveSshPassword: form.saveSshPassword ? form.saveSshPassword.checked : undefined,
         }),
       });
+      progress.setProgress(100);
       $("#modal-password").close();
       showError($("#sidebar-error"), "");
       await onConnected();
     } catch (err) {
       setStatus("Connection failed");
       alert(err.message);
+    } finally {
+      progress.end();
     }
   };
 
@@ -5939,6 +6924,12 @@ function wire() {
   $("#btn-back-to-sql")?.addEventListener("click", () => {
     switchTab("sql");
     $("#sql-editor")?.focus();
+  });
+  $("#btn-view-structure")?.addEventListener("click", () => {
+    switchTab("structure");
+  });
+  $("#btn-back-to-details")?.addEventListener("click", () => {
+    switchTab("details");
   });
 }
 

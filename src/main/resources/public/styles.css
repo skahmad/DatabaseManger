@@ -404,6 +404,123 @@ body.resizing-sidebar * {
   font-size: 0.78rem;
   border-radius: 8px;
 }
+.explorer-search-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  min-height: 2rem;
+  padding: 0.2rem 0.4rem 0.2rem 0.28rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-elev);
+}
+.explorer-search-field:focus-within {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.15);
+}
+.explorer-entity-chip {
+  appearance: none;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  border: none;
+  border-radius: 999px;
+  padding: 0.18rem 0.4rem 0.18rem 0.45rem;
+  background: rgba(var(--accent-rgb), 0.16);
+  color: var(--accent);
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  cursor: pointer;
+}
+.explorer-entity-chip:hover,
+.explorer-entity-chip[aria-expanded="true"] {
+  background: rgba(var(--accent-rgb), 0.28);
+}
+.explorer-entity-chip-caret {
+  font-size: 0.58rem;
+  opacity: 0.8;
+}
+.explorer-search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.2rem 0;
+  /* JavaFX WebView: type=search can paint oddly without explicit colors */
+  -webkit-appearance: none;
+  appearance: none;
+}
+.explorer-search-input::placeholder {
+  color: var(--muted);
+}
+.explorer-search-input::-webkit-search-decoration,
+.explorer-search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+.explorer-entity-menu {
+  position: absolute;
+  top: calc(100% + 0.3rem);
+  left: 0;
+  z-index: 60;
+  min-width: 10.5rem;
+  padding: 0.25rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+}
+.explorer-entity-option {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.explorer-entity-option:hover,
+.explorer-entity-option[aria-selected="true"] {
+  background: rgba(var(--accent-rgb), 0.12);
+}
+.explorer-entity-option .badge {
+  min-width: 2.2rem;
+}
+.explorer-search-status {
+  margin-top: 0.3rem;
+  font-size: 0.68rem;
+  color: var(--muted);
+  padding: 0 0.1rem;
+}
+/* Search filters the connection tree itself (no separate results panel). */
+.conn-tree.is-searching .tree-node.search-miss {
+  display: none !important;
+}
+.conn-tree.is-searching .tree-row.search-hit {
+  background: rgba(var(--accent-rgb), 0.14);
+  color: var(--text);
+}
+.conn-tree.is-searching .tree-row.search-hit .tree-label {
+  font-weight: 600;
+}
+/* While searching, keep caret clicks working even on highlighted rows. */
+.conn-tree.is-searching .tree-row {
+  pointer-events: auto;
+}
 .tree { flex: 1; overflow: auto; font-size: 0.85rem; min-height: 0; }
 .tree-children {
   margin-left: 0.55rem;
@@ -461,6 +578,56 @@ body.resizing-sidebar * {
 .tree-node { user-select: none; }
 .tree-row:hover { background: var(--btn-bg); }
 .tree-row.active { background: rgba(var(--accent-rgb), 0.12); color: var(--accent); }
+.tree-row.loading { opacity: 0.85; pointer-events: none; }
+.tree-node.is-loading > .tree-row {
+  background: rgba(var(--accent-rgb), 0.06);
+}
+
+/* Inline progress under connection / database / schema / table rows */
+.tree-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.15rem 0.4rem 0.4rem 1.35rem;
+  animation: tree-progress-fade-in 140ms ease-out;
+}
+.tree-progress-track {
+  position: relative;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.14);
+  overflow: hidden;
+}
+.tree-progress-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: tree-progress-slide 1.05s ease-in-out infinite;
+}
+.tree-progress[data-mode="determinate"] .tree-progress-bar {
+  animation: none;
+  background: var(--accent);
+  width: var(--tree-progress, 8%);
+  transition: width 160ms ease;
+}
+.tree-progress-label {
+  font-size: 0.68rem;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@keyframes tree-progress-slide {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
+@keyframes tree-progress-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 .badge {
   font-size: 0.62rem; font-weight: 700; padding: 0.08rem 0.3rem; border-radius: 4px;
   background: #334155; color: #e2e8f0; min-width: 1.45rem; text-align: center;
@@ -1331,15 +1498,37 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   overflow: auto;
   padding: 1.25rem 1.5rem 1.5rem;
 }
-.details-head h3 {
+.details-head,
+.structure-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.15rem;
+}
+.details-head-text,
+.structure-head-text {
+  min-width: 0;
+  flex: 1;
+}
+.details-head h3,
+.structure-head h3 {
   margin: 0;
   font-size: 1.2rem;
   letter-spacing: -0.02em;
+}
+.details-head #btn-view-structure,
+.structure-head #btn-back-to-details {
+  flex-shrink: 0;
+  margin-top: 0.1rem;
 }
 .details-subtitle {
   margin: 0.35rem 0 1.1rem;
   color: var(--muted);
   font-size: 0.9rem;
+}
+.structure-head .details-subtitle {
+  margin-bottom: 0.75rem;
 }
 .details-grid {
   display: grid;
@@ -1378,6 +1567,10 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   display: flex;
   flex-direction: column;
   gap: 0;
+}
+.structure-layout > .structure-head {
+  flex: 0 0 auto;
+  padding: 0.85rem 1rem 0;
 }
 .structure-section {
   min-height: 0;

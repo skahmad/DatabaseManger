@@ -98,8 +98,23 @@
       <div class="explorer-head">
         <span>Connections</span>
       </div>
-      <div class="conn-search-wrap">
-        <input type="search" id="conn-search" class="input conn-search" placeholder="Search connections…" autocomplete="off" spellcheck="false" aria-label="Search connections" />
+      <div class="conn-search-wrap explorer-search-wrap">
+        <div class="explorer-search-field" id="explorer-search-field">
+          <button type="button" class="explorer-entity-chip" id="explorer-entity-chip" aria-haspopup="listbox" aria-expanded="false" title="Search entity">
+            <span id="explorer-entity-chip-label">DB</span>
+            <span class="explorer-entity-chip-caret" aria-hidden="true">▾</span>
+          </button>
+          <input type="search" id="explorer-search" class="explorer-search-input" placeholder="Search databases…" autocomplete="off" spellcheck="false" aria-label="Search explorer" />
+          <div id="explorer-entity-menu" class="explorer-entity-menu" hidden role="listbox" aria-label="Search entity">
+            <button type="button" class="explorer-entity-option" role="option" data-entity="db"><span class="badge db">DB</span> Database</button>
+            <button type="button" class="explorer-entity-option" role="option" data-entity="sch"><span class="badge vw">SCH</span> Schema</button>
+            <button type="button" class="explorer-entity-option" role="option" data-entity="tbl"><span class="badge tbl">TBL</span> Table</button>
+            <button type="button" class="explorer-entity-option" role="option" data-entity="vw"><span class="badge vw">VW</span> View</button>
+            <button type="button" class="explorer-entity-option" role="option" data-entity="proc"><span class="badge db">PROC</span> Procedure</button>
+            <button type="button" class="explorer-entity-option" role="option" data-entity="func"><span class="badge db">FN</span> Function</button>
+          </div>
+        </div>
+        <div id="explorer-search-status" class="explorer-search-status" hidden></div>
       </div>
       <div id="conn-tree" class="conn-tree"></div>
       <p id="sidebar-error" class="error-text sidebar-error" hidden></p>
@@ -142,7 +157,6 @@
         <div class="tabs-left" id="view-tabs-left">
           <button type="button" class="tab active" data-tab="details">Details</button>
           <button type="button" class="tab" data-tab="data">Data</button>
-          <button type="button" class="tab" data-tab="structure">Structure</button>
         </div>
         <div class="tabs-right" id="view-tabs-right">
           <button type="button" class="btn ghost sm" id="btn-back-to-sql" hidden title="Back to SQL editor">← SQL</button>
@@ -179,8 +193,11 @@
       <section id="panel-details" class="panel active">
         <div class="details-panel">
           <div class="details-head">
-            <h3 id="details-title">Details</h3>
-            <p id="details-subtitle" class="details-subtitle">Connect to a database to see object counts.</p>
+            <div class="details-head-text">
+              <h3 id="details-title">Details</h3>
+              <p id="details-subtitle" class="details-subtitle">Connect to a database to see object counts.</p>
+            </div>
+            <button type="button" class="btn ghost sm" id="btn-view-structure" hidden title="View columns and DDL">Structure</button>
           </div>
           <div id="details-grid" class="details-grid"></div>
           <div id="details-empty" class="empty">No connection selected.</div>
@@ -267,6 +284,13 @@
 
       <section id="panel-structure" class="panel">
         <div class="structure-layout">
+          <div class="structure-head">
+            <div class="structure-head-text">
+              <h3 id="structure-title">Structure</h3>
+              <p id="structure-subtitle" class="details-subtitle">Columns and DDL for the selected table.</p>
+            </div>
+            <button type="button" class="btn ghost sm" id="btn-back-to-details" title="Back to details">← Details</button>
+          </div>
           <div class="structure-section structure-columns">
             <div class="structure-section-head">Columns</div>
             <div class="table-wrap">
