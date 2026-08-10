@@ -1518,9 +1518,16 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   letter-spacing: -0.02em;
 }
 .details-head #btn-view-structure,
+.details-head #btn-refresh-details,
 .structure-head #btn-back-to-details {
   flex-shrink: 0;
   margin-top: 0.1rem;
+}
+.details-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-shrink: 0;
 }
 .details-subtitle {
   margin: 0.35rem 0 1.1rem;

@@ -31,7 +31,7 @@ const state = {
   activeConnectionId: null,
   /**
    * Explorer tree cache per connection:
-   * { [connectionId]: { explorer, objects: { [schema]: { tables, views, procs, funcs } } } }
+   * { [connectionId]: { explorer, objects: { [schema]: { tables, views, procs, funcs } }, details: { [key]: payload } } }
    */
   explorerCache: {},
   /** Unified sidebar search: entity = db | sch | tbl */
@@ -441,10 +441,10 @@ const EXPLORER_SEARCH_ENTITIES = ["db", "sch", "tbl", "vw", "proc", "func"];
 const EXPLORER_SEARCH_META = {
   db: { label: "Database", chip: "DB", placeholder: "Search databases…", badge: "DB", badgeClass: "db", empty: "No databases match. Connect and expand a connection first." },
   sch: { label: "Schema", chip: "SCH", placeholder: "Search schemas…", badge: "SCH", badgeClass: "vw", empty: "No schemas match. Connect and expand a connection first." },
-  tbl: { label: "Table", chip: "TBL", placeholder: "Search tables…", badge: "TBL", badgeClass: "tbl", empty: "No tables match. Connect and expand a database, or wait while indexes load." },
-  vw: { label: "View", chip: "VW", placeholder: "Search views…", badge: "VW", badgeClass: "vw", empty: "No views match. Connect and expand a database, or wait while indexes load." },
-  proc: { label: "Procedure", chip: "PROC", placeholder: "Search procedures…", badge: "PROC", badgeClass: "db", empty: "No procedures match. Connect and expand a database, or wait while indexes load." },
-  func: { label: "Function", chip: "FN", placeholder: "Search functions…", badge: "FN", badgeClass: "db", empty: "No functions match. Connect and expand a database, or wait while indexes load." },
+  tbl: { label: "Table", chip: "TBL", placeholder: "Search tables…", badge: "TBL", badgeClass: "tbl", empty: "No tables match in cache — expand a database to load its tables." },
+  vw: { label: "View", chip: "VW", placeholder: "Search views…", badge: "VW", badgeClass: "vw", empty: "No views match in cache — expand a database to load its views." },
+  proc: { label: "Procedure", chip: "PROC", placeholder: "Search procedures…", badge: "PROC", badgeClass: "db", empty: "No procedures match in cache — expand a database to load them." },
+  func: { label: "Function", chip: "FN", placeholder: "Search functions…", badge: "FN", badgeClass: "db", empty: "No functions match in cache — expand a database to load them." },
 };
 
 function explorerSearchQuery() {
@@ -541,12 +541,13 @@ function collectExplorerSearchMatches(query, entity) {
 
   for (const connectionId of ids) {
     const entry = state.explorerCache[connectionId];
-    if (!entry?.explorer) continue;
+    if (!entry) continue;
     const connName = connectionLabel(connectionId);
-    const nodes = entry.explorer.nodes || [];
-    const layout = entry.explorer.layout || "";
+    const nodes = entry.explorer?.nodes || [];
+    const layout = entry.explorer?.layout || "";
 
     if (entity === "db") {
+      if (!entry.explorer) continue;
       for (const node of nodes) {
         if ((node.kind || "database") !== "database") continue;
         const name = node.name || "";
@@ -563,6 +564,7 @@ function collectExplorerSearchMatches(query, entity) {
         });
       }
     } else if (entity === "sch") {
+      if (!entry.explorer) continue;
       for (const node of nodes) {
         const kind = node.kind || "database";
         if (kind === "schema") {
@@ -612,6 +614,7 @@ function collectExplorerSearchMatches(query, entity) {
         }
       }
     } else if (needsExplorerObjectIndex(entity)) {
+      // Cache-only — never trigger network from search.
       const objects = entry.objects || {};
       for (const [schema, bag] of Object.entries(objects)) {
         if (entity === "tbl") {
@@ -645,81 +648,6 @@ function collectExplorerSearchMatches(query, entity) {
 
   out.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
   return out.slice(0, 200);
-}
-
-function schemasToIndexForSearch(connectionId) {
-  const entry = explorerCacheEntry(connectionId);
-  const explorer = entry.explorer;
-  if (!explorer) return [];
-  const schemas = [];
-  for (const node of explorer.nodes || []) {
-    const kind = node.kind || "database";
-    if (kind === "schema") {
-      schemas.push(node.schema || node.name);
-    } else if (Array.isArray(node.children)) {
-      for (const child of node.children) {
-        schemas.push(child.schema || child.name);
-      }
-    } else if (kind === "database") {
-      schemas.push(node.schema || node.name);
-    }
-  }
-  return [...new Set(schemas.filter(Boolean))];
-}
-
-/** For table/view/proc/func search, load missing schema object lists on live connections. */
-async function ensureExplorerSearchIndex() {
-  const entity = explorerSearchEntity();
-  const query = explorerSearchQuery();
-  if (!needsExplorerObjectIndex(entity) || query.length < 2) return;
-
-  const liveIds = Object.keys(state.connectedIds || {}).filter((id) => state.connectedIds[id]);
-  if (!liveIds.length) return;
-
-  const token = ++state.explorerSearch.scanToken;
-  state.explorerSearch.scanning = true;
-  const status = $("#explorer-search-status");
-
-  try {
-    for (const connectionId of liveIds) {
-      if (token !== state.explorerSearch.scanToken) return;
-      let explorer = explorerCacheEntry(connectionId).explorer;
-      if (!explorer) {
-        try {
-          explorer = await fetchExplorer(connectionId);
-        } catch {
-          continue;
-        }
-      }
-      const schemas = schemasToIndexForSearch(connectionId);
-      let done = 0;
-      for (const schema of schemas) {
-        if (token !== state.explorerSearch.scanToken) return;
-        if (explorerCacheEntry(connectionId).objects[schema]) {
-          done += 1;
-          continue;
-        }
-        if (status) {
-          status.hidden = false;
-          status.textContent = `Indexing ${connectionLabel(connectionId)}… ${done + 1}/${schemas.length}`;
-        }
-        try {
-          await fetchSchemaObjects(connectionId, schema);
-        } catch {
-          /* skip unreachable schemas */
-        }
-        done += 1;
-        if (token === state.explorerSearch.scanToken) {
-          applyExplorerSearchToTree();
-        }
-      }
-    }
-  } finally {
-    if (token === state.explorerSearch.scanToken) {
-      state.explorerSearch.scanning = false;
-      applyExplorerSearchToTree();
-    }
-  }
 }
 
 function clearExplorerSearchFilterClasses() {
@@ -1001,10 +929,8 @@ function refreshExplorerSearch() {
     state.explorerSearch.userCollapsedConnIds = {};
   }
   state.explorerSearch.activeIndex = 0;
+  // Cache-only filter — do not background-index every schema (that hung the UI).
   applyExplorerSearchToTree().catch(() => {});
-  if (needsExplorerObjectIndex(entity) && q.length >= 2) {
-    ensureExplorerSearchIndex().catch(() => {});
-  }
 }
 
 function routineSearchSql(match) {
@@ -1516,14 +1442,16 @@ function findConnectionTreeNode(profileId) {
 }
 
 function explorerCacheEntry(connectionId) {
-  if (!connectionId) return { explorer: null, objects: {} };
+  if (!connectionId) return { explorer: null, objects: {}, details: {} };
   if (!state.explorerCache[connectionId]) {
-    state.explorerCache[connectionId] = { explorer: null, objects: {} };
+    state.explorerCache[connectionId] = { explorer: null, objects: {}, details: {} };
   }
-  return state.explorerCache[connectionId];
+  const entry = state.explorerCache[connectionId];
+  if (!entry.details) entry.details = {};
+  return entry;
 }
 
-/** Clear explorer + schema-object cache for one connection, or all when omitted. */
+/** Clear explorer + schema-object + details cache for one connection, or all when omitted. */
 function invalidateExplorerCache(connectionId) {
   if (!connectionId) {
     state.explorerCache = {};
@@ -1537,6 +1465,104 @@ function invalidateSchemaObjectsCache(connectionId, schema) {
   const entry = state.explorerCache[connectionId];
   if (!entry) return;
   delete entry.objects[schema];
+  invalidateDetailsCache(connectionId, schema);
+}
+
+function detailsCacheKey(focus = {}) {
+  const scope = focus.scope || "connection";
+  const schema = focus.schema
+    || (scope === "database" ? focus.database : "")
+    || "";
+  const table = focus.table || "";
+  return `${scope}\0${schema}\0${table}`;
+}
+
+function getCachedDetails(connectionId, focus) {
+  if (!connectionId) return null;
+  const entry = explorerCacheEntry(connectionId);
+  return entry.details?.[detailsCacheKey(focus)] || null;
+}
+
+function setCachedDetails(connectionId, focus, data) {
+  if (!connectionId || !data) return;
+  const entry = explorerCacheEntry(connectionId);
+  entry.details[detailsCacheKey(focus)] = data;
+}
+
+function invalidateDetailsCache(connectionId, schema = null) {
+  const entry = state.explorerCache[connectionId];
+  if (!entry?.details) return;
+  if (!schema) {
+    entry.details = {};
+    return;
+  }
+  for (const key of Object.keys(entry.details)) {
+    const parts = key.split("\0");
+    if (parts[1] === schema) delete entry.details[key];
+  }
+}
+
+/**
+ * Build connection/schema/database details from explorer + object caches when possible
+ * so opening a DB does not re-hit /api/details every time.
+ */
+function buildDetailsFromExplorerCache(connectionId, focus = {}) {
+  if (!connectionId) return null;
+  const entry = explorerCacheEntry(connectionId);
+  const scope = focus.scope || "connection";
+  const profile = (state.profiles || []).find((p) => p.id === connectionId);
+  const engine = profile?.dbType || "";
+
+  if (scope === "connection") {
+    if (!entry.explorer) return null;
+    const nodes = entry.explorer.nodes || [];
+    const layout = entry.explorer.layout || "";
+    const items = [];
+    if (layout === "database-schemas") {
+      const databases = nodes.filter((n) => (n.kind || "database") === "database");
+      items.push({ label: "Databases", value: databases.length });
+      let schemas = 0;
+      for (const db of databases) {
+        schemas += Array.isArray(db.children) ? db.children.length : 0;
+      }
+      if (!schemas) {
+        schemas = nodes.filter((n) => (n.kind || "") === "schema").length;
+      }
+      items.push({ label: "Schemas", value: schemas });
+    } else {
+      const databases = nodes.filter((n) => (n.kind || "database") === "database");
+      items.push({ label: "Databases", value: databases.length || nodes.length });
+    }
+    return {
+      scope: "connection",
+      title: profile?.name || "Connection",
+      subtitle: engine ? String(engine) : "Connection",
+      engine,
+      items,
+    };
+  }
+
+  if (scope === "schema" || scope === "database") {
+    const schema = focus.schema || focus.database;
+    if (!schema) return null;
+    const bag = entry.objects?.[schema];
+    if (!bag) return null;
+    const isSchema = scope === "schema";
+    return {
+      scope,
+      title: schema,
+      subtitle: isSchema ? "Schema" : "Database",
+      engine,
+      items: [
+        { label: "Tables", value: (bag.tables || []).length },
+        { label: "Views", value: (bag.views || []).length },
+        { label: "Procedures", value: (bag.procs || []).length },
+        { label: "Functions", value: (bag.funcs || []).length },
+      ],
+    };
+  }
+
+  return null;
 }
 
 async function fetchExplorer(connectionId, { force = false } = {}) {
@@ -1625,16 +1651,17 @@ async function loadTreeInto(container, connectionId, { force = false } = {}) {
   container.hidden = false;
   const hasCache = !force && !!explorerCacheEntry(connectionId).explorer;
   const host = container.closest(".conn-node") || container.parentElement;
-  const progress = hasCache
-    ? null
-    : beginTreeLoading(host, "Loading databases…", { determinate: true });
-  if (!hasCache) {
+  const showProgress = force || !hasCache;
+  const progress = showProgress
+    ? beginTreeLoading(host, force ? "Refreshing databases…" : "Loading databases…", { determinate: true })
+    : null;
+  if (showProgress) {
     container.innerHTML = "";
     progress?.setProgress(12);
   }
   try {
     // Use connectionId on the request — do not steal active session from siblings.
-    progress?.setLabel("Fetching databases…");
+    progress?.setLabel(force ? "Refreshing databases…" : "Fetching databases…");
     progress?.setProgress(35);
     const explorer = await fetchExplorer(connectionId, { force });
     // User may have collapsed this connection while the request was in flight.
@@ -1727,9 +1754,13 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     const needsNetwork = force
       || (childSchemas && layout === "database-schemas" && force)
       || (!childSchemas && !(explorerCacheEntry(connectionId).objects[schema]));
-    const loadingLabel = childSchemas
-      ? "Loading schemas…"
-      : (kind === "schema" ? "Loading schema objects…" : "Loading database objects…");
+    const loadingLabel = force
+      ? (childSchemas
+        ? "Refreshing schemas…"
+        : (kind === "schema" ? "Refreshing schema objects…" : "Refreshing database objects…"))
+      : (childSchemas
+        ? "Loading schemas…"
+        : (kind === "schema" ? "Loading schema objects…" : "Loading database objects…"));
     const progress = needsNetwork
       ? beginTreeLoading(wrap, loadingLabel, { determinate: true })
       : null;
@@ -1778,6 +1809,30 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
       kids.appendChild(folder("Functions", "db", schema, objects.funcs, "func", connectionId, dbForObjects));
       progress?.setProgress(100);
       loaded = true;
+      // Keep details panel in sync with object counts without another /api/details round-trip.
+      const detailScope = kind === "schema" ? "schema" : "database";
+      const built = buildDetailsFromExplorerCache(connectionId, {
+        scope: detailScope,
+        schema,
+        database: dbForObjects || schema,
+      });
+      if (built) {
+        setCachedDetails(connectionId, {
+          scope: detailScope,
+          schema,
+          database: dbForObjects || schema,
+        }, built);
+        const focus = state.detailFocus || {};
+        const focusSchema = focus.schema || focus.database;
+        if (
+          state.currentTab === "details"
+          && (focus.connectionId || state.activeConnectionId) === connectionId
+          && focusSchema === schema
+          && (focus.scope === "schema" || focus.scope === "database")
+        ) {
+          refreshDetails().catch(() => {});
+        }
+      }
       if (explorerSearchQuery()) syncExplorerSearchFilter();
     } catch (err) {
       kids.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
@@ -3671,11 +3726,27 @@ async function handleContextAction(action) {
         invalidateExplorerCache(profile.id);
         state.activeConnectionId = profile.id;
         setExpanded(profile.id, true);
+        delete state.explorerSearch.userCollapsedConnIds[profile.id];
         await api("/api/session/active", {
           method: "POST",
           body: JSON.stringify({ id: profile.id }),
         }).catch(() => {});
-        renderProfiles();
+
+        let wrap = findConnectionTreeNode(profile.id);
+        let kids = wrap?.querySelector(":scope > .conn-children");
+        if (!wrap || !kids) {
+          renderProfiles();
+          wrap = findConnectionTreeNode(profile.id);
+          kids = wrap?.querySelector(":scope > .conn-children");
+        }
+        if (wrap && kids) {
+          kids.hidden = false;
+          const caret = wrap.querySelector(":scope > .tree-row .tree-caret");
+          if (caret) caret.textContent = "▾";
+          await loadTreeInto(kids, profile.id, { force: true });
+        } else {
+          renderProfiles();
+        }
         setStatus(`Refreshed databases for “${profile.name || "Untitled"}”`);
         break;
       }
@@ -3703,7 +3774,19 @@ async function handleContextAction(action) {
           }
           await nodeEl.reloadTreeChildren();
         } else if (target.kind === "database") {
-          await loadTree({ connectionId: cid });
+          invalidateExplorerCache(cid);
+          setExpanded(cid, true);
+          let wrap = findConnectionTreeNode(cid);
+          let kids = wrap?.querySelector(":scope > .conn-children");
+          if (!wrap || !kids) {
+            renderProfiles();
+            wrap = findConnectionTreeNode(cid);
+            kids = wrap?.querySelector(":scope > .conn-children");
+          }
+          if (kids) {
+            kids.hidden = false;
+            await loadTreeInto(kids, cid, { force: true });
+          }
         } else {
           invalidateSchemaObjectsCache(cid, schema);
           await loadTree({ connectionId: cid, schema });
@@ -5147,7 +5230,7 @@ function setDetailFocus({
   };
 }
 
-async function refreshDetails() {
+async function refreshDetails({ force = false } = {}) {
   const title = $("#details-title");
   const subtitle = $("#details-subtitle");
   const grid = $("#details-grid");
@@ -5159,22 +5242,54 @@ async function refreshDetails() {
     subtitle.textContent = "Connect to a database to see object counts.";
     grid.innerHTML = "";
     if (empty) empty.hidden = false;
+    updateDetailsActionButtons();
     return;
   }
 
   const focus = state.detailFocus || { scope: "connection" };
+  const cid = focus.connectionId || state.activeConnectionId;
+
+  const paint = (data) => {
+    title.textContent = data.title || "Details";
+    subtitle.textContent = data.subtitle || data.hierarchy || data.engine || "";
+    renderDetailsItems(data.items || []);
+    updateDetailsActionButtons();
+  };
+
+  if (!force && cid) {
+    const cached = getCachedDetails(cid, focus);
+    if (cached) {
+      paint(cached);
+      return;
+    }
+    const fromExplorer = buildDetailsFromExplorerCache(cid, focus);
+    if (fromExplorer) {
+      setCachedDetails(cid, focus, fromExplorer);
+      paint(fromExplorer);
+      return;
+    }
+  }
+
+  if (force && cid) {
+    const schema = focus.schema || (focus.scope === "database" ? focus.database : null);
+    if (schema && (focus.scope === "schema" || focus.scope === "database")) {
+      invalidateDetailsCache(cid, schema);
+    } else if (focus.scope === "connection" || focus.scope === "table") {
+      invalidateDetailsCache(cid);
+    }
+  }
+
   const params = new URLSearchParams({ scope: focus.scope || "connection" });
   if (focus.schema) params.set("schema", focus.schema);
   if (focus.database && focus.scope === "database") params.set("schema", focus.database);
   if (focus.table) params.set("table", focus.table);
-  const cid = state.activeConnectionId;
   grid.innerHTML = `<div class="hint">Loading…</div>`;
   if (empty) empty.hidden = true;
+  updateDetailsActionButtons();
   try {
     const data = await api(withConnectionId(`/api/details?${params}`, cid));
-    title.textContent = data.title || "Details";
-    subtitle.textContent = data.subtitle || data.hierarchy || data.engine || "";
-    renderDetailsItems(data.items || []);
+    if (cid) setCachedDetails(cid, focus, data);
+    paint(data);
   } catch (e) {
     title.textContent = "Details";
     subtitle.textContent = e.message || "Failed to load details";
@@ -5183,6 +5298,7 @@ async function refreshDetails() {
       empty.hidden = false;
       empty.textContent = e.message || "Failed to load details";
     }
+    updateDetailsActionButtons();
   }
 }
 
@@ -5257,7 +5373,7 @@ function updateViewTabBarVisibility() {
   if (backBtn) {
     backBtn.hidden = isTable || !onData || !(tab && (tab.kind === "sql" || tab.kind === "context" || tab.kind === "home"));
   }
-  updateStructureEntryButton();
+  updateDetailsActionButtons();
 }
 
 /** Show Details → Structure only when a table workspace is active. */
@@ -5270,6 +5386,14 @@ function updateStructureEntryButton() {
   if (show && tab) {
     btn.title = `View structure for ${tab.schema}.${tab.table}`;
   }
+}
+
+function updateDetailsActionButtons() {
+  updateStructureEntryButton();
+  const refreshBtn = $("#btn-refresh-details");
+  if (!refreshBtn) return;
+  const connected = state.connected || Object.keys(state.connectedIds || {}).length > 0;
+  refreshBtn.hidden = !(connected && state.currentTab === "details");
 }
 
 function switchTab(name, { skipTitle = false } = {}) {
@@ -5325,6 +5449,8 @@ function switchTab(name, { skipTitle = false } = {}) {
   }
   if (target === "details") {
     refreshDetails().catch((e) => console.error(e));
+  } else {
+    updateDetailsActionButtons();
   }
   if (target === "structure") {
     const st = $("#structure-title");
@@ -6927,6 +7053,12 @@ function wire() {
   });
   $("#btn-view-structure")?.addEventListener("click", () => {
     switchTab("structure");
+  });
+  $("#btn-refresh-details")?.addEventListener("click", () => {
+    refreshDetails({ force: true }).catch((e) => {
+      console.error(e);
+      setStatus(e.message || "Failed to refresh details");
+    });
   });
   $("#btn-back-to-details")?.addEventListener("click", () => {
     switchTab("details");

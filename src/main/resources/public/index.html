@@ -197,7 +197,10 @@
               <h3 id="details-title">Details</h3>
               <p id="details-subtitle" class="details-subtitle">Connect to a database to see object counts.</p>
             </div>
-            <button type="button" class="btn ghost sm" id="btn-view-structure" hidden title="View columns and DDL">Structure</button>
+            <div class="details-head-actions">
+              <button type="button" class="btn ghost sm" id="btn-refresh-details" hidden title="Refresh details">Refresh</button>
+              <button type="button" class="btn ghost sm" id="btn-view-structure" hidden title="View columns and DDL">Structure</button>
+            </div>
           </div>
           <div id="details-grid" class="details-grid"></div>
           <div id="details-empty" class="empty">No connection selected.</div>
