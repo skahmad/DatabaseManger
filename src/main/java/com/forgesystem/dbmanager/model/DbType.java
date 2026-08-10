@@ -1,7 +1,10 @@
 package com.forgesystem.dbmanager.model;
 
 public enum DbType {
-    MYSQL("MySQL", "com.mysql.cj.jdbc.Driver", 3306, "jdbc:mysql://%s:%d/%s"),
+    // MariaDB JDBC client — works with MySQL 5.7/8+ and MariaDB; avoids Connector/J
+    // handshake failures on servers that dropped query_cache_size.
+    MYSQL("MySQL", "org.mariadb.jdbc.Driver", 3306, "jdbc:mariadb://%s:%d/%s"),
+    MARIADB("MariaDB", "org.mariadb.jdbc.Driver", 3306, "jdbc:mariadb://%s:%d/%s"),
     POSTGRESQL("PostgreSQL", "org.postgresql.Driver", 5432, "jdbc:postgresql://%s:%d/%s"),
     SQLITE("SQLite", "org.sqlite.JDBC", 0, "jdbc:sqlite:%s"),
     H2("H2", "org.h2.Driver", 9092, "jdbc:h2:tcp://%s:%d/%s"),
@@ -35,6 +38,11 @@ public enum DbType {
 
     public boolean isFileBased() {
         return this == SQLITE || this == H2_FILE;
+    }
+
+    /** MySQL protocol engines (MySQL and MariaDB share dialect for most admin SQL). */
+    public boolean isMysqlFamily() {
+        return this == MYSQL || this == MARIADB;
     }
 
     public String buildUrl(String host, int port, String database) {

@@ -2078,7 +2078,7 @@ function readConnectionForm(form) {
   // Engine-enforced hierarchy
   if (["POSTGRESQL", "H2", "H2_FILE"].includes(profile.dbType)) {
     profile.connectionMode = "THREE_LAYER";
-  } else if (profile.dbType === "MYSQL" || profile.dbType === "SQLITE") {
+  } else if (profile.dbType === "MYSQL" || profile.dbType === "MARIADB" || profile.dbType === "SQLITE") {
     profile.connectionMode = "TWO_LAYER";
   }
   return profile;
@@ -4105,7 +4105,7 @@ function workspaceTabTooltip(tab) {
   const profile = profileById(tab.connectionId || state.activeConnectionId);
   const connName = (profile?.name || "").trim() || profile?.displayType || "Connection";
   const threeLayer = !!(profile && (isThreeLayerProfile(profile) || profile.dbType === "POSTGRESQL"));
-  const mysqlLike = !!(profile && (profile.dbType === "MYSQL" || (!threeLayer && !profile.fileBased)));
+  const mysqlLike = !!(profile && (profile.dbType === "MYSQL" || profile.dbType === "MARIADB" || (!threeLayer && !profile.fileBased)));
 
   let schema = "";
   if (tab.kind === "table") {
@@ -4145,7 +4145,7 @@ function workspaceTabTooltip(tab) {
   }
 
   // MySQL / 2-layer: connection · database
-  if (mysqlLike || profile?.dbType === "MYSQL" || tab.kind === "table" || tab.kind === "context") {
+  if (mysqlLike || profile?.dbType === "MYSQL" || profile?.dbType === "MARIADB" || tab.kind === "table" || tab.kind === "context") {
     const parts = [connName];
     if (database) parts.push(database);
     return parts.join(" · ");

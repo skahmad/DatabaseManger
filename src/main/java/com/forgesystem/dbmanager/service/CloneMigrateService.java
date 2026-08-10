@@ -39,7 +39,7 @@ public class CloneMigrateService {
         summary.put("target", target);
 
         switch (type) {
-            case MYSQL -> cloneMySqlDatabase(source, target, includeData, includeViews, includeIndexes, summary);
+            case MYSQL, MARIADB -> cloneMySqlDatabase(source, target, includeData, includeViews, includeIndexes, summary);
             case POSTGRESQL, H2, H2_FILE -> cloneSchema(source, target, includeData, includeViews, includeIndexes, summary);
             case SQLSERVER -> cloneSqlServerDatabase(source, target, includeData, includeViews, includeIndexes, summary);
             case SQLITE -> throw new SQLException("Clone is not supported for SQLite; export SQL and open a new file instead");

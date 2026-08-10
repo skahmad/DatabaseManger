@@ -48,10 +48,13 @@
         </dependency>
 
         <!-- JDBC drivers -->
+        <!-- MariaDB client is used for MySQL + MariaDB: Oracle Connector/J probes
+             query_cache_size on mis-detected server versions (MariaDB 5.5.5- prefix,
+             proxies, MySQL 8 forks) and fails with "Unknown system variable". -->
         <dependency>
-            <groupId>com.mysql</groupId>
-            <artifactId>mysql-connector-j</artifactId>
-            <version>9.1.0</version>
+            <groupId>org.mariadb.jdbc</groupId>
+            <artifactId>mariadb-java-client</artifactId>
+            <version>3.5.2</version>
         </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>

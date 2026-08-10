@@ -115,11 +115,13 @@ public class ConnectionService {
         if (profile.getPassword() != null) {
             props.setProperty("password", profile.getPassword());
         }
-        if (profile.getDbType() == DbType.MYSQL) {
+        if (profile.getDbType() != null && profile.getDbType().isMysqlFamily()) {
+            // MariaDB Java Client properties (used for both MySQL and MariaDB servers).
             props.setProperty("allowPublicKeyRetrieval", "true");
-            props.setProperty("useSSL", "false");
+            props.setProperty("sslMode", "disable");
+            props.setProperty("useSsl", "false");
             props.setProperty("serverTimezone", "UTC");
-            // Remote / cross-region MySQL: fail instead of hanging forever.
+            // Remote / cross-region: fail instead of hanging forever.
             props.setProperty("connectTimeout", "15000");
             props.setProperty("socketTimeout", "120000");
         }
@@ -131,6 +133,14 @@ public class ConnectionService {
         } catch (SQLException e) {
             if (tunnel != null) {
                 tunnel.close();
+            }
+            String msg = e.getMessage() == null ? "" : e.getMessage();
+            if (msg.toLowerCase().contains("query_cache_size")) {
+                throw new SQLException(
+                        "Server rejected MySQL Connector handshake (unknown variable query_cache_size). "
+                                + "This usually means MariaDB/MySQL 8+ behind a proxy with a mismatched JDBC driver. "
+                                + "Reconnect with the latest DB Pilot build (MariaDB JDBC client).",
+                        e);
             }
             throw e;
         }
@@ -255,7 +265,7 @@ public class ConnectionService {
         Connection conn = session.connection;
         DbType type = session.profile.getDbType();
         switch (type) {
-            case MYSQL -> {
+            case MYSQL, MARIADB -> {
                 conn.createStatement().execute("USE `" + databaseOrSchema.replace("`", "``") + "`");
                 session.profile.setDatabase(databaseOrSchema);
             }
@@ -289,7 +299,7 @@ public class ConnectionService {
         String sch = blankToNull(schema);
 
         switch (type) {
-            case MYSQL -> {
+            case MYSQL, MARIADB -> {
                 String target = db != null ? db : sch;
                 if (target != null) {
                     useDatabase(target);

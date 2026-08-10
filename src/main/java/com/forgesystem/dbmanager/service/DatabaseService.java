@@ -36,7 +36,7 @@ public class DatabaseService {
         List<String> dbs = new ArrayList<>();
 
         switch (type) {
-            case MYSQL -> {
+            case MYSQL, MARIADB -> {
                 try (ResultSet rs = conn.createStatement().executeQuery("SHOW DATABASES")) {
                     while (rs.next()) {
                         dbs.add(rs.getString(1));
@@ -131,7 +131,7 @@ public class DatabaseService {
                     schemas.add("PUBLIC");
                 }
             }
-            case MYSQL -> schemas.addAll(listDatabases());
+            case MYSQL, MARIADB -> schemas.addAll(listDatabases());
             case SQLSERVER -> {
                 try (ResultSet rs = conn.createStatement().executeQuery(
                         "SELECT name FROM sys.schemas " +
@@ -245,7 +245,7 @@ public class DatabaseService {
         if (type == DbType.POSTGRESQL || type == DbType.H2 || type == DbType.H2_FILE) {
             return ConnectionMode.THREE_LAYER;
         }
-        if (type == DbType.SQLITE || type == DbType.MYSQL) {
+        if (type == DbType.SQLITE || type.isMysqlFamily()) {
             return ConnectionMode.TWO_LAYER;
         }
         return profile.getConnectionMode();
@@ -496,7 +496,7 @@ public class DatabaseService {
         }
 
         switch (type) {
-            case MYSQL -> fillMySqlDatabaseProperties(conn, name, props);
+            case MYSQL, MARIADB -> fillMySqlDatabaseProperties(conn, name, props);
             case POSTGRESQL -> fillPostgresSchemaProperties(conn, name, props);
             case SQLSERVER -> fillSqlServerDatabaseProperties(conn, name, props);
             case SQLITE -> fillSqliteDatabaseProperties(conn, props);
@@ -612,7 +612,7 @@ public class DatabaseService {
 
     public List<String> listTables(String schema) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
-        if (type == DbType.MYSQL) {
+        if (type.isMysqlFamily()) {
             return listMySqlObjects(schema, "BASE TABLE");
         }
         if (type == DbType.POSTGRESQL) {
@@ -626,7 +626,7 @@ public class DatabaseService {
 
     public List<String> listViews(String schema) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
-        if (type == DbType.MYSQL) {
+        if (type.isMysqlFamily()) {
             return listMySqlObjects(schema, "VIEW");
         }
         if (type == DbType.POSTGRESQL) {
@@ -726,7 +726,7 @@ public class DatabaseService {
 
     public List<String> listProcedures(String schema) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
-        if (type == DbType.MYSQL) {
+        if (type.isMysqlFamily()) {
             return listMySqlRoutines(schema, "PROCEDURE");
         }
         if (type == DbType.POSTGRESQL) {
@@ -753,7 +753,7 @@ public class DatabaseService {
 
         try {
             switch (type) {
-                case MYSQL -> {
+                case MYSQL, MARIADB -> {
                     return listMySqlRoutines(schema, "FUNCTION");
                 }
                 case POSTGRESQL -> {
@@ -946,7 +946,7 @@ public class DatabaseService {
     public void createDatabase(String name, String charset, String collation) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
         String sql = switch (type) {
-            case MYSQL -> {
+            case MYSQL, MARIADB -> {
                 StringBuilder sb = new StringBuilder("CREATE DATABASE ").append(quoteIdent(name));
                 if (charset != null && !charset.isBlank()) {
                     sb.append(" CHARACTER SET ").append(charset.trim());
@@ -965,7 +965,7 @@ public class DatabaseService {
     public void alterDatabase(String name, String newName, String charset, String collation) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
         switch (type) {
-            case MYSQL -> {
+            case MYSQL, MARIADB -> {
                 if ((charset != null && !charset.isBlank()) || (collation != null && !collation.isBlank())) {
                     StringBuilder sb = new StringBuilder("ALTER DATABASE ").append(quoteIdent(name));
                     if (charset != null && !charset.isBlank()) {
@@ -1011,7 +1011,7 @@ public class DatabaseService {
         DbType type = connectionService.getProfile().getDbType();
         switch (type) {
             case POSTGRESQL, H2, H2_FILE -> execute("CREATE SCHEMA " + quoteIdent(name));
-            case MYSQL, SQLSERVER -> createDatabase(name);
+            case MYSQL, MARIADB, SQLSERVER -> createDatabase(name);
             case SQLITE -> throw new SQLException("SQLite does not support CREATE SCHEMA");
         }
     }
@@ -1021,7 +1021,7 @@ public class DatabaseService {
         switch (type) {
             case POSTGRESQL -> execute("DROP SCHEMA " + quoteIdent(name) + " CASCADE");
             case H2, H2_FILE -> execute("DROP SCHEMA IF EXISTS " + quoteIdent(name) + " CASCADE");
-            case MYSQL, SQLSERVER -> dropDatabase(name);
+            case MYSQL, MARIADB, SQLSERVER -> dropDatabase(name);
             case SQLITE -> throw new SQLException("SQLite does not support DROP SCHEMA");
         }
     }
@@ -1033,7 +1033,7 @@ public class DatabaseService {
     public void renameTable(String schema, String table, String newName) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
         String sql = switch (type) {
-            case MYSQL -> "RENAME TABLE " + qualify(schema, table) + " TO " + qualify(schema, newName);
+            case MYSQL, MARIADB -> "RENAME TABLE " + qualify(schema, table) + " TO " + qualify(schema, newName);
             case POSTGRESQL, H2, H2_FILE -> "ALTER TABLE " + qualify(schema, table) + " RENAME TO " + quoteIdent(newName);
             case SQLSERVER -> "EXEC sp_rename '" + schema + "." + table + "', '" + newName + "'";
             case SQLITE -> "ALTER TABLE " + quoteIdent(table) + " RENAME TO " + quoteIdent(newName);
@@ -1064,7 +1064,7 @@ public class DatabaseService {
             }
             verb = "CREATE VIEW ";
         }
-        if (type == DbType.MYSQL && replace) {
+        if (type.isMysqlFamily() && replace) {
             try {
                 dropView(schema, viewName);
             } catch (SQLException ignored) {
@@ -1123,7 +1123,7 @@ public class DatabaseService {
     public void dropIndex(String schema, String table, String indexName) throws SQLException {
         DbType type = connectionService.getProfile().getDbType();
         String sql = switch (type) {
-            case MYSQL -> "DROP INDEX " + quoteIdent(indexName) + " ON " + qualify(schema, table);
+            case MYSQL, MARIADB -> "DROP INDEX " + quoteIdent(indexName) + " ON " + qualify(schema, table);
             case SQLSERVER -> "DROP INDEX " + quoteIdent(indexName) + " ON " + qualify(schema, table);
             case SQLITE -> "DROP INDEX IF EXISTS " + quoteIdent(indexName);
             default -> "DROP INDEX " + quoteIdent(indexName);
@@ -1174,7 +1174,7 @@ public class DatabaseService {
                 }
                 if (c.autoIncrement()) {
                     sb.append(switch (type) {
-                        case MYSQL -> " AUTO_INCREMENT";
+                        case MYSQL, MARIADB -> " AUTO_INCREMENT";
                         case POSTGRESQL -> "";
                         case SQLITE -> ""; // handled above when PK; otherwise ignored
                         case H2, H2_FILE -> " GENERATED BY DEFAULT AS IDENTITY";
@@ -1200,7 +1200,7 @@ public class DatabaseService {
         Connection conn = connectionService.getConnection();
         try {
             return switch (type) {
-                case MYSQL -> {
+                case MYSQL, MARIADB -> {
                     try (ResultSet rs = conn.createStatement().executeQuery(
                             "SHOW CREATE TABLE " + qualify(schema, table))) {
                         if (rs.next()) {
@@ -1262,7 +1262,7 @@ public class DatabaseService {
     private String resolveCatalog(String schema) {
         DbType type = connectionService.getProfile().getDbType();
         return switch (type) {
-            case MYSQL, SQLSERVER -> schema;
+            case MYSQL, MARIADB, SQLSERVER -> schema;
             default -> null;
         };
     }
@@ -1281,7 +1281,7 @@ public class DatabaseService {
         if (schema == null || schema.isBlank() || type == DbType.SQLITE) {
             return quoteIdent(name);
         }
-        if (type == DbType.MYSQL || type == DbType.SQLSERVER) {
+        if (type.isMysqlFamily() || type == DbType.SQLSERVER) {
             return quoteIdent(schema) + "." + quoteIdent(name);
         }
         return quoteIdent(schema) + "." + quoteIdent(name);
@@ -1290,7 +1290,7 @@ public class DatabaseService {
     public String quoteIdent(String ident) {
         DbType type = connectionService.getProfile().getDbType();
         return switch (type) {
-            case MYSQL -> "`" + ident.replace("`", "``") + "`";
+            case MYSQL, MARIADB -> "`" + ident.replace("`", "``") + "`";
             case SQLSERVER -> "[" + ident.replace("]", "]]") + "]";
             default -> "\"" + ident.replace("\"", "\"\"") + "\"";
         };
