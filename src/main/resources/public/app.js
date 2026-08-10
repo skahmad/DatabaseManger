@@ -5050,13 +5050,22 @@ async function loadErdIntoActiveTab(tab) {
     const live = state.workspaceTabs.find((t) => t.id === tab.id);
     if (!live || live.id !== state.activeWorkspaceTabId) return;
     live.erd = data;
+    live.erdLogicalRelations = null;
     live.erdView = { ...(live.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
     const tableCount = (data.tables || []).length;
-    const relCount = (data.relations || []).length;
-    if (subtitle) {
-      subtitle.textContent = `${tableCount} table${tableCount === 1 ? "" : "s"} · ${relCount} relation${relCount === 1 ? "" : "s"}`;
+    const fkCount = (data.relations || []).length;
+    const logical = inferLogicalErdRelations(data.tables || [], data.relations || []);
+    live.erdLogicalRelations = logical;
+    // When no FK edges exist, default to showing inferred logical relationships.
+    if (live.erdShowLogical == null) {
+      live.erdShowLogical = fkCount === 0 && logical.length > 0;
     }
-    setStatus(`ERD · ${tab.schema}`);
+    const shown = getErdDisplayRelations(live).length;
+    if (subtitle) {
+      subtitle.textContent = erdRelationSubtitle(tableCount, fkCount, logical.length, live.erdShowLogical);
+    }
+    setStatus(`ERD · ${tab.schema}${shown ? ` · ${shown} link${shown === 1 ? "" : "s"}` : ""}`);
+    syncErdLogicalToggle(live);
     renderErdDiagram(data, live);
   } catch (err) {
     if (empty) {
@@ -5131,13 +5140,206 @@ function erdZoomBy(factor) {
 }
 
 /** Tables connected to `tableName` via FK (either direction), including itself. */
-function erdFocusNeighborhood(data, tableName) {
+function erdFocusNeighborhood(data, tableName, tab = null) {
   const related = new Set([tableName]);
-  for (const rel of data?.relations || []) {
+  const relations = tab ? getErdDisplayRelations(tab) : (data?.relations || []);
+  for (const rel of relations) {
     if (rel.fromTable === tableName && rel.toTable) related.add(rel.toTable);
     if (rel.toTable === tableName && rel.fromTable) related.add(rel.fromTable);
   }
   return related;
+}
+
+function erdRelationSubtitle(tableCount, fkCount, logicalCount, showLogical) {
+  const parts = [`${tableCount} table${tableCount === 1 ? "" : "s"}`];
+  parts.push(`${fkCount} FK`);
+  if (showLogical) {
+    parts.push(`${logicalCount} logical`);
+  } else if (fkCount === 0 && logicalCount > 0) {
+    parts.push(`${logicalCount} logical available`);
+  }
+  return parts.join(" · ");
+}
+
+function erdPluralVariants(stem) {
+  const s = String(stem || "").toLowerCase();
+  if (!s) return [];
+  const out = new Set([s]);
+  if (s.endsWith("ies") && s.length > 3) out.add(`${s.slice(0, -3)}y`);
+  if (s.endsWith("ses") || s.endsWith("xes") || s.endsWith("zes")
+    || s.endsWith("ches") || s.endsWith("shes")) {
+    out.add(s.slice(0, -2));
+  }
+  if (s.endsWith("s") && !s.endsWith("ss") && s.length > 1) out.add(s.slice(0, -1));
+  if (s.endsWith("y") && s.length > 1 && !/[aeiou]y$/i.test(s)) {
+    out.add(`${s.slice(0, -1)}ies`);
+  } else if (s.endsWith("s") || s.endsWith("x") || s.endsWith("z")
+    || s.endsWith("ch") || s.endsWith("sh")) {
+    out.add(`${s}es`);
+  } else {
+    out.add(`${s}s`);
+  }
+  return [...out];
+}
+
+function erdRefStemFromColumn(colName) {
+  const name = String(colName || "");
+  if (!name) return null;
+  const m = name.match(/^(.*?)[_]?id$/i) || name.match(/^(.*?)[_]?fk$/i);
+  if (!m || !m[1]) return null;
+  let stem = m[1].replace(/_+$/, "");
+  if (!stem) return null;
+  // camelCase FooId → Foo
+  if (/^[A-Z]/.test(name) && /Id$/.test(name)) {
+    stem = name.slice(0, -2);
+  }
+  return stem;
+}
+
+/**
+ * Infer logical relationships from naming (user_id → users.id) when no FK exists.
+ */
+function inferLogicalErdRelations(tables, fkRelations = []) {
+  const list = tables || [];
+  const byLower = new Map();
+  const pkByTable = new Map();
+  for (const t of list) {
+    const name = String(t.name || "");
+    if (!name) continue;
+    byLower.set(name.toLowerCase(), name);
+    const pks = (t.columns || []).filter((c) => c.primaryKey).map((c) => c.name);
+    pkByTable.set(name, pks);
+  }
+
+  const fkSeen = new Set();
+  for (const rel of fkRelations || []) {
+    const fromCols = (rel.fromColumns || []).join(",");
+    const toCols = (rel.toColumns || []).join(",");
+    fkSeen.add(`${rel.fromTable}\0${rel.toTable}\0${fromCols}\0${toCols}`);
+    fkSeen.add(`${rel.fromTable}\0${rel.toTable}\0${(rel.fromColumns || [])[0] || ""}`);
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  const resolveTarget = (stem) => {
+    for (const variant of erdPluralVariants(stem)) {
+      const hit = byLower.get(variant);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  const pickPk = (targetName, stem) => {
+    const pks = pkByTable.get(targetName) || [];
+    if (!pks.length) return null;
+    const lower = pks.map((p) => String(p).toLowerCase());
+    const stemL = String(stem).toLowerCase();
+    const prefer = ["id", `${stemL}_id`, `${stemL}id`, targetName.toLowerCase() + "_id"];
+    for (const p of prefer) {
+      const idx = lower.indexOf(p);
+      if (idx >= 0) return pks[idx];
+    }
+    if (pks.length === 1) return pks[0];
+    return pks[0];
+  };
+
+  for (const t of list) {
+    const fromTable = String(t.name || "");
+    for (const col of t.columns || []) {
+      if (col.primaryKey) continue;
+      const colName = String(col.name || "");
+      const stem = erdRefStemFromColumn(colName);
+      if (!stem) continue;
+      const toTable = resolveTarget(stem);
+      if (!toTable || toTable === fromTable) continue;
+      const toCol = pickPk(toTable, stem);
+      if (!toCol) continue;
+
+      const fkKey = `${fromTable}\0${toTable}\0${colName}`;
+      if (fkSeen.has(fkKey) || fkSeen.has(`${fromTable}\0${toTable}\0${colName}\0${toCol}`)) {
+        continue;
+      }
+      const key = `${fromTable}\0${toTable}\0${colName}\0${toCol}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        name: `${colName} → ${toTable}.${toCol}`,
+        fromTable,
+        toTable,
+        fromColumns: [colName],
+        toColumns: [toCol],
+        logical: true,
+      });
+    }
+  }
+
+  out.sort((a, b) => {
+    const t = String(a.fromTable).localeCompare(String(b.fromTable), undefined, { sensitivity: "base" });
+    if (t) return t;
+    return String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" });
+  });
+  return out;
+}
+
+function getErdDisplayRelations(tab) {
+  const fk = (tab?.erd?.relations || []).map((r) => ({ ...r, logical: !!r.logical }));
+  if (!tab?.erdShowLogical) return fk;
+  let logical = tab.erdLogicalRelations;
+  if (!logical) {
+    logical = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
+    tab.erdLogicalRelations = logical;
+  }
+  return [...fk, ...logical];
+}
+
+function syncErdLogicalToggle(tab) {
+  const chk = $("#chk-erd-logical");
+  const wrap = $("#erd-logical-toggle");
+  if (!chk) return;
+  const fkCount = (tab?.erd?.relations || []).length;
+  const logicalCount = (tab?.erdLogicalRelations
+    || inferLogicalErdRelations(tab?.erd?.tables || [], tab?.erd?.relations || [])).length;
+  if (tab?.kind === "erd") {
+    if (!tab.erdLogicalRelations) tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
+    chk.checked = !!tab.erdShowLogical;
+    chk.disabled = logicalCount === 0;
+  } else {
+    chk.checked = false;
+    chk.disabled = true;
+  }
+  if (wrap) {
+    wrap.classList.toggle("has-logical", logicalCount > 0);
+    wrap.classList.toggle("no-fk", fkCount === 0 && logicalCount > 0);
+    wrap.title = logicalCount === 0
+      ? "No logical relationships inferred from column names"
+      : "Show relationships inferred from column names (e.g. user_id → users.id)";
+  }
+}
+
+function setErdShowLogical(enabled) {
+  const tab = activeWorkspaceTab();
+  if (!tab || tab.kind !== "erd") return;
+  tab.erdShowLogical = !!enabled;
+  const data = tab.erd;
+  if (!data) return;
+  const keepView = tab.erdView ? { ...tab.erdView, _needsFit: false } : null;
+  if (keepView) tab.erdView = keepView;
+  renderErdDiagram(data, tab);
+  const fkCount = (data.relations || []).length;
+  const logicalCount = (tab.erdLogicalRelations || []).length;
+  const subtitle = $("#erd-subtitle");
+  if (subtitle && !tab.erdFocusTable) {
+    subtitle.textContent = erdRelationSubtitle(
+      (data.tables || []).length,
+      fkCount,
+      logicalCount,
+      tab.erdShowLogical,
+    );
+  }
+  setStatus(tab.erdShowLogical
+    ? `ERD · logical relationships on (${logicalCount})`
+    : "ERD · logical relationships off");
 }
 
 function updateErdFocusButton(tab) {
@@ -5163,13 +5365,14 @@ function setErdFocus(tab, tableName) {
   applyErdSearchStyles(tab);
   const subtitle = $("#erd-subtitle");
   const tables = tab.erd?.tables || [];
-  const relations = tab.erd?.relations || [];
   if (subtitle) {
     if (tab.erdFocusTable) {
-      const n = erdFocusNeighborhood(tab.erd, tab.erdFocusTable).size;
+      const n = erdFocusNeighborhood(tab.erd, tab.erdFocusTable, tab).size;
       subtitle.textContent = `Focus · ${tab.erdFocusTable} · ${n} related table${n === 1 ? "" : "s"}`;
     } else {
-      subtitle.textContent = `${tables.length} table${tables.length === 1 ? "" : "s"} · ${relations.length} relation${relations.length === 1 ? "" : "s"}`;
+      const fkCount = (tab.erd?.relations || []).length;
+      const logicalCount = (tab.erdLogicalRelations || []).length;
+      subtitle.textContent = erdRelationSubtitle(tables.length, fkCount, logicalCount, !!tab.erdShowLogical);
     }
   }
   if (tab.erdFocusTable) {
@@ -5189,9 +5392,10 @@ function clearErdFocus(tab = activeWorkspaceTab()) {
   updateErdFocusButton(tab);
   const subtitle = $("#erd-subtitle");
   const tables = tab.erd?.tables || [];
-  const relations = tab.erd?.relations || [];
+  const fkCount = (tab.erd?.relations || []).length;
+  const logicalCount = (tab.erdLogicalRelations || []).length;
   if (subtitle) {
-    subtitle.textContent = `${tables.length} table${tables.length === 1 ? "" : "s"} · ${relations.length} relation${relations.length === 1 ? "" : "s"}`;
+    subtitle.textContent = erdRelationSubtitle(tables.length, fkCount, logicalCount, !!tab.erdShowLogical);
   }
 }
 
@@ -5201,7 +5405,7 @@ function applyErdFocusStyles(tab) {
   if (!root) return;
   const focus = tab?.erdFocusTable || null;
   root.classList.toggle("erd-focus-mode", !!focus);
-  const related = focus ? erdFocusNeighborhood(tab.erd, focus) : null;
+  const related = focus ? erdFocusNeighborhood(tab.erd, focus, tab) : null;
 
   root.querySelectorAll(".erd-table").forEach((g) => {
     const name = g.dataset.table;
@@ -5458,12 +5662,22 @@ function renderErdDiagram(data, tab) {
   const tables = [...(data?.tables || [])].sort((a, b) =>
     String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" }),
   );
-  const relations = data?.relations || [];
+  if (!tab.erdLogicalRelations) {
+    tab.erdLogicalRelations = inferLogicalErdRelations(tables, data?.relations || []);
+  }
+  const fkRelations = data?.relations || [];
+  const relations = getErdDisplayRelations(tab);
 
   if (title) title.textContent = tab.schema || data?.schema || "ER Diagram";
-  if (subtitle) {
-    subtitle.textContent = `${tables.length} table${tables.length === 1 ? "" : "s"} · ${relations.length} relation${relations.length === 1 ? "" : "s"}`;
+  if (subtitle && !tab.erdFocusTable) {
+    subtitle.textContent = erdRelationSubtitle(
+      tables.length,
+      fkRelations.length,
+      (tab.erdLogicalRelations || []).length,
+      !!tab.erdShowLogical,
+    );
   }
+  syncErdLogicalToggle(tab);
 
   setErdCanvasEmpty();
   if (!tables.length) {
@@ -5652,8 +5866,10 @@ function renderErdDiagram(data, tab) {
     const path = document.createElementNS(NS, "path");
     path.setAttribute("d", `M ${x1} ${y1} C ${c1x} ${y1}, ${c2x} ${y2}, ${x2} ${y2}`);
     path.classList.add("erd-edge");
+    if (rel.logical) path.classList.add("erd-edge-logical");
     path.dataset.from = rel.fromTable || "";
     path.dataset.to = rel.toTable || "";
+    path.dataset.logical = rel.logical ? "1" : "0";
     path.setAttribute("marker-end", "url(#erd-arrow)");
     edges.appendChild(path);
 
@@ -5665,10 +5881,11 @@ function renderErdDiagram(data, tab) {
       label.setAttribute("y", String(my));
       label.setAttribute("text-anchor", "middle");
       label.classList.add("erd-edge-label");
+      if (rel.logical) label.classList.add("erd-edge-logical");
       label.dataset.from = rel.fromTable || "";
       label.dataset.to = rel.toTable || "";
-      const nm = String(rel.name);
-      label.textContent = nm.length > 22 ? `${nm.slice(0, 21)}…` : nm;
+      const nm = rel.logical ? `~ ${rel.name}` : String(rel.name);
+      label.textContent = nm.length > 24 ? `${nm.slice(0, 23)}…` : nm;
       edges.appendChild(label);
     }
   });
@@ -5697,7 +5914,7 @@ function renderErdDiagram(data, tab) {
   if (tab.erdFocusTable) {
     const subtitleEl = $("#erd-subtitle");
     if (subtitleEl && !(tab.erdSearchQuery || "").trim()) {
-      const n = erdFocusNeighborhood(data, tab.erdFocusTable).size;
+      const n = erdFocusNeighborhood(data, tab.erdFocusTable, tab).size;
       subtitleEl.textContent = `Focus · ${tab.erdFocusTable} · ${n} related table${n === 1 ? "" : "s"}`;
     }
   }
@@ -7644,6 +7861,9 @@ function wire() {
   $("#btn-erd-fit")?.addEventListener("click", () => {
     const tab = activeWorkspaceTab();
     if (tab?.kind === "erd") fitErdToViewport(tab);
+  });
+  $("#chk-erd-logical")?.addEventListener("change", (e) => {
+    setErdShowLogical(!!e.target.checked);
   });
   $("#btn-erd-clear-focus")?.addEventListener("click", () => {
     clearErdFocus(activeWorkspaceTab());
