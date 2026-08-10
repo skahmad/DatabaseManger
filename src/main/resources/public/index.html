@@ -114,6 +114,13 @@
             <button type="button" class="explorer-entity-option" role="option" data-entity="func"><span class="badge db">FN</span> Function</button>
           </div>
         </div>
+        <div id="explorer-search-scope" class="explorer-search-scope" hidden>
+          <span class="explorer-scope-chip" title="Search is limited to this database">
+            <span class="badge db">DB</span>
+            <span id="explorer-scope-label" class="explorer-scope-label"></span>
+            <button type="button" class="explorer-scope-clear" id="btn-clear-explorer-scope" title="Search all databases" aria-label="Clear database scope">×</button>
+          </span>
+        </div>
         <div id="explorer-search-status" class="explorer-search-status" hidden></div>
       </div>
       <div id="conn-tree" class="conn-tree"></div>
@@ -342,6 +349,8 @@
                 <span>Logical</span>
               </label>
               <button type="button" class="btn ghost sm" id="btn-erd-clear-focus" title="Clear focus mode" disabled>Clear focus</button>
+              <button type="button" class="btn ghost sm" id="btn-erd-clear-highlights" title="Clear highlighted tables" disabled>Clear highlights</button>
+              <button type="button" class="btn ghost sm" id="btn-erd-restore" title="Restore removed tables" disabled>Restore</button>
               <button type="button" class="btn ghost sm" id="btn-erd-refresh" title="Refresh ERD">Refresh</button>
             </div>
           </div>
@@ -490,6 +499,15 @@
     <button type="button" class="ctx-item" data-action="ws-unpin" role="menuitem">Unpin tab</button>
     <hr class="ctx-sep" />
     <button type="button" class="ctx-item danger" data-action="ws-close" role="menuitem">Close</button>
+  </div>
+
+  <!-- Context menu: ERD table -->
+  <div id="ctx-menu-erd" class="ctx-menu" hidden role="menu">
+    <button type="button" class="ctx-item" data-action="erd-highlight" role="menuitem">Highlight</button>
+    <button type="button" class="ctx-item" data-action="erd-focus" role="menuitem">Focus</button>
+    <button type="button" class="ctx-item" data-action="erd-open" role="menuitem">Open table</button>
+    <hr class="ctx-sep" />
+    <button type="button" class="ctx-item danger" data-action="erd-delete" role="menuitem">Remove from diagram</button>
   </div>
 
   <!-- Modal: database properties -->

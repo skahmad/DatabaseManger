@@ -16,9 +16,11 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -841,6 +843,8 @@ public class DatabaseService {
 
     /**
      * Build an ERD payload for a database/schema: tables with columns + FK relations.
+     * Uses bulk catalog queries where possible so large remote schemas (hundreds of tables)
+     * do not pay one JDBC round-trip per table.
      */
     public Map<String, Object> getErd(String schema) throws SQLException {
         if (schema == null || schema.isBlank()) {
@@ -848,67 +852,113 @@ public class DatabaseService {
         }
         List<String> tableNames = listTables(schema);
         Collections.sort(tableNames);
+        Set<String> tableSet = new LinkedHashSet<>(tableNames);
+
+        DbType type = connectionService.getProfile().getDbType();
+        Map<String, List<Map<String, Object>>> columnsByTable;
+        List<Map<String, Object>> relations;
+
+        if (type.isMysqlFamily()) {
+            columnsByTable = loadErdColumnsMySql(schema, tableSet);
+            relations = loadErdRelationsMySql(schema, tableSet);
+        } else if (type == DbType.POSTGRESQL) {
+            columnsByTable = loadErdColumnsPostgres(schema, tableSet);
+            relations = loadErdRelationsPostgres(schema, tableSet);
+        } else {
+            columnsByTable = loadErdColumnsJdbc(schema, tableSet);
+            relations = listForeignKeyRelations(schema, tableNames);
+        }
 
         List<Map<String, Object>> tables = new ArrayList<>();
         for (String table : tableNames) {
             Map<String, Object> t = new LinkedHashMap<>();
             t.put("name", table);
-            List<Map<String, Object>> cols = new ArrayList<>();
-            for (ColumnInfo c : getColumns(schema, table)) {
-                Map<String, Object> col = new LinkedHashMap<>();
-                col.put("name", c.getName());
-                col.put("type", c.getDisplayType());
-                col.put("primaryKey", c.isPrimaryKey());
-                col.put("nullable", c.isNullable());
-                cols.add(col);
-            }
-            t.put("columns", cols);
+            t.put("columns", columnsByTable.getOrDefault(table, List.of()));
             tables.add(t);
         }
-
-        List<Map<String, Object>> relations = listForeignKeyRelations(schema, tableNames);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("schema", schema);
         out.put("tables", tables);
         out.put("relations", relations);
+        out.put("tableCount", tables.size());
+        out.put("relationCount", relations.size());
         return out;
     }
 
-    private List<Map<String, Object>> listForeignKeyRelations(String schema, List<String> tableNames)
+    private Map<String, List<Map<String, Object>>> loadErdColumnsMySql(String schema, Set<String> tableSet)
             throws SQLException {
         Connection conn = connectionService.getConnection();
-        DatabaseMetaData meta = conn.getMetaData();
-        String catalog = resolveCatalog(schema);
-        String schemaPattern = resolveSchemaPattern(schema);
-        Set<String> tableSet = new LinkedHashSet<>(tableNames);
-        // Group composite FK columns by FK name + tables.
-        Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
-
-        for (String table : tableNames) {
-            try (ResultSet rs = meta.getImportedKeys(catalog, schemaPattern, table)) {
+        Map<String, Set<String>> pkByTable = new HashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
+                        + "WHERE TABLE_SCHEMA = ? AND CONSTRAINT_NAME = 'PRIMARY'")) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String fkTable = rs.getString("FKTABLE_NAME");
-                    String pkTable = rs.getString("PKTABLE_NAME");
-                    String fkCol = rs.getString("FKCOLUMN_NAME");
-                    String pkCol = rs.getString("PKCOLUMN_NAME");
-                    if (fkTable == null || pkTable == null || fkCol == null || pkCol == null) {
-                        continue;
+                    String table = rs.getString(1);
+                    if (!tableSet.contains(table)) continue;
+                    pkByTable.computeIfAbsent(table, k -> new LinkedHashSet<>()).add(rs.getString(2));
+                }
+            }
+        }
+
+        Map<String, List<Map<String, Object>>> byTable = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, EXTRA "
+                        + "FROM information_schema.COLUMNS "
+                        + "WHERE TABLE_SCHEMA = ? "
+                        + "ORDER BY TABLE_NAME, ORDINAL_POSITION")) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String table = rs.getString(1);
+                    if (!tableSet.contains(table)) continue;
+                    String name = rs.getString(2);
+                    String colType = rs.getString(3);
+                    boolean nullable = !"NO".equalsIgnoreCase(rs.getString(4));
+                    String extra = rs.getString(5);
+                    boolean pk = pkByTable.getOrDefault(table, Set.of()).contains(name);
+                    Map<String, Object> col = new LinkedHashMap<>();
+                    col.put("name", name);
+                    col.put("type", colType != null ? colType : "");
+                    col.put("primaryKey", pk);
+                    col.put("nullable", nullable);
+                    if (extra != null && extra.toLowerCase(Locale.ROOT).contains("auto_increment")) {
+                        col.put("autoIncrement", true);
                     }
-                    // Keep edges within this schema's table set when possible.
-                    if (!tableSet.isEmpty() && (!tableSet.contains(fkTable) || !tableSet.contains(pkTable))) {
-                        continue;
-                    }
-                    String fkName = rs.getString("FK_NAME");
+                    byTable.computeIfAbsent(table, k -> new ArrayList<>()).add(col);
+                }
+            }
+        }
+        return byTable;
+    }
+
+    private List<Map<String, Object>> loadErdRelationsMySql(String schema, Set<String> tableSet)
+            throws SQLException {
+        Connection conn = connectionService.getConnection();
+        Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, "
+                        + "REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, ORDINAL_POSITION "
+                        + "FROM information_schema.KEY_COLUMN_USAGE "
+                        + "WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL "
+                        + "ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION")) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String fkName = rs.getString(1);
+                    String fkTable = rs.getString(2);
+                    String fkCol = rs.getString(3);
+                    String pkTable = rs.getString(4);
+                    String pkCol = rs.getString(5);
+                    int seq = rs.getInt(6);
+                    if (fkTable == null || pkTable == null || fkCol == null || pkCol == null) continue;
+                    if (!tableSet.contains(fkTable) || !tableSet.contains(pkTable)) continue;
                     if (fkName == null || fkName.isBlank()) {
                         fkName = fkTable + "_to_" + pkTable;
                     }
-                    int seq = 1;
-                    try {
-                        seq = rs.getInt("KEY_SEQ");
-                        if (rs.wasNull()) seq = 1;
-                    } catch (SQLException ignored) {
-                    }
+                    if (seq < 1) seq = 1;
                     String key = fkName + "\0" + fkTable + "\0" + pkTable;
                     Map<String, Object> rel = grouped.get(key);
                     if (rel == null) {
@@ -924,17 +974,238 @@ public class DatabaseService {
                     List<String> fromCols = (List<String>) rel.get("fromColumns");
                     @SuppressWarnings("unchecked")
                     List<String> toCols = (List<String>) rel.get("toColumns");
-                    // KEY_SEQ is 1-based; ensure order
                     while (fromCols.size() < seq) fromCols.add(null);
                     while (toCols.size() < seq) toCols.add(null);
                     fromCols.set(seq - 1, fkCol);
                     toCols.set(seq - 1, pkCol);
                 }
-            } catch (SQLException ignored) {
-                // Some engines/drivers lack FK metadata for this table.
+            }
+        }
+        return finalizeErdRelations(grouped);
+    }
+
+    private Map<String, List<Map<String, Object>>> loadErdColumnsPostgres(String schema, Set<String> tableSet)
+            throws SQLException {
+        Connection conn = connectionService.getConnection();
+        String schemaName = (schema == null || schema.isBlank()) ? "public" : schema;
+
+        Map<String, Set<String>> pkByTable = new HashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT kcu.table_name, kcu.column_name "
+                        + "FROM information_schema.table_constraints tc "
+                        + "JOIN information_schema.key_column_usage kcu "
+                        + "  ON tc.constraint_name = kcu.constraint_name "
+                        + " AND tc.table_schema = kcu.table_schema "
+                        + "WHERE tc.table_schema = ? AND tc.constraint_type = 'PRIMARY KEY'")) {
+            ps.setString(1, schemaName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String table = rs.getString(1);
+                    if (!tableSet.contains(table)) continue;
+                    pkByTable.computeIfAbsent(table, k -> new LinkedHashSet<>()).add(rs.getString(2));
+                }
             }
         }
 
+        Map<String, List<Map<String, Object>>> byTable = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT table_name, column_name, data_type, udt_name, "
+                        + "character_maximum_length, numeric_precision, numeric_scale, is_nullable "
+                        + "FROM information_schema.columns "
+                        + "WHERE table_schema = ? "
+                        + "ORDER BY table_name, ordinal_position")) {
+            ps.setString(1, schemaName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String table = rs.getString(1);
+                    if (!tableSet.contains(table)) continue;
+                    String name = rs.getString(2);
+                    String dataType = rs.getString(3);
+                    String udt = rs.getString(4);
+                    Integer charLen = (Integer) rs.getObject(5);
+                    Integer numPrec = (Integer) rs.getObject(6);
+                    Integer numScale = (Integer) rs.getObject(7);
+                    boolean nullable = !"NO".equalsIgnoreCase(rs.getString(8));
+                    String type = formatPostgresType(dataType, udt, charLen, numPrec, numScale);
+                    boolean pk = pkByTable.getOrDefault(table, Set.of()).contains(name);
+                    Map<String, Object> col = new LinkedHashMap<>();
+                    col.put("name", name);
+                    col.put("type", type);
+                    col.put("primaryKey", pk);
+                    col.put("nullable", nullable);
+                    byTable.computeIfAbsent(table, k -> new ArrayList<>()).add(col);
+                }
+            }
+        }
+        return byTable;
+    }
+
+    private static String formatPostgresType(String dataType, String udt, Integer charLen,
+                                             Integer numPrec, Integer numScale) {
+        String base = (udt != null && !udt.isBlank()) ? udt : (dataType != null ? dataType : "");
+        if ("varchar".equalsIgnoreCase(dataType) || "character varying".equalsIgnoreCase(dataType)) {
+            return charLen != null ? "varchar(" + charLen + ")" : "varchar";
+        }
+        if ("character".equalsIgnoreCase(dataType) || "char".equalsIgnoreCase(dataType)) {
+            return charLen != null ? "char(" + charLen + ")" : "char";
+        }
+        if ("numeric".equalsIgnoreCase(dataType) || "decimal".equalsIgnoreCase(dataType)) {
+            if (numPrec != null && numScale != null) return "numeric(" + numPrec + "," + numScale + ")";
+            if (numPrec != null) return "numeric(" + numPrec + ")";
+            return "numeric";
+        }
+        return base;
+    }
+
+    private List<Map<String, Object>> loadErdRelationsPostgres(String schema, Set<String> tableSet)
+            throws SQLException {
+        Connection conn = connectionService.getConnection();
+        String schemaName = (schema == null || schema.isBlank()) ? "public" : schema;
+        Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT tc.constraint_name, kcu.table_name, kcu.column_name, "
+                        + "ccu.table_name AS foreign_table_name, ccu.column_name AS foreign_column_name, "
+                        + "kcu.ordinal_position "
+                        + "FROM information_schema.table_constraints AS tc "
+                        + "JOIN information_schema.key_column_usage AS kcu "
+                        + "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+                        + "JOIN information_schema.constraint_column_usage AS ccu "
+                        + "  ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema "
+                        + "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = ? "
+                        + "ORDER BY tc.constraint_name, kcu.ordinal_position")) {
+            ps.setString(1, schemaName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String fkName = rs.getString(1);
+                    String fkTable = rs.getString(2);
+                    String fkCol = rs.getString(3);
+                    String pkTable = rs.getString(4);
+                    String pkCol = rs.getString(5);
+                    int seq = rs.getInt(6);
+                    if (fkTable == null || pkTable == null || fkCol == null || pkCol == null) continue;
+                    if (!tableSet.contains(fkTable) || !tableSet.contains(pkTable)) continue;
+                    if (fkName == null || fkName.isBlank()) {
+                        fkName = fkTable + "_to_" + pkTable;
+                    }
+                    if (seq < 1) seq = 1;
+                    String key = fkName + "\0" + fkTable + "\0" + pkTable;
+                    Map<String, Object> rel = grouped.get(key);
+                    if (rel == null) {
+                        rel = new LinkedHashMap<>();
+                        rel.put("name", fkName);
+                        rel.put("fromTable", fkTable);
+                        rel.put("toTable", pkTable);
+                        rel.put("fromColumns", new ArrayList<String>());
+                        rel.put("toColumns", new ArrayList<String>());
+                        grouped.put(key, rel);
+                    }
+                    @SuppressWarnings("unchecked")
+                    List<String> fromCols = (List<String>) rel.get("fromColumns");
+                    @SuppressWarnings("unchecked")
+                    List<String> toCols = (List<String>) rel.get("toColumns");
+                    while (fromCols.size() < seq) fromCols.add(null);
+                    while (toCols.size() < seq) toCols.add(null);
+                    fromCols.set(seq - 1, fkCol);
+                    toCols.set(seq - 1, pkCol);
+                }
+            }
+        }
+        return finalizeErdRelations(grouped);
+    }
+
+    /** Bulk JDBC metadata: one getColumns + one getPrimaryKeys for the schema when drivers allow. */
+    private Map<String, List<Map<String, Object>>> loadErdColumnsJdbc(String schema, Set<String> tableSet)
+            throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DatabaseMetaData meta = conn.getMetaData();
+        String catalog = resolveCatalog(schema);
+        String schemaPattern = resolveSchemaPattern(schema);
+
+        Map<String, Set<String>> pkByTable = new HashMap<>();
+        // Prefer schema-wide PK fetch; fall back to per-table if unsupported.
+        boolean bulkPkOk = false;
+        try (ResultSet pk = meta.getPrimaryKeys(catalog, schemaPattern, null)) {
+            bulkPkOk = true;
+            while (pk.next()) {
+                String table = pk.getString("TABLE_NAME");
+                if (table == null || !tableSet.contains(table)) continue;
+                pkByTable.computeIfAbsent(table, k -> new LinkedHashSet<>()).add(pk.getString("COLUMN_NAME"));
+            }
+        } catch (SQLException ignored) {
+            bulkPkOk = false;
+        }
+        if (!bulkPkOk) {
+            try (ResultSet pk = meta.getPrimaryKeys(catalog, schemaPattern, "%")) {
+                bulkPkOk = true;
+                while (pk.next()) {
+                    String table = pk.getString("TABLE_NAME");
+                    if (table == null || !tableSet.contains(table)) continue;
+                    pkByTable.computeIfAbsent(table, k -> new LinkedHashSet<>()).add(pk.getString("COLUMN_NAME"));
+                }
+            } catch (SQLException ignored) {
+                bulkPkOk = false;
+            }
+        }
+        if (!bulkPkOk) {
+            for (String table : tableSet) {
+                try (ResultSet pk = meta.getPrimaryKeys(catalog, schemaPattern, table)) {
+                    while (pk.next()) {
+                        pkByTable.computeIfAbsent(table, k -> new LinkedHashSet<>())
+                                .add(pk.getString("COLUMN_NAME"));
+                    }
+                } catch (SQLException ignored) {
+                }
+            }
+        }
+
+        Map<String, List<Map<String, Object>>> byTable = new LinkedHashMap<>();
+        boolean bulkColsOk = false;
+        try (ResultSet rs = meta.getColumns(catalog, schemaPattern, "%", "%")) {
+            bulkColsOk = true;
+            while (rs.next()) {
+                String table = rs.getString("TABLE_NAME");
+                if (table == null || !tableSet.contains(table)) continue;
+                appendErdJdbcColumn(byTable, pkByTable, table, rs);
+            }
+        } catch (SQLException ignored) {
+            bulkColsOk = false;
+        }
+        if (!bulkColsOk) {
+            for (String table : tableSet) {
+                try (ResultSet rs = meta.getColumns(catalog, schemaPattern, table, "%")) {
+                    while (rs.next()) {
+                        appendErdJdbcColumn(byTable, pkByTable, table, rs);
+                    }
+                } catch (SQLException ignored) {
+                }
+            }
+        }
+        return byTable;
+    }
+
+    private void appendErdJdbcColumn(Map<String, List<Map<String, Object>>> byTable,
+                                     Map<String, Set<String>> pkByTable,
+                                     String table,
+                                     ResultSet rs) throws SQLException {
+        String name = rs.getString("COLUMN_NAME");
+        String typeName = rs.getString("TYPE_NAME");
+        int size = rs.getInt("COLUMN_SIZE");
+        boolean nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
+        String display = typeName == null ? "" : typeName;
+        if (size > 0 && typeName != null
+                && (typeName.toUpperCase(Locale.ROOT).contains("CHAR")
+                || typeName.toUpperCase(Locale.ROOT).contains("BINARY"))) {
+            display = typeName + "(" + size + ")";
+        }
+        Map<String, Object> col = new LinkedHashMap<>();
+        col.put("name", name);
+        col.put("type", display);
+        col.put("primaryKey", pkByTable.getOrDefault(table, Set.of()).contains(name));
+        col.put("nullable", nullable);
+        byTable.computeIfAbsent(table, k -> new ArrayList<>()).add(col);
+    }
+
+    private List<Map<String, Object>> finalizeErdRelations(Map<String, Map<String, Object>> grouped) {
         List<Map<String, Object>> relations = new ArrayList<>();
         for (Map<String, Object> rel : grouped.values()) {
             @SuppressWarnings("unchecked")
@@ -947,6 +1218,88 @@ public class DatabaseService {
             relations.add(rel);
         }
         return relations;
+    }
+
+    private List<Map<String, Object>> listForeignKeyRelations(String schema, List<String> tableNames)
+            throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DatabaseMetaData meta = conn.getMetaData();
+        String catalog = resolveCatalog(schema);
+        String schemaPattern = resolveSchemaPattern(schema);
+        Set<String> tableSet = new LinkedHashSet<>(tableNames);
+        Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
+
+        // Try one schema-wide imported-keys call first (supported by some drivers).
+        boolean bulkOk = false;
+        try (ResultSet rs = meta.getImportedKeys(catalog, schemaPattern, null)) {
+            bulkOk = true;
+            collectImportedKeyRows(rs, tableSet, grouped);
+        } catch (SQLException ignored) {
+            bulkOk = false;
+        }
+        if (!bulkOk) {
+            try (ResultSet rs = meta.getImportedKeys(catalog, schemaPattern, "%")) {
+                bulkOk = true;
+                collectImportedKeyRows(rs, tableSet, grouped);
+            } catch (SQLException ignored) {
+                bulkOk = false;
+            }
+        }
+        if (!bulkOk) {
+            for (String table : tableNames) {
+                try (ResultSet rs = meta.getImportedKeys(catalog, schemaPattern, table)) {
+                    collectImportedKeyRows(rs, tableSet, grouped);
+                } catch (SQLException ignored) {
+                    // Some engines/drivers lack FK metadata for this table.
+                }
+            }
+        }
+        return finalizeErdRelations(grouped);
+    }
+
+    private void collectImportedKeyRows(ResultSet rs, Set<String> tableSet,
+                                        Map<String, Map<String, Object>> grouped) throws SQLException {
+        while (rs.next()) {
+            String fkTable = rs.getString("FKTABLE_NAME");
+            String pkTable = rs.getString("PKTABLE_NAME");
+            String fkCol = rs.getString("FKCOLUMN_NAME");
+            String pkCol = rs.getString("PKCOLUMN_NAME");
+            if (fkTable == null || pkTable == null || fkCol == null || pkCol == null) {
+                continue;
+            }
+            if (!tableSet.isEmpty() && (!tableSet.contains(fkTable) || !tableSet.contains(pkTable))) {
+                continue;
+            }
+            String fkName = rs.getString("FK_NAME");
+            if (fkName == null || fkName.isBlank()) {
+                fkName = fkTable + "_to_" + pkTable;
+            }
+            int seq = 1;
+            try {
+                seq = rs.getInt("KEY_SEQ");
+                if (rs.wasNull()) seq = 1;
+            } catch (SQLException ignored) {
+            }
+            String key = fkName + "\0" + fkTable + "\0" + pkTable;
+            Map<String, Object> rel = grouped.get(key);
+            if (rel == null) {
+                rel = new LinkedHashMap<>();
+                rel.put("name", fkName);
+                rel.put("fromTable", fkTable);
+                rel.put("toTable", pkTable);
+                rel.put("fromColumns", new ArrayList<String>());
+                rel.put("toColumns", new ArrayList<String>());
+                grouped.put(key, rel);
+            }
+            @SuppressWarnings("unchecked")
+            List<String> fromCols = (List<String>) rel.get("fromColumns");
+            @SuppressWarnings("unchecked")
+            List<String> toCols = (List<String>) rel.get("toColumns");
+            while (fromCols.size() < seq) fromCols.add(null);
+            while (toCols.size() < seq) toCols.add(null);
+            fromCols.set(seq - 1, fkCol);
+            toCols.set(seq - 1, pkCol);
+        }
     }
 
     public QueryResult previewTable(String schema, String table, int limit) throws SQLException {

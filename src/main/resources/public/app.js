@@ -50,6 +50,11 @@ const state = {
     revealedConnIds: {},
     /** Connection ids the user collapsed while a search is active. */
     userCollapsedConnIds: {},
+    /**
+     * Optional database scope for search:
+     * { connectionId, database } — null means search all DBs/connections.
+     */
+    scope: null,
   },
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
@@ -365,7 +370,15 @@ function wireExplorerSearch() {
     closeExplorerEntityMenu();
   });
 
+  $("#btn-clear-explorer-scope")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearExplorerSearchScope({ refresh: true });
+    input.focus();
+  });
+
   setExplorerSearchEntity(state.explorerSearch.entity || "db", { refresh: false });
+  syncExplorerSearchScopeUi();
 }
 
 function wirePrefs() {
@@ -458,6 +471,75 @@ function explorerSearchEntity() {
   return EXPLORER_SEARCH_ENTITIES.includes(entity) ? entity : "db";
 }
 
+function explorerSearchScope() {
+  const scope = state.explorerSearch?.scope;
+  if (!scope?.connectionId || !scope?.database) return null;
+  return scope;
+}
+
+function explorerSearchScopeKey() {
+  const scope = explorerSearchScope();
+  return scope ? `${scope.connectionId}\0${scope.database}` : "";
+}
+
+function syncExplorerSearchScopeUi() {
+  const bar = $("#explorer-search-scope");
+  const label = $("#explorer-scope-label");
+  const scope = explorerSearchScope();
+  if (!bar) return;
+  if (!scope) {
+    bar.hidden = true;
+    if (label) label.textContent = "";
+    return;
+  }
+  const conn = connectionLabel(scope.connectionId);
+  bar.hidden = false;
+  if (label) label.textContent = `${conn} · ${scope.database}`;
+}
+
+function setExplorerSearchScope({ connectionId, database } = {}, { refresh = true } = {}) {
+  if (!connectionId || !database) {
+    clearExplorerSearchScope({ refresh });
+    return;
+  }
+  const prev = explorerSearchScopeKey();
+  state.explorerSearch.scope = { connectionId, database };
+  syncExplorerSearchScopeUi();
+  if (prev !== explorerSearchScopeKey()) {
+    state.explorerSearch.revealedConnIds = {};
+    state.explorerSearch.userCollapsedConnIds = {};
+  }
+  if (refresh) refreshExplorerSearch();
+}
+
+function clearExplorerSearchScope({ refresh = true } = {}) {
+  const had = !!explorerSearchScope();
+  state.explorerSearch.scope = null;
+  syncExplorerSearchScopeUi();
+  if (had) {
+    state.explorerSearch.revealedConnIds = {};
+    state.explorerSearch.userCollapsedConnIds = {};
+  }
+  if (refresh && (had || explorerSearchQuery())) refreshExplorerSearch();
+}
+
+/** Schema/object keys that belong to the selected database scope. */
+function schemasForExplorerScope(connectionId, database) {
+  if (!connectionId || !database) return [];
+  const entry = state.explorerCache[connectionId];
+  const nodes = entry?.explorer?.nodes || [];
+  const layout = entry?.explorer?.layout || "";
+  const dbNode = nodes.find((n) =>
+    (n.kind || "database") === "database" && (n.name || "") === database);
+  if (dbNode && layout === "database-schemas" && Array.isArray(dbNode.children)) {
+    return dbNode.children
+      .map((c) => c.schema || c.name)
+      .filter(Boolean);
+  }
+  // MySQL-style / fallback: database name is the schema key for objects.
+  return [dbNode?.schema || dbNode?.name || database];
+}
+
 function closeExplorerEntityMenu() {
   const menu = $("#explorer-entity-menu");
   const chip = $("#explorer-entity-chip");
@@ -510,7 +592,7 @@ function connectionLabel(connectionId) {
 }
 
 function pushObjectSearchMatches(out, {
-  entity, connectionId, connName, schema, names, kind, badge, badgeClass, query,
+  entity, connectionId, connName, schema, database, names, kind, badge, badgeClass, query,
 }) {
   for (const name of names || []) {
     if (!String(name).toLowerCase().includes(query)) continue;
@@ -519,9 +601,11 @@ function pushObjectSearchMatches(out, {
       connectionId,
       name,
       schema,
-      database: schema,
+      database: database || schema,
       kind,
-      path: `${connName} · ${schema}`,
+      path: database && database !== schema
+        ? `${connName} · ${database} · ${schema}`
+        : `${connName} · ${schema}`,
       badge,
       badgeClass,
     });
@@ -533,10 +617,14 @@ function collectExplorerSearchMatches(query, entity) {
   const q = (query || "").trim().toLowerCase();
   if (!q) return [];
   const out = [];
+  const scope = explorerSearchScope();
   const liveIds = Object.keys(state.connectedIds || {}).filter((id) => state.connectedIds[id]);
-  const ids = liveIds.length
+  let ids = liveIds.length
     ? liveIds
     : Object.keys(state.explorerCache || {});
+  if (scope?.connectionId) {
+    ids = ids.filter((id) => id === scope.connectionId);
+  }
   const meta = EXPLORER_SEARCH_META[entity] || EXPLORER_SEARCH_META.db;
 
   for (const connectionId of ids) {
@@ -545,12 +633,16 @@ function collectExplorerSearchMatches(query, entity) {
     const connName = connectionLabel(connectionId);
     const nodes = entry.explorer?.nodes || [];
     const layout = entry.explorer?.layout || "";
+    const scopeSchemas = scope?.connectionId === connectionId
+      ? new Set(schemasForExplorerScope(connectionId, scope.database))
+      : null;
 
     if (entity === "db") {
       if (!entry.explorer) continue;
       for (const node of nodes) {
         if ((node.kind || "database") !== "database") continue;
         const name = node.name || "";
+        if (scope && name !== scope.database) continue;
         if (!name.toLowerCase().includes(q)) continue;
         out.push({
           entity: "db",
@@ -569,6 +661,7 @@ function collectExplorerSearchMatches(query, entity) {
         const kind = node.kind || "database";
         if (kind === "schema") {
           const name = node.name || "";
+          if (scopeSchemas && !scopeSchemas.has(node.schema || name)) continue;
           if (!name.toLowerCase().includes(q)) continue;
           out.push({
             entity: "sch",
@@ -583,6 +676,7 @@ function collectExplorerSearchMatches(query, entity) {
           continue;
         }
         if (kind === "database" && Array.isArray(node.children)) {
+          if (scope && node.name !== scope.database) continue;
           for (const child of node.children) {
             const name = child.name || "";
             if (!name.toLowerCase().includes(q)) continue;
@@ -600,6 +694,7 @@ function collectExplorerSearchMatches(query, entity) {
         } else if (kind === "database" && layout !== "database-schemas") {
           // MySQL 2-layer: database acts as schema namespace too.
           const name = node.name || "";
+          if (scope && name !== scope.database) continue;
           if (!name.toLowerCase().includes(q)) continue;
           out.push({
             entity: "sch",
@@ -616,28 +711,50 @@ function collectExplorerSearchMatches(query, entity) {
     } else if (needsExplorerObjectIndex(entity)) {
       // Cache-only — never trigger network from search.
       const objects = entry.objects || {};
+      // Map schema -> parent database for path/filtering.
+      const schemaToDb = new Map();
+      for (const node of nodes) {
+        if ((node.kind || "database") !== "database") continue;
+        if (layout === "database-schemas" && Array.isArray(node.children)) {
+          for (const child of node.children) {
+            const sch = child.schema || child.name;
+            if (sch) schemaToDb.set(sch, node.name || "");
+          }
+        } else {
+          const sch = node.schema || node.name;
+          if (sch) schemaToDb.set(sch, node.name || sch);
+        }
+      }
       for (const [schema, bag] of Object.entries(objects)) {
+        const database = schemaToDb.get(schema) || schema;
+        if (scope) {
+          if (scope.connectionId !== connectionId) continue;
+          if (database !== scope.database && schema !== scope.database
+            && !(scopeSchemas && scopeSchemas.has(schema))) {
+            continue;
+          }
+        }
         if (entity === "tbl") {
           pushObjectSearchMatches(out, {
-            entity, connectionId, connName, schema, query: q,
+            entity, connectionId, connName, schema, database, query: q,
             names: bag.tables, kind: "table",
             badge: meta.badge, badgeClass: meta.badgeClass,
           });
         } else if (entity === "vw") {
           pushObjectSearchMatches(out, {
-            entity, connectionId, connName, schema, query: q,
+            entity, connectionId, connName, schema, database, query: q,
             names: bag.views, kind: "view",
             badge: meta.badge, badgeClass: meta.badgeClass,
           });
         } else if (entity === "proc") {
           pushObjectSearchMatches(out, {
-            entity, connectionId, connName, schema, query: q,
+            entity, connectionId, connName, schema, database, query: q,
             names: bag.procs, kind: "procedure",
             badge: meta.badge, badgeClass: meta.badgeClass,
           });
         } else if (entity === "func") {
           pushObjectSearchMatches(out, {
-            entity, connectionId, connName, schema, query: q,
+            entity, connectionId, connName, schema, database, query: q,
             names: bag.funcs, kind: "function",
             badge: meta.badge, badgeClass: meta.badgeClass,
           });
@@ -850,14 +967,19 @@ function syncExplorerSearchFilter() {
   paintExplorerSearchFilter(matches, entity);
 
   if (status) {
+    const scope = explorerSearchScope();
+    const scopeSuffix = scope ? ` in ${scope.database}` : "";
     if (state.explorerSearch.scanning) {
       status.hidden = false;
     } else if (!matches.length) {
       status.hidden = false;
-      status.textContent = EXPLORER_SEARCH_META[entity]?.empty || "No matches";
+      const empty = EXPLORER_SEARCH_META[entity]?.empty || "No matches";
+      status.textContent = scope
+        ? `No matches${scopeSuffix}. Expand this database to load objects, or clear scope to search all.`
+        : empty;
     } else {
       status.hidden = false;
-      status.textContent = `${matches.length} match${matches.length === 1 ? "" : "es"} in list`;
+      status.textContent = `${matches.length} match${matches.length === 1 ? "" : "es"}${scopeSuffix}`;
     }
   }
 }
@@ -922,7 +1044,8 @@ function refreshExplorerSearch() {
   state.explorerSearch.query = (input?.value || "").trim();
   const q = explorerSearchQuery();
   const entity = explorerSearchEntity();
-  const key = q ? `${entity}\0${q}` : "";
+  const scopeKey = explorerSearchScopeKey();
+  const key = q ? `${entity}\0${q}\0${scopeKey}` : "";
   if (key !== state.explorerSearch.revealKey) {
     state.explorerSearch.revealKey = key;
     state.explorerSearch.revealedConnIds = {};
@@ -1284,6 +1407,7 @@ async function resetSession() {
   state.page = 1;
   state.expandedProfileIds = {};
   invalidateExplorerCache();
+  clearExplorerSearchScope({ refresh: false });
   setDetailFocus({ scope: "connection" });
   updateContextMeta("");
   resetWorkspaceTabs();
@@ -1321,6 +1445,9 @@ async function disconnectCurrent(profileId) {
   setExpanded(id, false);
   invalidateExplorerCache(id);
   closeWorkspaceTabsForConnection(id);
+  if (explorerSearchScope()?.connectionId === id) {
+    clearExplorerSearchScope({ refresh: false });
+  }
   if (state.activeConnectionId === id) {
     state.activeConnectionId = Object.keys(state.connectedIds)[0] || null;
   }
@@ -1863,6 +1990,12 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
         body: JSON.stringify({ id: connectionId }),
       }).catch(() => {});
     }
+    if (kind === "database") {
+      setExplorerSearchScope({
+        connectionId,
+        database: node.name || node.schema || "",
+      }, { refresh: !!explorerSearchQuery() });
+    }
     if (kind === "schema" || (kind === "database" && layout !== "database-schemas")) {
       await focusHomeDetails({
         scope: "schema",
@@ -2133,7 +2266,7 @@ const PROP_LABELS = {
   id: "Connection ID",
 };
 
-const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view", "#ctx-menu-wstab"];
+const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view", "#ctx-menu-wstab", "#ctx-menu-erd"];
 let suppressMenuHideUntil = 0;
 
 function hideAllContextMenus() {
@@ -3925,6 +4058,41 @@ async function handleContextAction(action) {
         await openErd(schema, state.activeConnectionId, dbName);
         break;
       }
+      case "erd-highlight": {
+        hideAllContextMenus();
+        const tab = state.workspaceTabs.find((t) => t.id === target.tabId) || activeWorkspaceTab();
+        if (tab?.kind === "erd" && target.table) toggleErdHighlight(tab, target.table);
+        break;
+      }
+      case "erd-focus": {
+        hideAllContextMenus();
+        const tab = state.workspaceTabs.find((t) => t.id === target.tabId) || activeWorkspaceTab();
+        if (tab?.kind === "erd" && target.table) {
+          if (tab.erdFocusTable === target.table) clearErdFocus(tab);
+          else setErdFocus(tab, target.table);
+        }
+        break;
+      }
+      case "erd-open": {
+        hideAllContextMenus();
+        if (target.table) {
+          await openTable(
+            target.schema,
+            target.table,
+            target.connectionId || state.activeConnectionId,
+            target.database,
+          );
+        }
+        break;
+      }
+      case "erd-delete": {
+        hideAllContextMenus();
+        const tab = state.workspaceTabs.find((t) => t.id === target.tabId) || activeWorkspaceTab();
+        if (tab?.kind === "erd" && target.table) {
+          removeErdTablesFromDiagram(tab, [target.table]);
+        }
+        break;
+      }
       case "open-table":
         hideAllContextMenus();
         await openTable(target.schema, target.table, state.activeConnectionId, target.database);
@@ -5050,17 +5218,26 @@ async function loadErdIntoActiveTab(tab) {
   const title = $("#erd-title");
   const subtitle = $("#erd-subtitle");
   if (title) title.textContent = tab.schema;
-  if (subtitle) {
-    const n = tab.erd?.tables?.length;
-    subtitle.textContent = n != null
-      ? `${n} table${n === 1 ? "" : "s"} · foreign keys`
-      : "Loading tables and foreign keys…";
-  }
+  if (subtitle) subtitle.textContent = "Loading tables and foreign keys…";
   if (empty) {
     empty.hidden = false;
     empty.textContent = "Loading ER diagram…";
   }
   setErdCanvasEmpty();
+
+  const started = Date.now();
+  let tickTimer = null;
+  const updateProgress = (msg) => {
+    const secs = Math.max(1, Math.round((Date.now() - started) / 1000));
+    if (empty) empty.textContent = `${msg} (${secs}s)`;
+    if (subtitle) subtitle.textContent = msg;
+    setStatus(`ERD · ${msg}`);
+  };
+  tickTimer = setInterval(() => {
+    updateProgress("Loading large schema from remote database…");
+  }, 1000);
+  updateProgress("Fetching schema metadata…");
+
   try {
     if (tab.connectionId) {
       await api("/api/session/active", {
@@ -5080,18 +5257,31 @@ async function loadErdIntoActiveTab(tab) {
     live.erdView = { ...(live.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
     const tableCount = (data.tables || []).length;
     const fkCount = (data.relations || []).length;
-    const logical = inferLogicalErdRelations(data.tables || [], data.relations || []);
-    live.erdLogicalRelations = logical;
-    // When no FK edges exist, default to showing inferred logical relationships.
+
+    updateProgress(`Building diagram · ${tableCount} tables…`);
+    // Logical inference on very large schemas is expensive; defer until the user enables it.
+    live.erdLogicalRelations = null;
+    let logicalCount = -1;
+    if (tableCount <= 250) {
+      live.erdLogicalRelations = inferLogicalErdRelations(data.tables || [], data.relations || []);
+      logicalCount = live.erdLogicalRelations.length;
+    }
     if (live.erdShowLogical == null) {
-      live.erdShowLogical = fkCount === 0 && logical.length > 0;
+      live.erdShowLogical = fkCount === 0 && logicalCount > 0 && tableCount <= 250;
     }
     const shown = getErdDisplayRelations(live).length;
     if (subtitle) {
-      subtitle.textContent = erdRelationSubtitle(tableCount, fkCount, logical.length, live.erdShowLogical);
+      subtitle.textContent = erdRelationSubtitle(
+        tableCount,
+        fkCount,
+        Math.max(0, logicalCount),
+        live.erdShowLogical,
+      );
     }
     setStatus(`ERD · ${tab.schema}${shown ? ` · ${shown} link${shown === 1 ? "" : "s"}` : ""}`);
     syncErdLogicalToggle(live);
+    // Yield so the loading message paints before a heavy SVG build.
+    await new Promise((r) => requestAnimationFrame(() => r()));
     renderErdDiagram(data, live);
   } catch (err) {
     if (empty) {
@@ -5100,6 +5290,8 @@ async function loadErdIntoActiveTab(tab) {
     }
     setErdCanvasEmpty();
     setStatus(err.message || "ERD failed");
+  } finally {
+    if (tickTimer) clearInterval(tickTimer);
   }
 }
 
@@ -5170,6 +5362,7 @@ function erdFocusNeighborhood(data, tableName, tab = null) {
   const related = new Set([tableName]);
   const relations = tab ? getErdAllRelations(tab) : (data?.relations || []);
   for (const rel of relations) {
+    if (tab && (isErdTableHidden(tab, rel.fromTable) || isErdTableHidden(tab, rel.toTable))) continue;
     if (rel.fromTable === tableName && rel.toTable) related.add(rel.toTable);
     if (rel.toTable === tableName && rel.fromTable) related.add(rel.fromTable);
   }
@@ -5365,20 +5558,29 @@ function inferLogicalErdRelations(tables, fkRelations = []) {
 
 function getErdDisplayRelations(tab) {
   const all = getErdAllRelations(tab);
+  // Drop links to tables removed from the diagram.
+  const visible = all.filter((r) =>
+    !isErdTableHidden(tab, r.fromTable) && !isErdTableHidden(tab, r.toTable),
+  );
   // Focus mode: drop connections that do not touch the focused table.
   const focus = tab?.erdFocusTable;
-  if (!focus) return all;
-  return all.filter((r) => r.fromTable === focus || r.toTable === focus);
+  if (!focus) return visible;
+  return visible.filter((r) => r.fromTable === focus || r.toTable === focus);
 }
 
 /** All FK/logical relations ignoring focus filter (for counts / neighborhood). */
 function getErdAllRelations(tab) {
   const fk = (tab?.erd?.relations || []).map((r) => ({ ...r, logical: !!r.logical }));
   if (!tab?.erdShowLogical) return fk;
-  if (!Array.isArray(tab.erdLogicalRelations)) {
-    tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
-  }
-  return [...fk, ...tab.erdLogicalRelations];
+  ensureErdLogicalRelations(tab);
+  return [...fk, ...(tab.erdLogicalRelations || [])];
+}
+
+function ensureErdLogicalRelations(tab) {
+  if (!tab?.erd) return [];
+  if (Array.isArray(tab.erdLogicalRelations)) return tab.erdLogicalRelations;
+  tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd.tables || [], tab.erd.relations || []);
+  return tab.erdLogicalRelations;
 }
 
 function syncErdLogicalToggle(tab) {
@@ -5386,17 +5588,27 @@ function syncErdLogicalToggle(tab) {
   const wrap = $("#erd-logical-toggle");
   if (!chk) return;
   const fkCount = (tab?.erd?.relations || []).length;
+  const tableCount = (tab?.erd?.tables || []).length;
   if (tab?.kind === "erd") {
-    tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
-    const logicalCount = tab.erdLogicalRelations.length;
+    let logicalCount = Array.isArray(tab.erdLogicalRelations) ? tab.erdLogicalRelations.length : -1;
+    // Avoid scanning huge schemas until the user asks for Logical.
+    if (logicalCount < 0 && tableCount <= 250) {
+      ensureErdLogicalRelations(tab);
+      logicalCount = tab.erdLogicalRelations.length;
+    }
     chk.checked = !!tab.erdShowLogical;
     chk.disabled = logicalCount === 0;
     if (wrap) {
       wrap.classList.toggle("has-logical", logicalCount > 0);
       wrap.classList.toggle("no-fk", fkCount === 0 && logicalCount > 0);
-      wrap.title = logicalCount === 0
-        ? "No logical relationships inferred (e.g. a_code → a.code, user_id → users.id)"
-        : "Show relationships inferred from column names (e.g. a_code → a.code, user_id → users.id)";
+      if (logicalCount < 0) {
+        chk.disabled = false;
+        wrap.title = "Infer logical relationships (may be slow on 500+ tables)";
+      } else {
+        wrap.title = logicalCount === 0
+          ? "No logical relationships inferred (e.g. a_code → a.code, user_id → users.id)"
+          : "Show relationships inferred from column names (e.g. a_code → a.code, user_id → users.id)";
+      }
     }
   } else {
     chk.checked = false;
@@ -5414,6 +5626,10 @@ function setErdShowLogical(enabled) {
   tab.erdShowLogical = !!enabled;
   const data = tab.erd;
   if (!data) return;
+  if (enabled) {
+    setStatus("ERD · computing logical relationships…");
+    ensureErdLogicalRelations(tab);
+  }
   const keepView = tab.erdView ? { ...tab.erdView, _needsFit: false } : null;
   if (keepView) tab.erdView = keepView;
   renderErdDiagram(data, tab);
@@ -5442,6 +5658,142 @@ function updateErdFocusButton(tab) {
   btn.title = active
     ? `Clear focus on ${tab.erdFocusTable}`
     : "Click a table to enter focus mode";
+}
+
+function erdHiddenSet(tab) {
+  if (!tab.erdHiddenTables) tab.erdHiddenTables = {};
+  return tab.erdHiddenTables;
+}
+
+function erdHighlightSet(tab) {
+  if (!tab.erdHighlighted) tab.erdHighlighted = {};
+  return tab.erdHighlighted;
+}
+
+function erdHiddenCount(tab) {
+  return Object.keys(erdHiddenSet(tab)).length;
+}
+
+function erdHighlightCount(tab) {
+  return Object.keys(erdHighlightSet(tab)).length;
+}
+
+function isErdTableHidden(tab, name) {
+  return !!(name && erdHiddenSet(tab)[name]);
+}
+
+function isErdTableHighlighted(tab, name) {
+  return !!(name && erdHighlightSet(tab)[name]);
+}
+
+function updateErdHighlightButtons(tab) {
+  const clearHl = $("#btn-erd-clear-highlights");
+  const restore = $("#btn-erd-restore");
+  const hl = tab?.kind === "erd" ? erdHighlightCount(tab) : 0;
+  const hidden = tab?.kind === "erd" ? erdHiddenCount(tab) : 0;
+  if (clearHl) {
+    clearHl.disabled = hl === 0;
+    clearHl.classList.toggle("active", hl > 0);
+    clearHl.title = hl > 0 ? `Clear ${hl} highlighted table${hl === 1 ? "" : "s"}` : "Clear highlighted tables";
+  }
+  if (restore) {
+    restore.disabled = hidden === 0;
+    restore.classList.toggle("active", hidden > 0);
+    restore.title = hidden > 0
+      ? `Restore ${hidden} removed table${hidden === 1 ? "" : "s"}`
+      : "Restore removed tables";
+  }
+}
+
+function applyErdHighlightStyles(tab) {
+  const svg = $("#erd-canvas");
+  const root = svg?.querySelector(".erd-root");
+  if (!root) return;
+  const highlights = erdHighlightSet(tab);
+  const any = Object.keys(highlights).length > 0;
+  root.classList.toggle("erd-highlight-mode", any);
+  root.querySelectorAll(".erd-table").forEach((g) => {
+    const name = g.dataset.table;
+    g.classList.toggle("erd-highlighted", !!highlights[name]);
+  });
+}
+
+function toggleErdHighlight(tab, tableName) {
+  if (!tab || tab.kind !== "erd" || !tableName) return;
+  const set = erdHighlightSet(tab);
+  if (set[tableName]) delete set[tableName];
+  else set[tableName] = true;
+  applyErdHighlightStyles(tab);
+  updateErdHighlightButtons(tab);
+  setStatus(set[tableName]
+    ? `ERD · highlighted ${tableName}`
+    : `ERD · cleared highlight on ${tableName}`);
+}
+
+function clearErdHighlights(tab = activeWorkspaceTab()) {
+  if (!tab || tab.kind !== "erd") return;
+  tab.erdHighlighted = {};
+  applyErdHighlightStyles(tab);
+  updateErdHighlightButtons(tab);
+  setStatus("ERD · highlights cleared");
+}
+
+function removeErdTablesFromDiagram(tab, tableNames) {
+  if (!tab || tab.kind !== "erd") return;
+  const names = (tableNames || []).filter(Boolean);
+  if (!names.length) return;
+  const hidden = erdHiddenSet(tab);
+  const highlights = erdHighlightSet(tab);
+  for (const name of names) {
+    hidden[name] = true;
+    delete highlights[name];
+    if (tab.erdFocusTable === name) tab.erdFocusTable = null;
+    if (tab.erdPositions) delete tab.erdPositions[name];
+  }
+  const data = tab.erd;
+  if (!data) return;
+  const keepView = tab.erdView ? { ...tab.erdView, _needsFit: false } : null;
+  if (keepView) tab.erdView = keepView;
+  renderErdDiagram(data, tab);
+  setStatus(`ERD · removed ${names.length === 1 ? names[0] : `${names.length} tables`} from diagram`);
+}
+
+function restoreErdHiddenTables(tab = activeWorkspaceTab()) {
+  if (!tab || tab.kind !== "erd") return;
+  const n = erdHiddenCount(tab);
+  if (!n) return;
+  tab.erdHiddenTables = {};
+  const data = tab.erd;
+  if (!data) return;
+  tab.erdView = { ...(tab.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
+  renderErdDiagram(data, tab);
+  setStatus(`ERD · restored ${n} table${n === 1 ? "" : "s"}`);
+}
+
+function showErdTableContextMenu(x, y, tab, tableName) {
+  for (const sel of CTX_MENUS) {
+    const menu = $(sel);
+    if (menu) menu.hidden = true;
+  }
+  state.contextTarget = {
+    type: "erd-table",
+    tabId: tab.id,
+    schema: tab.schema,
+    table: tableName,
+    connectionId: tab.connectionId,
+    database: tab.database,
+  };
+  const menu = $("#ctx-menu-erd");
+  if (!menu) return;
+  const hlBtn = menu.querySelector('[data-action="erd-highlight"]');
+  if (hlBtn) {
+    hlBtn.textContent = isErdTableHighlighted(tab, tableName) ? "Unhighlight" : "Highlight";
+  }
+  const focusBtn = menu.querySelector('[data-action="erd-focus"]');
+  if (focusBtn) {
+    focusBtn.textContent = tab.erdFocusTable === tableName ? "Clear focus" : "Focus";
+  }
+  positionContextMenu(menu, x, y);
 }
 
 function setErdFocus(tab, tableName) {
@@ -5571,6 +5923,7 @@ function collectErdSearchMatches(tab) {
   if (!q || !tab?.erd?.tables) return [];
   const matches = [];
   for (const t of tab.erd.tables) {
+    if (isErdTableHidden(tab, t.name)) continue;
     const tableName = String(t.name || "");
     if (scope === "table") {
       if (tableName.toLowerCase().includes(q)) {
@@ -5855,6 +6208,7 @@ function redrawErdEdges(tab) {
   }
 
   applyErdFocusStyles(tab);
+  applyErdHighlightStyles(tab);
   applyErdSearchStyles(tab);
 }
 
@@ -5865,31 +6219,49 @@ function renderErdDiagram(data, tab) {
   const subtitle = $("#erd-subtitle");
   if (!svg || !tab) return;
 
-  const tables = [...(data?.tables || [])].sort((a, b) =>
+  const allTables = [...(data?.tables || [])].sort((a, b) =>
     String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" }),
   );
-  tab.erdLogicalRelations = inferLogicalErdRelations(tables, data?.relations || []);
+  const tables = allTables.filter((t) => !isErdTableHidden(tab, t.name));
+  if (tab.erdShowLogical) ensureErdLogicalRelations(tab);
   const fkRelations = data?.relations || [];
   const relations = getErdDisplayRelations(tab);
+  const hiddenCount = erdHiddenCount(tab);
 
   if (title) title.textContent = tab.schema || data?.schema || "ER Diagram";
   if (subtitle && !tab.erdFocusTable) {
-    subtitle.textContent = erdRelationSubtitle(
-      tables.length,
+    let text = erdRelationSubtitle(
+      allTables.length,
       fkRelations.length,
       (tab.erdLogicalRelations || []).length,
       !!tab.erdShowLogical,
     );
+    if (hiddenCount > 0) {
+      text += ` · ${hiddenCount} removed`;
+    }
+    subtitle.textContent = text;
   }
   syncErdLogicalToggle(tab);
+  updateErdHighlightButtons(tab);
 
   setErdCanvasEmpty();
-  if (!tables.length) {
+  if (!allTables.length) {
     if (empty) {
       empty.hidden = false;
       empty.textContent = "No tables in this database/schema.";
     }
     tab.erdLayout = { width: 0, height: 0, boxes: {} };
+    updateErdHighlightButtons(tab);
+    return;
+  }
+  if (!tables.length) {
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = "All tables were removed from this diagram. Click Restore to bring them back.";
+    }
+    tab.erdLayout = { width: 0, height: 0, boxes: {} };
+    updateErdFocusButton(tab);
+    updateErdHighlightButtons(tab);
     return;
   }
   if (empty) empty.hidden = true;
@@ -5900,7 +6272,7 @@ function renderErdDiagram(data, tab) {
   const PAD_X = 10;
   const GAP_X = 56;
   const GAP_Y = 48;
-  const MAX_SHOWN_COLS = 40;
+  const MAX_SHOWN_COLS = tables.length > 300 ? 6 : (tables.length > 120 ? 12 : 40);
   const cols = Math.max(1, Math.ceil(Math.sqrt(tables.length)));
 
   // Columns that must be visible so edge ports can attach accurately.
@@ -6112,7 +6484,9 @@ function renderErdDiagram(data, tab) {
     applyErdTransform(tab);
   }
   applyErdFocusStyles(tab);
+  applyErdHighlightStyles(tab);
   updateErdFocusButton(tab);
+  updateErdHighlightButtons(tab);
   syncErdSearchUi(tab);
   tab.erdSearchMatches = collectErdSearchMatches(tab);
   if (tab.erdSearchMatches.length) {
@@ -6153,6 +6527,7 @@ function ensureErdInteractions() {
   viewport.addEventListener("pointerdown", (e) => {
     const tab = activeWorkspaceTab();
     if (!tab || tab.kind !== "erd") return;
+    if (e.button !== 0) return;
 
     const tableEl = e.target.closest?.(".erd-table");
     if (tableEl) {
@@ -6228,10 +6603,14 @@ function ensureErdInteractions() {
       try { viewport.releasePointerCapture?.(e.pointerId); } catch (_) { /* ignore */ }
       if (!drag.moved && tab?.kind === "erd") {
         clearTimeout(erdTableFocusTimer);
-        erdTableFocusTimer = setTimeout(() => {
-          const live = state.workspaceTabs.find((t) => t.id === tab.id) || tab;
-          setErdFocus(live, drag.name);
-        }, 220);
+        if (e.shiftKey) {
+          toggleErdHighlight(tab, drag.name);
+        } else {
+          erdTableFocusTimer = setTimeout(() => {
+            const live = state.workspaceTabs.find((t) => t.id === tab.id) || tab;
+            setErdFocus(live, drag.name);
+          }, 220);
+        }
       }
       return;
     }
@@ -6245,6 +6624,17 @@ function ensureErdInteractions() {
   };
   viewport.addEventListener("pointerup", endPointer);
   viewport.addEventListener("pointercancel", endPointer);
+
+  viewport.addEventListener("contextmenu", (e) => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    const tableEl = e.target.closest?.(".erd-table");
+    if (!tableEl?.dataset?.table) return;
+    e.preventDefault();
+    e.stopPropagation();
+    clearTimeout(erdTableFocusTimer);
+    showErdTableContextMenu(e.clientX, e.clientY, tab, tableEl.dataset.table);
+  });
 
   // Two-finger trackpad scroll pans; pinch / ctrl+wheel zoom stays blocked (toolbar ±).
   viewport.addEventListener("wheel", (e) => {
@@ -6276,11 +6666,28 @@ function ensureErdInteractions() {
   viewport.addEventListener("gestureend", (e) => e.preventDefault());
 
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape") return;
     const tab = activeWorkspaceTab();
-    if (tab?.kind === "erd" && tab.erdFocusTable) {
-      clearErdFocus(tab);
-      e.stopPropagation();
+    if (tab?.kind !== "erd") return;
+    const tag = (e.target?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
+
+    if (e.key === "Escape") {
+      if (tab.erdFocusTable) {
+        clearErdFocus(tab);
+        e.stopPropagation();
+      }
+      return;
+    }
+
+    if (e.key === "Delete" || e.key === "Backspace") {
+      const targets = [];
+      if (tab.erdFocusTable) targets.push(tab.erdFocusTable);
+      else {
+        for (const name of Object.keys(erdHighlightSet(tab))) targets.push(name);
+      }
+      if (!targets.length) return;
+      e.preventDefault();
+      removeErdTablesFromDiagram(tab, targets);
     }
   });
 }
@@ -7380,6 +7787,16 @@ async function saveCellValueEdit(e) {
   }
 }
 
+function selectDataTableRow(tr) {
+  const tbody = $("#data-table tbody");
+  if (!tbody || !tr) return;
+  const wasSelected = tr.classList.contains("row-selected");
+  tbody.querySelectorAll("tr.row-selected").forEach((row) => {
+    row.classList.remove("row-selected");
+  });
+  if (!wasSelected) tr.classList.add("row-selected");
+}
+
 function renderData(result) {
   const thead = $("#data-table thead");
   const tbody = $("#data-table tbody");
@@ -7484,6 +7901,8 @@ function renderData(result) {
 
   for (const row of pageRows) {
     const tr = document.createElement("tr");
+    tr.classList.add("data-row");
+    tr.tabIndex = -1;
     for (const c of columns) {
       const td = document.createElement("td");
       const v = row[c];
@@ -7505,6 +7924,10 @@ function renderData(result) {
       }
       tr.appendChild(td);
     }
+    tr.addEventListener("click", (e) => {
+      if (e.target.closest("button, a, input, textarea, select")) return;
+      selectDataTableRow(tr);
+    });
     tbody.appendChild(tr);
   }
 
@@ -8186,6 +8609,12 @@ function wire() {
   });
   $("#btn-erd-clear-focus")?.addEventListener("click", () => {
     clearErdFocus(activeWorkspaceTab());
+  });
+  $("#btn-erd-clear-highlights")?.addEventListener("click", () => {
+    clearErdHighlights(activeWorkspaceTab());
+  });
+  $("#btn-erd-restore")?.addEventListener("click", () => {
+    restoreErdHiddenTables(activeWorkspaceTab());
   });
   $("#btn-erd-refresh")?.addEventListener("click", () => {
     const tab = activeWorkspaceTab();
