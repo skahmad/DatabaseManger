@@ -11,6 +11,7 @@ import javafx.scene.control.MenuBar;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.RadioMenuItem;
 import javafx.scene.control.SeparatorMenuItem;
+import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.ToggleGroup;
 import javafx.scene.image.Image;
 import javafx.scene.input.KeyCode;
@@ -47,12 +48,21 @@ public class DesktopApp extends Application {
         webView.setContextMenuEnabled(false);
         engine = webView.getEngine();
 
-        // JavaFX WebView defaults cancel every window.confirm() — wire native dialogs.
+        // JavaFX WebView defaults cancel confirm/prompt — wire native dialogs.
         engine.setConfirmHandler(message -> {
             Alert alert = new Alert(Alert.AlertType.CONFIRMATION, message, ButtonType.OK, ButtonType.CANCEL);
             alert.setHeaderText(null);
             alert.initOwner(stage);
             return alert.showAndWait().orElse(ButtonType.CANCEL) == ButtonType.OK;
+        });
+        engine.setPromptHandler(promptData -> {
+            TextInputDialog dialog = new TextInputDialog(
+                    promptData.getDefaultValue() != null ? promptData.getDefaultValue() : "");
+            dialog.setTitle(Launcher.APP_NAME);
+            dialog.setHeaderText(null);
+            dialog.setContentText(promptData.getMessage());
+            dialog.initOwner(stage);
+            return dialog.showAndWait().orElse(null);
         });
         engine.setOnAlert(event -> {
             Alert alert = new Alert(Alert.AlertType.INFORMATION, event.getData(), ButtonType.OK);

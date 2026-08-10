@@ -113,6 +113,7 @@ public class ApiServer {
             config.routes.delete("/api/databases/{schema}/tables/{table}", this::dropTable);
             config.routes.post("/api/databases/{schema}/tables/{table}/rename", this::renameTable);
             config.routes.post("/api/databases/{schema}/tables/{table}/columns", this::addColumn);
+            config.routes.post("/api/databases/{schema}/tables/{table}/columns/{column}/rename", this::renameColumn);
             config.routes.delete("/api/databases/{schema}/tables/{table}/columns/{column}", this::dropColumn);
             config.routes.post("/api/databases/{schema}/views", this::createView);
             config.routes.delete("/api/databases/{schema}/views/{view}", this::dropView);
@@ -717,6 +718,20 @@ public class ApiServer {
                 body.has("autoIncrement") && body.get("autoIncrement").getAsBoolean()
         );
         databaseService.addColumn(ctx.pathParam("schema"), ctx.pathParam("table"), def);
+        ctx.json(Map.of("ok", true));
+    }
+
+    private void renameColumn(Context ctx) throws Exception {
+        requireConnected(ctx);
+        JsonObject body = gson.fromJson(ctx.body(), JsonObject.class);
+        if (body == null || !body.has("newName") || body.get("newName").isJsonNull()) {
+            throw new IllegalArgumentException("newName is required");
+        }
+        databaseService.renameColumn(
+                ctx.pathParam("schema"),
+                ctx.pathParam("table"),
+                ctx.pathParam("column"),
+                body.get("newName").getAsString());
         ctx.json(Map.of("ok", true));
     }
 

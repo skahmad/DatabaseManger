@@ -1622,6 +1622,15 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   flex: 1;
   min-height: 0;
 }
+.structure-actions {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+}
+.structure-actions .btn {
+  padding: 0.15rem 0.45rem;
+  font-size: 0.72rem;
+}
 .ddl-view {
   margin: 0; flex: 1; min-height: 0; overflow: auto; padding: 1rem 1.25rem;
   font-family: var(--mono); font-size: 0.9rem; background: var(--editor-bg); color: var(--text);
@@ -1991,15 +2000,42 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   fill: var(--accent);
   font-weight: 600;
 }
+.erd-col-linked {
+  fill: var(--text);
+  font-weight: 600;
+}
 .erd-col-more {
   fill: var(--muted);
   font-style: italic;
 }
-.erd-table:hover .erd-table-card {
-  stroke: var(--accent-dim);
+.erd-port {
+  fill: var(--muted);
+  stroke: var(--bg-panel);
+  stroke-width: 1;
+}
+.erd-port-logical {
+  fill: var(--muted);
+  opacity: 0.85;
+}
+.erd-root.erd-focus-mode .erd-port.erd-edge-active {
+  fill: var(--warn);
+}
+.erd-root.erd-focus-mode .erd-port.erd-dimmed,
+.erd-root.erd-search-mode .erd-port.erd-search-miss {
+  opacity: 0.08;
 }
 .erd-table {
-  cursor: pointer;
+  cursor: grab;
+}
+.erd-table.erd-dragging {
+  cursor: grabbing;
+  opacity: 0.96;
+}
+.erd-viewport.erd-dragging-table {
+  cursor: grabbing;
+}
+.erd-table:hover .erd-table-card {
+  stroke: var(--accent-dim);
 }
 .erd-root.erd-focus-mode .erd-table.erd-dimmed {
   opacity: 0.22;

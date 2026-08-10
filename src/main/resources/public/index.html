@@ -300,7 +300,7 @@
               <table id="structure-table">
                 <thead>
                   <tr>
-                    <th>Column</th><th>Type</th><th>Nullable</th><th>PK</th><th>Auto</th><th>Default</th>
+                    <th>Column</th><th>Type</th><th>Nullable</th><th>PK</th><th>Auto</th><th>Default</th><th></th>
                   </tr>
                 </thead>
                 <tbody></tbody>
@@ -337,7 +337,7 @@
               <span id="erd-zoom-label" class="erd-zoom-label">100%</span>
               <button type="button" class="btn ghost sm" id="btn-erd-zoom-in" title="Zoom in">+</button>
               <button type="button" class="btn ghost sm" id="btn-erd-fit" title="Fit diagram">Fit</button>
-              <label class="erd-logical-toggle" id="erd-logical-toggle" title="Infer relationships from column names (e.g. user_id → users)">
+              <label class="erd-logical-toggle" id="erd-logical-toggle" title="Infer relationships from column names (e.g. a_code → a.code)">
                 <input type="checkbox" id="chk-erd-logical" />
                 <span>Logical</span>
               </label>
@@ -470,7 +470,8 @@
     <button type="button" class="ctx-item" data-action="import-table" role="menuitem">Import…</button>
     <button type="button" class="ctx-item" data-action="manage-indexes" role="menuitem">Indexes…</button>
     <button type="button" class="ctx-item" data-action="add-column" role="menuitem">Add column…</button>
-    <button type="button" class="ctx-item" data-action="rename-table" role="menuitem">Rename…</button>
+    <button type="button" class="ctx-item" data-action="rename-column" role="menuitem">Rename column…</button>
+    <button type="button" class="ctx-item" data-action="rename-table" role="menuitem">Rename table…</button>
     <hr class="ctx-sep" />
     <button type="button" class="ctx-item danger" data-action="drop-table" role="menuitem">Drop table…</button>
   </div>

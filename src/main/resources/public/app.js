@@ -3938,9 +3938,35 @@ async function handleContextAction(action) {
       case "add-column":
         openAddColumnModal(target.schema, target.table);
         break;
+      case "rename-column": {
+        hideAllContextMenus();
+        let column = "";
+        const openTab = state.workspaceTabs.find((t) =>
+          t.kind === "table"
+          && t.schema === target.schema
+          && t.table === target.table
+          && Array.isArray(t.columns)
+          && t.columns.length);
+        if (openTab?.columns?.length === 1) {
+          column = openTab.columns[0].name;
+        } else if (openTab?.columns?.length) {
+          const names = openTab.columns.map((c) => c.name).join(", ");
+          column = String(prompt(`Column to rename (${names}):`, openTab.columns[0].name) || "").trim();
+        } else {
+          column = String(prompt("Column to rename:", "") || "").trim();
+        }
+        if (!column) return;
+        await renameColumnInteractive(
+          target.schema,
+          target.table,
+          column,
+          state.activeConnectionId,
+        );
+        break;
+      }
       case "rename-table": {
         hideAllContextMenus();
-        const newName = prompt("New table name:", target.table);
+        const newName = String(prompt("New table name:", target.table) || "").trim();
         if (!newName || newName === target.table) return;
         await api(`/api/databases/${encodeURIComponent(target.schema)}/tables/${encodeURIComponent(target.table)}/rename`, {
           method: "POST",
@@ -5142,7 +5168,7 @@ function erdZoomBy(factor) {
 /** Tables connected to `tableName` via FK (either direction), including itself. */
 function erdFocusNeighborhood(data, tableName, tab = null) {
   const related = new Set([tableName]);
-  const relations = tab ? getErdDisplayRelations(tab) : (data?.relations || []);
+  const relations = tab ? getErdAllRelations(tab) : (data?.relations || []);
   for (const rel of relations) {
     if (rel.fromTable === tableName && rel.toTable) related.add(rel.toTable);
     if (rel.toTable === tableName && rel.fromTable) related.add(rel.fromTable);
@@ -5182,33 +5208,39 @@ function erdPluralVariants(stem) {
   return [...out];
 }
 
-function erdRefStemFromColumn(colName) {
-  const name = String(colName || "");
-  if (!name) return null;
-  const m = name.match(/^(.*?)[_]?id$/i) || name.match(/^(.*?)[_]?fk$/i);
-  if (!m || !m[1]) return null;
-  let stem = m[1].replace(/_+$/, "");
-  if (!stem) return null;
-  // camelCase FooId → Foo
-  if (/^[A-Z]/.test(name) && /Id$/.test(name)) {
-    stem = name.slice(0, -2);
-  }
-  return stem;
+function erdSplitCamel(name) {
+  const s = String(name || "");
+  if (!s || !/[a-z][A-Z]/.test(s)) return null;
+  const parts = s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split("_");
+  return parts.length >= 2 ? parts : null;
 }
 
 /**
- * Infer logical relationships from naming (user_id → users.id) when no FK exists.
+ * Infer logical relationships from naming, without needing PK/FK metadata.
+ * Examples:
+ *   user_id → users.id
+ *   a_code → a.code
+ *   order_user_code → order_user.code (longest table prefix wins)
  */
 function inferLogicalErdRelations(tables, fkRelations = []) {
   const list = tables || [];
   const byLower = new Map();
-  const pkByTable = new Map();
+  /** @type {Map<string, { name: string, cols: Map<string, string>, pk: string[] }>} */
+  const meta = new Map();
+
   for (const t of list) {
     const name = String(t.name || "");
     if (!name) continue;
     byLower.set(name.toLowerCase(), name);
-    const pks = (t.columns || []).filter((c) => c.primaryKey).map((c) => c.name);
-    pkByTable.set(name, pks);
+    const cols = new Map();
+    const pk = [];
+    for (const c of t.columns || []) {
+      const cn = String(c.name || "");
+      if (!cn) continue;
+      cols.set(cn.toLowerCase(), cn);
+      if (c.primaryKey) pk.push(cn);
+    }
+    meta.set(name, { name, cols, pk });
   }
 
   const fkSeen = new Set();
@@ -5219,9 +5251,6 @@ function inferLogicalErdRelations(tables, fkRelations = []) {
     fkSeen.add(`${rel.fromTable}\0${rel.toTable}\0${(rel.fromColumns || [])[0] || ""}`);
   }
 
-  const out = [];
-  const seen = new Set();
-
   const resolveTarget = (stem) => {
     for (const variant of erdPluralVariants(stem)) {
       const hit = byLower.get(variant);
@@ -5230,47 +5259,99 @@ function inferLogicalErdRelations(tables, fkRelations = []) {
     return null;
   };
 
-  const pickPk = (targetName, stem) => {
-    const pks = pkByTable.get(targetName) || [];
-    if (!pks.length) return null;
-    const lower = pks.map((p) => String(p).toLowerCase());
-    const stemL = String(stem).toLowerCase();
-    const prefer = ["id", `${stemL}_id`, `${stemL}id`, targetName.toLowerCase() + "_id"];
-    for (const p of prefer) {
-      const idx = lower.indexOf(p);
-      if (idx >= 0) return pks[idx];
+  /** Prefer exact column, then id / PK fallbacks when suffix is id-like. */
+  const resolveTargetColumn = (targetName, suffix) => {
+    const info = meta.get(targetName);
+    if (!info) return null;
+    const want = String(suffix || "").toLowerCase();
+    if (!want) return null;
+    if (info.cols.has(want)) return info.cols.get(want);
+
+    // id-like suffixes may map to a bare `id` column (even without PK flag).
+    if (want === "id" || want === "fk" || want === "uuid" || want === "guid") {
+      if (info.cols.has("id")) return info.cols.get("id");
+      if (info.cols.has("uuid")) return info.cols.get("uuid");
+      if (info.pk.length === 1) return info.pk[0];
+      if (info.pk.length) return info.pk[0];
     }
-    if (pks.length === 1) return pks[0];
-    return pks[0];
+
+    // user_id → users.user_id when present
+    const stem = targetName.toLowerCase();
+    for (const candidate of [`${stem}_${want}`, `${stem}${want}`]) {
+      if (info.cols.has(candidate)) return info.cols.get(candidate);
+    }
+    return null;
+  };
+
+  const out = [];
+  const seen = new Set();
+
+  const addRel = (fromTable, fromCol, toTable, toCol) => {
+    if (!fromTable || !fromCol || !toTable || !toCol || fromTable === toTable) return;
+    const fkKey = `${fromTable}\0${toTable}\0${fromCol}`;
+    if (fkSeen.has(fkKey) || fkSeen.has(`${fromTable}\0${toTable}\0${fromCol}\0${toCol}`)) return;
+    const key = `${fromTable}\0${toTable}\0${fromCol}\0${toCol}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      name: `${fromCol} → ${toTable}.${toCol}`,
+      fromTable,
+      toTable,
+      fromColumns: [fromCol],
+      toColumns: [toCol],
+      logical: true,
+    });
+  };
+
+  const tryPrefixedParts = (fromTable, colName, parts) => {
+    if (!parts || parts.length < 2) return false;
+    // Longest table-name prefix first: a_code → (a, code); order_item_code → (order_item, code)
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const prefix = parts.slice(0, i).join("_");
+      const suffix = parts.slice(i).join("_");
+      if (!prefix || !suffix) continue;
+      // Avoid ultra-generic single-letter noise unless it really matches a table.
+      const toTable = resolveTarget(prefix);
+      if (!toTable || toTable === fromTable) continue;
+      const toCol = resolveTargetColumn(toTable, suffix);
+      if (!toCol) continue;
+      addRel(fromTable, colName, toTable, toCol);
+      return true;
+    }
+    return false;
   };
 
   for (const t of list) {
     const fromTable = String(t.name || "");
     for (const col of t.columns || []) {
-      if (col.primaryKey) continue;
       const colName = String(col.name || "");
-      const stem = erdRefStemFromColumn(colName);
-      if (!stem) continue;
-      const toTable = resolveTarget(stem);
-      if (!toTable || toTable === fromTable) continue;
-      const toCol = pickPk(toTable, stem);
-      if (!toCol) continue;
+      if (!colName) continue;
 
-      const fkKey = `${fromTable}\0${toTable}\0${colName}`;
-      if (fkSeen.has(fkKey) || fkSeen.has(`${fromTable}\0${toTable}\0${colName}\0${toCol}`)) {
-        continue;
+      // snake_case prefixes: a_code, user_id, order_item_code
+      if (colName.includes("_")) {
+        if (tryPrefixedParts(fromTable, colName, colName.toLowerCase().split("_"))) continue;
       }
-      const key = `${fromTable}\0${toTable}\0${colName}\0${toCol}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({
-        name: `${colName} → ${toTable}.${toCol}`,
-        fromTable,
-        toTable,
-        fromColumns: [colName],
-        toColumns: [toCol],
-        logical: true,
-      });
+
+      // camelCase: userId, aCode, orderUserId
+      const camelParts = erdSplitCamel(colName);
+      if (camelParts) {
+        if (tryPrefixedParts(fromTable, colName, camelParts)) continue;
+      }
+
+      // Trailing Id/Fk without underscore: userid (weak) — only if stem resolves to a table
+      const m = colName.match(/^(.*?)(id|fk|uuid|guid)$/i);
+      if (m && m[1] && m[1].length >= 1) {
+        let stem = m[1].replace(/_+$/, "");
+        if (/[A-Z]$/.test(stem)) {
+          // FooId already handled via camel; keep stem as-is lowercased path
+        }
+        stem = stem.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+        const toTable = resolveTarget(stem.replace(/_+/g, "_").replace(/^_|_$/g, ""));
+        if (toTable && toTable !== fromTable) {
+          const toCol = resolveTargetColumn(toTable, m[2]);
+          if (toCol) addRel(fromTable, colName, toTable, toCol);
+        }
+      }
     }
   }
 
@@ -5283,14 +5364,21 @@ function inferLogicalErdRelations(tables, fkRelations = []) {
 }
 
 function getErdDisplayRelations(tab) {
+  const all = getErdAllRelations(tab);
+  // Focus mode: drop connections that do not touch the focused table.
+  const focus = tab?.erdFocusTable;
+  if (!focus) return all;
+  return all.filter((r) => r.fromTable === focus || r.toTable === focus);
+}
+
+/** All FK/logical relations ignoring focus filter (for counts / neighborhood). */
+function getErdAllRelations(tab) {
   const fk = (tab?.erd?.relations || []).map((r) => ({ ...r, logical: !!r.logical }));
   if (!tab?.erdShowLogical) return fk;
-  let logical = tab.erdLogicalRelations;
-  if (!logical) {
-    logical = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
-    tab.erdLogicalRelations = logical;
+  if (!Array.isArray(tab.erdLogicalRelations)) {
+    tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
   }
-  return [...fk, ...logical];
+  return [...fk, ...tab.erdLogicalRelations];
 }
 
 function syncErdLogicalToggle(tab) {
@@ -5298,22 +5386,25 @@ function syncErdLogicalToggle(tab) {
   const wrap = $("#erd-logical-toggle");
   if (!chk) return;
   const fkCount = (tab?.erd?.relations || []).length;
-  const logicalCount = (tab?.erdLogicalRelations
-    || inferLogicalErdRelations(tab?.erd?.tables || [], tab?.erd?.relations || [])).length;
   if (tab?.kind === "erd") {
-    if (!tab.erdLogicalRelations) tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
+    tab.erdLogicalRelations = inferLogicalErdRelations(tab.erd?.tables || [], tab.erd?.relations || []);
+    const logicalCount = tab.erdLogicalRelations.length;
     chk.checked = !!tab.erdShowLogical;
     chk.disabled = logicalCount === 0;
+    if (wrap) {
+      wrap.classList.toggle("has-logical", logicalCount > 0);
+      wrap.classList.toggle("no-fk", fkCount === 0 && logicalCount > 0);
+      wrap.title = logicalCount === 0
+        ? "No logical relationships inferred (e.g. a_code → a.code, user_id → users.id)"
+        : "Show relationships inferred from column names (e.g. a_code → a.code, user_id → users.id)";
+    }
   } else {
     chk.checked = false;
     chk.disabled = true;
-  }
-  if (wrap) {
-    wrap.classList.toggle("has-logical", logicalCount > 0);
-    wrap.classList.toggle("no-fk", fkCount === 0 && logicalCount > 0);
-    wrap.title = logicalCount === 0
-      ? "No logical relationships inferred from column names"
-      : "Show relationships inferred from column names (e.g. user_id → users.id)";
+    if (wrap) {
+      wrap.classList.remove("has-logical", "no-fk");
+      wrap.title = "Show relationships inferred from column names";
+    }
   }
 }
 
@@ -5360,6 +5451,7 @@ function setErdFocus(tab, tableName) {
   } else {
     tab.erdFocusTable = tableName;
   }
+  redrawErdEdges(tab);
   applyErdFocusStyles(tab);
   updateErdFocusButton(tab);
   applyErdSearchStyles(tab);
@@ -5387,6 +5479,7 @@ function clearErdFocus(tab = activeWorkspaceTab()) {
     return;
   }
   tab.erdFocusTable = null;
+  redrawErdEdges(tab);
   applyErdFocusStyles(tab);
   applyErdSearchStyles(tab);
   updateErdFocusButton(tab);
@@ -5416,7 +5509,8 @@ function applyErdFocusStyles(tab) {
     else g.classList.add("erd-dimmed");
   });
 
-  root.querySelectorAll(".erd-edge, .erd-edge-label").forEach((el) => {
+  // Only focused-table connections are drawn; highlight those edges.
+  root.querySelectorAll(".erd-edge, .erd-edge-label, .erd-port").forEach((el) => {
     el.classList.remove("erd-edge-active", "erd-dimmed");
     if (!focus) {
       if (el.classList.contains("erd-edge")) {
@@ -5424,19 +5518,9 @@ function applyErdFocusStyles(tab) {
       }
       return;
     }
-    const from = el.dataset.from;
-    const to = el.dataset.to;
-    const incident = from === focus || to === focus;
-    if (incident) {
-      el.classList.add("erd-edge-active");
-      if (el.classList.contains("erd-edge")) {
-        el.setAttribute("marker-end", "url(#erd-arrow-active)");
-      }
-    } else {
-      el.classList.add("erd-dimmed");
-      if (el.classList.contains("erd-edge")) {
-        el.setAttribute("marker-end", "url(#erd-arrow)");
-      }
+    el.classList.add("erd-edge-active");
+    if (el.classList.contains("erd-edge")) {
+      el.setAttribute("marker-end", "url(#erd-arrow-active)");
     }
   });
 }
@@ -5549,7 +5633,7 @@ function applyErdSearchStyles(tab) {
   });
 
   // Dim edges that don't touch a hit table while searching
-  root.querySelectorAll(".erd-edge, .erd-edge-label").forEach((el) => {
+  root.querySelectorAll(".erd-edge, .erd-edge-label, .erd-port").forEach((el) => {
     el.classList.remove("erd-search-miss");
     if (!searching) return;
     const from = el.dataset.from;
@@ -5652,6 +5736,128 @@ function wireErdSearch() {
   $("#btn-erd-search-next")?.addEventListener("click", () => erdSearchStep(1));
 }
 
+function updateErdLayoutBounds(tab) {
+  const boxes = tab?.erdLayout?.boxes || {};
+  let maxR = 0;
+  let maxB = 0;
+  for (const b of Object.values(boxes)) {
+    maxR = Math.max(maxR, (b.x || 0) + (b.w || 0));
+    maxB = Math.max(maxB, (b.y || 0) + (b.h || 0));
+  }
+  if (tab.erdLayout) {
+    tab.erdLayout.width = maxR;
+    tab.erdLayout.height = maxB;
+  }
+}
+
+function erdColRowCenterY(box, colName, headerH = 28, rowH = 18) {
+  const key = String(colName || "").toLowerCase();
+  let idx = box.colIndex?.[key];
+  if (idx == null) {
+    const all = box.table?.columns || [];
+    const found = all.find((c) => String(c.name || "").toLowerCase() === key);
+    if (found) idx = box.colIndex?.[String(found.name).toLowerCase()];
+  }
+  if (idx == null) return (box.y || 0) + headerH + rowH / 2;
+  return (box.y || 0) + headerH + idx * rowH + rowH / 2;
+}
+
+/** Redraw FK/logical edges from current box positions (used while dragging tables). */
+function redrawErdEdges(tab) {
+  const svg = $("#erd-canvas");
+  const edges = svg?.querySelector(".erd-edges");
+  const layout = tab?.erdLayout;
+  if (!edges || !layout?.boxes) return;
+  while (edges.firstChild) edges.removeChild(edges.firstChild);
+
+  const NS = "http://www.w3.org/2000/svg";
+  const HEADER_H = layout.headerH || 28;
+  const ROW_H = layout.rowH || 18;
+  const boxes = layout.boxes;
+  const relations = getErdDisplayRelations(tab);
+
+  for (const rel of relations) {
+    // Data model: from* = FK/child side (b.a_id), to* = PK/parent side (a.id).
+    // Draw parent → child so the arrow reads a.id → b.a_id.
+    const parent = boxes[rel.toTable];
+    const child = boxes[rel.fromTable];
+    if (!parent || !child) continue;
+    const childCol = (rel.fromColumns && rel.fromColumns[0]) || "";
+    const parentCol = (rel.toColumns && rel.toColumns[0]) || "";
+    if (!childCol && !parentCol) continue;
+
+    const y1 = erdColRowCenterY(parent, parentCol, HEADER_H, ROW_H);
+    const y2 = erdColRowCenterY(child, childCol, HEADER_H, ROW_H);
+    let x1;
+    let x2;
+    const parentCenter = parent.x + parent.w / 2;
+    const childCenter = child.x + child.w / 2;
+    if (childCenter >= parentCenter) {
+      x1 = parent.x + parent.w;
+      x2 = child.x;
+    } else {
+      x1 = parent.x;
+      x2 = child.x + child.w;
+    }
+    const dx = Math.max(28, Math.abs(x2 - x1) * 0.45);
+    const c1x = x1 <= x2 ? x1 + dx : x1 - dx;
+    const c2x = x1 <= x2 ? x2 - dx : x2 + dx;
+
+    const startDot = document.createElementNS(NS, "circle");
+    startDot.setAttribute("cx", String(x1));
+    startDot.setAttribute("cy", String(y1));
+    startDot.setAttribute("r", "2.5");
+    startDot.classList.add("erd-port");
+    if (rel.logical) startDot.classList.add("erd-port-logical");
+    startDot.dataset.from = rel.fromTable || "";
+    startDot.dataset.to = rel.toTable || "";
+    edges.appendChild(startDot);
+
+    const endDot = document.createElementNS(NS, "circle");
+    endDot.setAttribute("cx", String(x2));
+    endDot.setAttribute("cy", String(y2));
+    endDot.setAttribute("r", "2.5");
+    endDot.classList.add("erd-port");
+    if (rel.logical) endDot.classList.add("erd-port-logical");
+    endDot.dataset.from = rel.fromTable || "";
+    endDot.dataset.to = rel.toTable || "";
+    edges.appendChild(endDot);
+
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${c1x} ${y1}, ${c2x} ${y2}, ${x2} ${y2}`);
+    path.classList.add("erd-edge");
+    if (rel.logical) path.classList.add("erd-edge-logical");
+    path.dataset.from = rel.fromTable || "";
+    path.dataset.to = rel.toTable || "";
+    path.dataset.fromCol = childCol;
+    path.dataset.toCol = parentCol;
+    path.dataset.logical = rel.logical ? "1" : "0";
+    path.setAttribute("marker-end", "url(#erd-arrow)");
+    edges.appendChild(path);
+
+    if (parentCol || childCol) {
+      const mx = (x1 + x2) / 2;
+      const my = (y1 + y2) / 2 - 5;
+      const label = document.createElementNS(NS, "text");
+      label.setAttribute("x", String(mx));
+      label.setAttribute("y", String(my));
+      label.setAttribute("text-anchor", "middle");
+      label.classList.add("erd-edge-label");
+      if (rel.logical) label.classList.add("erd-edge-logical");
+      label.dataset.from = rel.fromTable || "";
+      label.dataset.to = rel.toTable || "";
+      const nm = rel.logical
+        ? `~ ${parentCol} → ${childCol}`
+        : `${parentCol} → ${childCol}`;
+      label.textContent = nm.length > 28 ? `${nm.slice(0, 27)}…` : nm;
+      edges.appendChild(label);
+    }
+  }
+
+  applyErdFocusStyles(tab);
+  applyErdSearchStyles(tab);
+}
+
 function renderErdDiagram(data, tab) {
   const svg = $("#erd-canvas");
   const empty = $("#erd-empty");
@@ -5662,9 +5868,7 @@ function renderErdDiagram(data, tab) {
   const tables = [...(data?.tables || [])].sort((a, b) =>
     String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" }),
   );
-  if (!tab.erdLogicalRelations) {
-    tab.erdLogicalRelations = inferLogicalErdRelations(tables, data?.relations || []);
-  }
+  tab.erdLogicalRelations = inferLogicalErdRelations(tables, data?.relations || []);
   const fkRelations = data?.relations || [];
   const relations = getErdDisplayRelations(tab);
 
@@ -5690,13 +5894,54 @@ function renderErdDiagram(data, tab) {
   }
   if (empty) empty.hidden = true;
 
-  const CARD_W = 200;
+  const CARD_W = 220;
   const HEADER_H = 28;
   const ROW_H = 18;
   const PAD_X = 10;
-  const GAP_X = 48;
-  const GAP_Y = 40;
+  const GAP_X = 56;
+  const GAP_Y = 48;
+  const MAX_SHOWN_COLS = 40;
   const cols = Math.max(1, Math.ceil(Math.sqrt(tables.length)));
+
+  // Columns that must be visible so edge ports can attach accurately.
+  const requiredColsByTable = new Map();
+  const requireCol = (tableName, colName) => {
+    if (!tableName || !colName) return;
+    if (!requiredColsByTable.has(tableName)) requiredColsByTable.set(tableName, new Set());
+    requiredColsByTable.get(tableName).add(String(colName).toLowerCase());
+  };
+  for (const rel of relations) {
+    for (const c of rel.fromColumns || []) requireCol(rel.fromTable, c);
+    for (const c of rel.toColumns || []) requireCol(rel.toTable, c);
+  }
+
+  const buildShownColumns = (table) => {
+    const all = table.columns || [];
+    const required = requiredColsByTable.get(table.name) || new Set();
+    const shown = [];
+    const used = new Set();
+    const pushCol = (c) => {
+      if (!c?.name) return;
+      const key = String(c.name).toLowerCase();
+      if (used.has(key)) return;
+      used.add(key);
+      shown.push(c);
+    };
+    // Always keep PKs + relationship endpoints visible first.
+    for (const c of all) {
+      if (c.primaryKey || required.has(String(c.name || "").toLowerCase())) pushCol(c);
+    }
+    for (const c of all) {
+      if (shown.length >= MAX_SHOWN_COLS) break;
+      pushCol(c);
+    }
+    // If a required column is missing from metadata, synthesize a stub row so the port still exists.
+    for (const need of required) {
+      if (used.has(need)) continue;
+      pushCol({ name: need, type: "", primaryKey: false, nullable: true });
+    }
+    return shown;
+  };
 
   const boxes = {};
   let maxBottom = 0;
@@ -5704,12 +5949,30 @@ function renderErdDiagram(data, tab) {
   tables.forEach((t, i) => {
     const col = i % cols;
     const row = Math.floor(i / cols);
-    const colCount = Math.min((t.columns || []).length, 24);
-    const moreRow = (t.columns || []).length > 24 ? 1 : 0;
-    const h = HEADER_H + Math.max(1, colCount + moreRow) * ROW_H + 8;
+    const shownColumns = buildShownColumns(t);
+    const hiddenCount = Math.max(0, (t.columns || []).length - shownColumns.length);
+    const moreRow = hiddenCount > 0 ? 1 : 0;
+    const colCount = Math.max(1, shownColumns.length);
+    const h = HEADER_H + (colCount + moreRow) * ROW_H + 8;
     const x = col * (CARD_W + GAP_X);
-    const y = row * 0; // placeholder; compute after measuring row heights
-    boxes[t.name] = { name: t.name, table: t, x, y, w: CARD_W, h, col, row, colCount };
+    const colIndex = {};
+    shownColumns.forEach((c, idx) => {
+      colIndex[String(c.name || "").toLowerCase()] = idx;
+    });
+    boxes[t.name] = {
+      name: t.name,
+      table: t,
+      x,
+      y: 0,
+      w: CARD_W,
+      h,
+      col,
+      row,
+      colCount,
+      shownColumns,
+      hiddenCount,
+      colIndex,
+    };
   });
 
   // Compact row packing: track max height per grid row
@@ -5726,38 +5989,49 @@ function renderErdDiagram(data, tab) {
   }
   Object.values(boxes).forEach((b) => {
     b.y = rowTops[b.row] || 0;
+    const saved = tab.erdPositions?.[b.name];
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+      b.x = saved.x;
+      b.y = saved.y;
+    }
     maxBottom = Math.max(maxBottom, b.y + b.h);
     maxRight = Math.max(maxRight, b.x + b.w);
   });
 
-  tab.erdLayout = { width: maxRight, height: maxBottom, boxes };
+  tab.erdLayout = {
+    width: maxRight,
+    height: maxBottom,
+    boxes,
+    headerH: HEADER_H,
+    rowH: ROW_H,
+  };
 
   const NS = "http://www.w3.org/2000/svg";
   const root = document.createElementNS(NS, "g");
   root.classList.add("erd-root");
 
-  // Marker for FK arrows
+  // Marker for FK arrows — tip sits on the target column port.
   let defs = svg.querySelector("defs");
   if (!defs) {
     defs = document.createElementNS(NS, "defs");
     svg.appendChild(defs);
   }
   defs.innerHTML = `
-    <marker id="erd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" class="erd-arrow-fill"/>
+    <marker id="erd-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 1.2 L 8 5 L 0 8.8 z" class="erd-arrow-fill"/>
     </marker>
-    <marker id="erd-arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" class="erd-arrow-fill-active"/>
+    <marker id="erd-arrow-active" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 1.2 L 8 5 L 0 8.8 z" class="erd-arrow-fill-active"/>
     </marker>
   `;
-
-  const edges = document.createElementNS(NS, "g");
-  edges.classList.add("erd-edges");
-  root.appendChild(edges);
 
   const nodes = document.createElementNS(NS, "g");
   nodes.classList.add("erd-nodes");
   root.appendChild(nodes);
+
+  const edges = document.createElementNS(NS, "g");
+  edges.classList.add("erd-edges");
+  root.appendChild(edges);
 
   Object.values(boxes).forEach((b) => {
     const g = document.createElementNS(NS, "g");
@@ -5778,7 +6052,6 @@ function renderErdDiagram(data, tab) {
     head.setAttribute("rx", "6");
     head.classList.add("erd-table-head");
     g.appendChild(head);
-    // Square off bottom of header
     const headFix = document.createElementNS(NS, "rect");
     headFix.setAttribute("y", String(HEADER_H - 6));
     headFix.setAttribute("width", String(b.w));
@@ -5793,104 +6066,44 @@ function renderErdDiagram(data, tab) {
     nameText.textContent = b.name;
     g.appendChild(nameText);
 
-    const colsList = b.table.columns || [];
-    const shown = colsList.slice(0, 24);
-    shown.forEach((c, idx) => {
-      const y = HEADER_H + 14 + idx * ROW_H;
+    (b.shownColumns || []).forEach((c, idx) => {
+      const y = HEADER_H + 13 + idx * ROW_H;
       const row = document.createElementNS(NS, "text");
       row.setAttribute("x", String(PAD_X));
       row.setAttribute("y", String(y));
       row.classList.add("erd-col");
       row.dataset.col = c.name || "";
       if (c.primaryKey) row.classList.add("erd-col-pk");
+      const required = requiredColsByTable.get(b.name);
+      if (required?.has(String(c.name || "").toLowerCase())) {
+        row.classList.add("erd-col-linked");
+      }
       const pk = c.primaryKey ? "PK " : "";
       const type = c.type ? ` : ${c.type}` : "";
       const label = `${pk}${c.name}${type}`;
-      row.textContent = label.length > 28 ? `${label.slice(0, 27)}…` : label;
+      row.textContent = label.length > 30 ? `${label.slice(0, 29)}…` : label;
       g.appendChild(row);
     });
-    if (colsList.length > 24) {
+    if (b.hiddenCount > 0) {
       const more = document.createElementNS(NS, "text");
       more.setAttribute("x", String(PAD_X));
-      more.setAttribute("y", String(HEADER_H + 14 + 24 * ROW_H));
+      more.setAttribute("y", String(HEADER_H + 13 + (b.shownColumns || []).length * ROW_H));
       more.classList.add("erd-col", "erd-col-more");
-      more.textContent = `+${colsList.length - 24} more…`;
+      more.textContent = `+${b.hiddenCount} more…`;
       g.appendChild(more);
     }
 
-    let focusClickTimer = null;
-    g.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const live = state.workspaceTabs.find((t) => t.id === tab.id) || tab;
-      clearTimeout(focusClickTimer);
-      focusClickTimer = setTimeout(() => setErdFocus(live, b.name), 220);
-    });
     g.addEventListener("dblclick", (e) => {
       e.stopPropagation();
-      clearTimeout(focusClickTimer);
+      clearTimeout(erdTableFocusTimer);
       openTable(tab.schema, b.name, tab.connectionId, tab.database).catch((err) => alert(err.message));
     });
 
     nodes.appendChild(g);
   });
 
-  const portY = (box, colName) => {
-    const colsList = box.table.columns || [];
-    let idx = colsList.findIndex((c) => c.name === colName);
-    if (idx < 0) idx = 0;
-    idx = Math.min(idx, Math.max(0, box.colCount - 1));
-    return box.y + HEADER_H + 10 + idx * ROW_H;
-  };
-
-  relations.forEach((rel) => {
-    const from = boxes[rel.fromTable];
-    const to = boxes[rel.toTable];
-    if (!from || !to) return;
-    const fromCol = (rel.fromColumns && rel.fromColumns[0]) || "";
-    const toCol = (rel.toColumns && rel.toColumns[0]) || "";
-    const y1 = portY(from, fromCol);
-    const y2 = portY(to, toCol);
-    // Exit from right or left depending on relative position
-    let x1;
-    let x2;
-    if (to.x + to.w / 2 >= from.x + from.w / 2) {
-      x1 = from.x + from.w;
-      x2 = to.x;
-    } else {
-      x1 = from.x;
-      x2 = to.x + to.w;
-    }
-    const dx = Math.max(24, Math.abs(x2 - x1) * 0.4);
-    const c1x = x1 <= x2 ? x1 + dx : x1 - dx;
-    const c2x = x1 <= x2 ? x2 - dx : x2 + dx;
-    const path = document.createElementNS(NS, "path");
-    path.setAttribute("d", `M ${x1} ${y1} C ${c1x} ${y1}, ${c2x} ${y2}, ${x2} ${y2}`);
-    path.classList.add("erd-edge");
-    if (rel.logical) path.classList.add("erd-edge-logical");
-    path.dataset.from = rel.fromTable || "";
-    path.dataset.to = rel.toTable || "";
-    path.dataset.logical = rel.logical ? "1" : "0";
-    path.setAttribute("marker-end", "url(#erd-arrow)");
-    edges.appendChild(path);
-
-    if (rel.name) {
-      const mx = (x1 + x2) / 2;
-      const my = (y1 + y2) / 2 - 4;
-      const label = document.createElementNS(NS, "text");
-      label.setAttribute("x", String(mx));
-      label.setAttribute("y", String(my));
-      label.setAttribute("text-anchor", "middle");
-      label.classList.add("erd-edge-label");
-      if (rel.logical) label.classList.add("erd-edge-logical");
-      label.dataset.from = rel.fromTable || "";
-      label.dataset.to = rel.toTable || "";
-      const nm = rel.logical ? `~ ${rel.name}` : String(rel.name);
-      label.textContent = nm.length > 24 ? `${nm.slice(0, 23)}…` : nm;
-      edges.appendChild(label);
-    }
-  });
-
   svg.appendChild(root);
+  redrawErdEdges(tab);
 
   if (!tab.erdView || tab.erdView._needsFit) {
     tab.erdView = { x: 0, y: 0, scale: 1, _needsFit: false };
@@ -5922,6 +6135,7 @@ function renderErdDiagram(data, tab) {
 }
 
 let erdInteractionsBound = false;
+let erdTableFocusTimer = null;
 
 function ensureErdInteractions() {
   if (erdInteractionsBound) return;
@@ -5929,29 +6143,72 @@ function ensureErdInteractions() {
   if (!viewport) return;
   erdInteractionsBound = true;
 
-  let dragging = false;
-  let moved = false;
+  let panning = false;
+  let panMoved = false;
   let lastX = 0;
   let lastY = 0;
+  /** @type {{ name: string, el: Element, lastX: number, lastY: number, moved: boolean } | null} */
+  let tableDrag = null;
 
   viewport.addEventListener("pointerdown", (e) => {
     const tab = activeWorkspaceTab();
     if (!tab || tab.kind !== "erd") return;
-    if (e.target.closest?.(".erd-table")) return;
-    dragging = true;
-    moved = false;
+
+    const tableEl = e.target.closest?.(".erd-table");
+    if (tableEl) {
+      const name = tableEl.dataset.table;
+      if (!name || !tab.erdLayout?.boxes?.[name]) return;
+      e.preventDefault();
+      e.stopPropagation();
+      clearTimeout(erdTableFocusTimer);
+      tableDrag = {
+        name,
+        el: tableEl,
+        lastX: e.clientX,
+        lastY: e.clientY,
+        moved: false,
+      };
+      tableEl.classList.add("erd-dragging");
+      viewport.classList.add("erd-dragging-table");
+      viewport.setPointerCapture?.(e.pointerId);
+      return;
+    }
+
+    panning = true;
+    panMoved = false;
     lastX = e.clientX;
     lastY = e.clientY;
     viewport.setPointerCapture?.(e.pointerId);
     viewport.classList.add("erd-panning");
   });
+
   viewport.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
     const tab = activeWorkspaceTab();
     if (!tab || tab.kind !== "erd") return;
+
+    if (tableDrag) {
+      const box = tab.erdLayout?.boxes?.[tableDrag.name];
+      if (!box) return;
+      const scale = Math.max(0.01, tab.erdView?.scale || 1);
+      const dxScreen = e.clientX - tableDrag.lastX;
+      const dyScreen = e.clientY - tableDrag.lastY;
+      if (Math.abs(dxScreen) + Math.abs(dyScreen) > 3) tableDrag.moved = true;
+      box.x += dxScreen / scale;
+      box.y += dyScreen / scale;
+      tableDrag.lastX = e.clientX;
+      tableDrag.lastY = e.clientY;
+      tableDrag.el.setAttribute("transform", `translate(${box.x} ${box.y})`);
+      if (!tab.erdPositions) tab.erdPositions = {};
+      tab.erdPositions[tableDrag.name] = { x: box.x, y: box.y };
+      updateErdLayoutBounds(tab);
+      redrawErdEdges(tab);
+      return;
+    }
+
+    if (!panning) return;
     const dx = e.clientX - lastX;
     const dy = e.clientY - lastY;
-    if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+    if (Math.abs(dx) + Math.abs(dy) > 3) panMoved = true;
     const view = tab.erdView || { x: 0, y: 0, scale: 1 };
     view.x += dx;
     view.y += dy;
@@ -5960,20 +6217,34 @@ function ensureErdInteractions() {
     tab.erdView = view;
     applyErdTransform(tab);
   });
-  const endDrag = (e) => {
-    if (!dragging) return;
-    const wasMoved = moved;
-    dragging = false;
-    moved = false;
+
+  const endPointer = (e) => {
+    const tab = activeWorkspaceTab();
+    if (tableDrag) {
+      const drag = tableDrag;
+      tableDrag = null;
+      drag.el.classList.remove("erd-dragging");
+      viewport.classList.remove("erd-dragging-table");
+      try { viewport.releasePointerCapture?.(e.pointerId); } catch (_) { /* ignore */ }
+      if (!drag.moved && tab?.kind === "erd") {
+        clearTimeout(erdTableFocusTimer);
+        erdTableFocusTimer = setTimeout(() => {
+          const live = state.workspaceTabs.find((t) => t.id === tab.id) || tab;
+          setErdFocus(live, drag.name);
+        }, 220);
+      }
+      return;
+    }
+    if (!panning) return;
+    const wasMoved = panMoved;
+    panning = false;
+    panMoved = false;
     viewport.classList.remove("erd-panning");
     try { viewport.releasePointerCapture?.(e.pointerId); } catch (_) { /* ignore */ }
-    if (!wasMoved) {
-      const tab = activeWorkspaceTab();
-      if (tab?.kind === "erd" && tab.erdFocusTable) clearErdFocus(tab);
-    }
+    if (!wasMoved && tab?.kind === "erd" && tab.erdFocusTable) clearErdFocus(tab);
   };
-  viewport.addEventListener("pointerup", endDrag);
-  viewport.addEventListener("pointercancel", endDrag);
+  viewport.addEventListener("pointerup", endPointer);
+  viewport.addEventListener("pointercancel", endPointer);
 
   // Two-finger trackpad scroll pans; pinch / ctrl+wheel zoom stays blocked (toolbar ±).
   viewport.addEventListener("wheel", (e) => {
@@ -5982,7 +6253,6 @@ function ensureErdInteractions() {
     const tab = activeWorkspaceTab();
     if (!tab || tab.kind !== "erd") return;
     const view = tab.erdView || { x: 0, y: 0, scale: 1 };
-    // deltaMode: 0=pixels, 1=lines, 2=pages
     let dx = e.deltaX;
     let dy = e.deltaY;
     if (e.deltaMode === 1) {
@@ -5992,7 +6262,6 @@ function ensureErdInteractions() {
       dx *= viewport.clientWidth;
       dy *= viewport.clientHeight;
     }
-    // Shift+wheel often maps vertical to horizontal on mice; keep both axes.
     if (e.shiftKey && dx === 0 && dy !== 0) {
       dx = dy;
       dy = 0;
@@ -7283,9 +7552,59 @@ function renderStructure(cols) {
       <td>${c.nullable ? "YES" : "NO"}</td>
       <td>${c.primaryKey ? "✓" : ""}</td>
       <td>${c.autoIncrement ? "✓" : ""}</td>
-      <td>${escapeHtml(c.defaultValue ?? "")}</td>`;
+      <td>${escapeHtml(c.defaultValue ?? "")}</td>
+      <td class="structure-actions"></td>`;
+    const actions = tr.querySelector(".structure-actions");
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.className = "btn ghost sm";
+    renameBtn.textContent = "Rename";
+    renameBtn.title = `Rename column ${c.name}`;
+    renameBtn.addEventListener("click", () => {
+      const tab = activeWorkspaceTab();
+      const schema = tab?.schema || state.currentSchema;
+      const table = tab?.table || state.currentTable;
+      if (!schema || !table) {
+        alert("Open a table first");
+        return;
+      }
+      renameColumnInteractive(schema, table, c.name, tab?.connectionId || state.activeConnectionId)
+        .catch((err) => alert(err.message));
+    });
+    actions.appendChild(renameBtn);
     tbody.appendChild(tr);
   }
+}
+
+async function renameColumnInteractive(schema, table, column, connectionId = null) {
+  const current = String(column || "").trim();
+  if (!schema || !table || !current) {
+    throw new Error("Schema, table, and column are required");
+  }
+  const newName = String(prompt(`Rename column “${current}” to:`, current) || "").trim();
+  if (!newName || newName === current) return null;
+  const cid = connectionId || state.activeConnectionId;
+  const path = withConnectionId(
+    `/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/columns/${encodeURIComponent(current)}/rename`,
+    cid,
+  );
+  await api(path, {
+    method: "POST",
+    body: JSON.stringify({ newName }),
+    connectionId: cid,
+  });
+  setStatus(`Renamed column ${current} → ${newName}`);
+  // Refresh open table workspace if it matches.
+  const tab = activeWorkspaceTab();
+  if (tab?.kind === "table" && tab.schema === schema && tab.table === table) {
+    tab.columns = null;
+    tab.ddl = null;
+    await applyWorkspaceTab(tab.id, { forceReload: true });
+    if (state.currentTab === "structure" || tab.viewMode === "structure") {
+      switchTab("structure", { skipTitle: true });
+    }
+  }
+  return newName;
 }
 
 /* ── SQL output log ──────────────────────────────── */

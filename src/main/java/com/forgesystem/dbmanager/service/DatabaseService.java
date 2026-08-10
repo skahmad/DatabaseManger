@@ -1262,6 +1262,38 @@ public class DatabaseService {
         execute("ALTER TABLE " + qualify(schema, table) + " DROP COLUMN " + quoteIdent(column));
     }
 
+    public void renameColumn(String schema, String table, String column, String newName) throws SQLException {
+        if (column == null || column.isBlank()) {
+            throw new SQLException("Column name is required");
+        }
+        if (newName == null || newName.isBlank()) {
+            throw new SQLException("New column name is required");
+        }
+        String oldName = column.trim();
+        String renamed = newName.trim();
+        if (oldName.equals(renamed)) {
+            return;
+        }
+        DbType type = connectionService.getProfile().getDbType();
+        String sql = switch (type) {
+            case MYSQL, MARIADB, POSTGRESQL, SQLITE ->
+                    "ALTER TABLE " + qualify(schema, table)
+                            + " RENAME COLUMN " + quoteIdent(oldName)
+                            + " TO " + quoteIdent(renamed);
+            case H2, H2_FILE ->
+                    "ALTER TABLE " + qualify(schema, table)
+                            + " ALTER COLUMN " + quoteIdent(oldName)
+                            + " RENAME TO " + quoteIdent(renamed);
+            case SQLSERVER ->
+                    "EXEC sp_rename '"
+                            + schema.replace("'", "''") + "."
+                            + table.replace("'", "''") + "."
+                            + oldName.replace("'", "''")
+                            + "', '" + renamed.replace("'", "''") + "', 'COLUMN'";
+        };
+        execute(sql);
+    }
+
     public void createTable(String schema, String tableName, List<ColumnDefinition> columns) throws SQLException {
         if (columns.isEmpty()) {
             throw new SQLException("Table must have at least one column");
