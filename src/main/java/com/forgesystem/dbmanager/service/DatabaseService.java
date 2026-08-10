@@ -839,6 +839,116 @@ public class DatabaseService {
         return columns;
     }
 
+    /**
+     * Build an ERD payload for a database/schema: tables with columns + FK relations.
+     */
+    public Map<String, Object> getErd(String schema) throws SQLException {
+        if (schema == null || schema.isBlank()) {
+            throw new SQLException("Schema/database name is required");
+        }
+        List<String> tableNames = listTables(schema);
+        Collections.sort(tableNames);
+
+        List<Map<String, Object>> tables = new ArrayList<>();
+        for (String table : tableNames) {
+            Map<String, Object> t = new LinkedHashMap<>();
+            t.put("name", table);
+            List<Map<String, Object>> cols = new ArrayList<>();
+            for (ColumnInfo c : getColumns(schema, table)) {
+                Map<String, Object> col = new LinkedHashMap<>();
+                col.put("name", c.getName());
+                col.put("type", c.getDisplayType());
+                col.put("primaryKey", c.isPrimaryKey());
+                col.put("nullable", c.isNullable());
+                cols.add(col);
+            }
+            t.put("columns", cols);
+            tables.add(t);
+        }
+
+        List<Map<String, Object>> relations = listForeignKeyRelations(schema, tableNames);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("schema", schema);
+        out.put("tables", tables);
+        out.put("relations", relations);
+        return out;
+    }
+
+    private List<Map<String, Object>> listForeignKeyRelations(String schema, List<String> tableNames)
+            throws SQLException {
+        Connection conn = connectionService.getConnection();
+        DatabaseMetaData meta = conn.getMetaData();
+        String catalog = resolveCatalog(schema);
+        String schemaPattern = resolveSchemaPattern(schema);
+        Set<String> tableSet = new LinkedHashSet<>(tableNames);
+        // Group composite FK columns by FK name + tables.
+        Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
+
+        for (String table : tableNames) {
+            try (ResultSet rs = meta.getImportedKeys(catalog, schemaPattern, table)) {
+                while (rs.next()) {
+                    String fkTable = rs.getString("FKTABLE_NAME");
+                    String pkTable = rs.getString("PKTABLE_NAME");
+                    String fkCol = rs.getString("FKCOLUMN_NAME");
+                    String pkCol = rs.getString("PKCOLUMN_NAME");
+                    if (fkTable == null || pkTable == null || fkCol == null || pkCol == null) {
+                        continue;
+                    }
+                    // Keep edges within this schema's table set when possible.
+                    if (!tableSet.isEmpty() && (!tableSet.contains(fkTable) || !tableSet.contains(pkTable))) {
+                        continue;
+                    }
+                    String fkName = rs.getString("FK_NAME");
+                    if (fkName == null || fkName.isBlank()) {
+                        fkName = fkTable + "_to_" + pkTable;
+                    }
+                    int seq = 1;
+                    try {
+                        seq = rs.getInt("KEY_SEQ");
+                        if (rs.wasNull()) seq = 1;
+                    } catch (SQLException ignored) {
+                    }
+                    String key = fkName + "\0" + fkTable + "\0" + pkTable;
+                    Map<String, Object> rel = grouped.get(key);
+                    if (rel == null) {
+                        rel = new LinkedHashMap<>();
+                        rel.put("name", fkName);
+                        rel.put("fromTable", fkTable);
+                        rel.put("toTable", pkTable);
+                        rel.put("fromColumns", new ArrayList<String>());
+                        rel.put("toColumns", new ArrayList<String>());
+                        grouped.put(key, rel);
+                    }
+                    @SuppressWarnings("unchecked")
+                    List<String> fromCols = (List<String>) rel.get("fromColumns");
+                    @SuppressWarnings("unchecked")
+                    List<String> toCols = (List<String>) rel.get("toColumns");
+                    // KEY_SEQ is 1-based; ensure order
+                    while (fromCols.size() < seq) fromCols.add(null);
+                    while (toCols.size() < seq) toCols.add(null);
+                    fromCols.set(seq - 1, fkCol);
+                    toCols.set(seq - 1, pkCol);
+                }
+            } catch (SQLException ignored) {
+                // Some engines/drivers lack FK metadata for this table.
+            }
+        }
+
+        List<Map<String, Object>> relations = new ArrayList<>();
+        for (Map<String, Object> rel : grouped.values()) {
+            @SuppressWarnings("unchecked")
+            List<String> fromCols = (List<String>) rel.get("fromColumns");
+            @SuppressWarnings("unchecked")
+            List<String> toCols = (List<String>) rel.get("toColumns");
+            fromCols.removeIf(c -> c == null || c.isBlank());
+            toCols.removeIf(c -> c == null || c.isBlank());
+            if (fromCols.isEmpty() || toCols.isEmpty()) continue;
+            relations.add(rel);
+        }
+        return relations;
+    }
+
     public QueryResult previewTable(String schema, String table, int limit) throws SQLException {
         return previewTable(schema, table, limit, 0);
     }

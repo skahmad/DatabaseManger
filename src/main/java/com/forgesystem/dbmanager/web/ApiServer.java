@@ -84,6 +84,7 @@ public class ApiServer {
             config.routes.get("/api/explorer", this::explorer);
             config.routes.get("/api/details", this::details);
             config.routes.get("/api/databases/{schema}/properties", this::databaseProperties);
+            config.routes.get("/api/databases/{schema}/erd", this::erd);
             config.routes.get("/api/databases/{schema}/tables", this::tables);
             config.routes.get("/api/databases/{schema}/views", this::views);
             config.routes.get("/api/databases/{schema}/procedures", this::procedures);
@@ -494,6 +495,11 @@ public class ApiServer {
     private void databaseProperties(Context ctx) throws Exception {
         requireConnected(ctx);
         ctx.json(databaseService.getDatabaseProperties(ctx.pathParam("schema")));
+    }
+
+    private void erd(Context ctx) throws Exception {
+        requireConnected(ctx);
+        ctx.json(databaseService.getErd(ctx.pathParam("schema")));
     }
 
     private void tables(Context ctx) throws Exception {

@@ -1296,6 +1296,7 @@ function closeWorkspaceTabsForConnection(connectionId) {
   if (!connectionId) return;
   const kept = state.workspaceTabs.filter((t) => {
     if (t.kind === "table") return t.connectionId !== connectionId;
+    if (t.kind === "erd") return t.connectionId !== connectionId;
     if (t.kind === "context") return t.connectionId !== connectionId;
     return true;
   });
@@ -3908,6 +3909,22 @@ async function handleContextAction(action) {
         });
         break;
       }
+      case "open-erd": {
+        hideAllContextMenus();
+        const schema = target.schema;
+        if (!schema) {
+          alert("Select a database/schema first");
+          return;
+        }
+        const three = isThreeLayerProfile(activeProfile());
+        const dbName = target.database
+          || (target.kind === "database" ? target.schema : null)
+          || (!three ? target.schema : null)
+          || profileDatabaseName(state.activeConnectionId)
+          || "";
+        await openErd(schema, state.activeConnectionId, dbName);
+        break;
+      }
       case "open-table":
         hideAllContextMenus();
         await openTable(target.schema, target.table, state.activeConnectionId, target.database);
@@ -4108,7 +4125,7 @@ function workspaceTabTooltip(tab) {
   const mysqlLike = !!(profile && (profile.dbType === "MYSQL" || profile.dbType === "MARIADB" || (!threeLayer && !profile.fileBased)));
 
   let schema = "";
-  if (tab.kind === "table") {
+  if (tab.kind === "table" || tab.kind === "erd") {
     schema = tab.schema || "";
   } else {
     const focus = tab.detailFocus || state.detailFocus || {};
@@ -4135,6 +4152,15 @@ function workspaceTabTooltip(tab) {
       return [connName, db, sch].filter(Boolean).join(" · ");
     }
     return [connName, db || sch].filter(Boolean).join(" · ");
+  }
+
+  if (tab.kind === "erd") {
+    const db = tab.database || database;
+    const sch = tab.schema || schema;
+    if (threeLayer) {
+      return [connName, db, sch, "ERD"].filter(Boolean).join(" · ");
+    }
+    return [connName, db || sch, "ERD"].filter(Boolean).join(" · ");
   }
 
   if (threeLayer) {
@@ -4174,6 +4200,7 @@ function contextTabTitle(focus = state.detailFocus) {
 
 function contextTabBadge(tab) {
   if (tab.kind === "table") return "TBL";
+  if (tab.kind === "erd") return "ERD";
   if (tab.kind === "sql") return tab.source === "file" || tab.sqlFileName ? "FILE" : "SQL";
   const scope = tab.detailFocus?.scope || tab.scope;
   if (scope === "schema") return "SCH";
@@ -4191,6 +4218,7 @@ function workspaceTabLabel(tab) {
     return tab.title || tab.querySchema || tab.queryDatabase || "Query";
   }
   if (tab.kind === "table") return tab.table || tab.title || "Table";
+  if (tab.kind === "erd") return tab.title || tab.schema || "ERD";
   return tab.title || contextTabTitle(tab.detailFocus) || "Database";
 }
 
@@ -4293,6 +4321,13 @@ function resetWorkspaceTabs() {
 function snapshotActiveWorkspaceTab() {
   const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
   if (!tab) return;
+  if (tab.kind === "erd") {
+    tab.viewMode = "erd";
+    tab.connectionId = state.activeConnectionId || tab.connectionId;
+    tab.database = state.detailFocus?.database || tab.database || profileDatabaseName(state.activeConnectionId);
+    tab.detailFocus = { ...(state.detailFocus || {}) };
+    return;
+  }
   tab.viewMode = state.currentTab || "details";
   tab.schema = state.currentSchema;
   tab.table = state.currentTable;
@@ -4588,6 +4623,31 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
       state.result = tab.result;
       renderData(tab.result);
     }
+    return;
+  }
+
+  if (tab.kind === "erd") {
+    if (tab.connectionId) state.activeConnectionId = tab.connectionId;
+    state.currentSchema = tab.schema || null;
+    state.currentTable = null;
+    state.columns = [];
+    state.result = null;
+    setDetailFocus({
+      scope: isThreeLayerProfile(profileById(tab.connectionId)) ? "schema" : "database",
+      schema: tab.schema || null,
+      table: null,
+      database: tab.database || profileDatabaseName(tab.connectionId),
+      connectionId: tab.connectionId,
+    });
+    updateRunButton();
+    updateContextMeta(tab.title || tab.schema || "ERD");
+    tab.viewMode = "erd";
+    switchTab("erd", { skipTitle: true });
+    if (!forceReload && tab.erd) {
+      renderErdDiagram(tab.erd, tab);
+      return;
+    }
+    await loadErdIntoActiveTab(tab);
     return;
   }
 
@@ -4893,6 +4953,850 @@ async function openTable(schema, table, connectionId, database = null) {
   updateRunButton();
   renderWorkspaceTabs();
   await applyWorkspaceTab(id, { forceReload: !tab.columns || !tab.result });
+}
+
+function erdTabId(schema, connectionId) {
+  return `erd:${connectionId || state.activeConnectionId || ""}:${schema || ""}`;
+}
+
+async function openErd(schema, connectionId, database = null) {
+  if (!schema) {
+    alert("Select a database/schema first");
+    return;
+  }
+  if (connectionId) state.activeConnectionId = connectionId;
+  const cid = connectionId || state.activeConnectionId;
+  const id = erdTabId(schema, cid);
+  const profile = profileById(cid);
+  const three = isThreeLayerProfile(profile);
+  const dbName = database
+    || (!three ? schema : null)
+    || state.detailFocus?.database
+    || profileDatabaseName(cid)
+    || "";
+  snapshotActiveWorkspaceTab();
+  removeContextTabs();
+
+  let tab = state.workspaceTabs.find((t) => t.id === id);
+  if (!tab) {
+    tab = {
+      id,
+      kind: "erd",
+      title: schema,
+      schema,
+      table: null,
+      database: dbName,
+      connectionId: cid,
+      closable: true,
+      pinned: false,
+      viewMode: "erd",
+      erd: null,
+      erdView: { x: 0, y: 0, scale: 1 },
+    };
+    state.workspaceTabs.push(tab);
+  } else {
+    tab.connectionId = cid;
+    tab.schema = schema;
+    tab.database = dbName || tab.database;
+    tab.title = schema;
+    tab.viewMode = "erd";
+    if (!tab.erdView) tab.erdView = { x: 0, y: 0, scale: 1 };
+  }
+
+  state.activeWorkspaceTabId = id;
+  state.currentSchema = schema;
+  state.currentTable = null;
+  setDetailFocus({
+    scope: three ? "schema" : "database",
+    schema,
+    table: null,
+    database: dbName,
+    connectionId: cid,
+  });
+  updateRunButton();
+  renderWorkspaceTabs();
+  await applyWorkspaceTab(id, { forceReload: !tab.erd });
+}
+
+async function loadErdIntoActiveTab(tab) {
+  if (!tab || tab.kind !== "erd" || !tab.schema) return;
+  const empty = $("#erd-empty");
+  const title = $("#erd-title");
+  const subtitle = $("#erd-subtitle");
+  if (title) title.textContent = tab.schema;
+  if (subtitle) {
+    const n = tab.erd?.tables?.length;
+    subtitle.textContent = n != null
+      ? `${n} table${n === 1 ? "" : "s"} · foreign keys`
+      : "Loading tables and foreign keys…";
+  }
+  if (empty) {
+    empty.hidden = false;
+    empty.textContent = "Loading ER diagram…";
+  }
+  setErdCanvasEmpty();
+  try {
+    if (tab.connectionId) {
+      await api("/api/session/active", {
+        method: "POST",
+        body: JSON.stringify({ id: tab.connectionId }),
+      }).catch(() => {});
+    }
+    const path = withConnectionId(
+      `/api/databases/${encodeURIComponent(tab.schema)}/erd`,
+      tab.connectionId,
+    );
+    const data = await api(path, { connectionId: tab.connectionId });
+    const live = state.workspaceTabs.find((t) => t.id === tab.id);
+    if (!live || live.id !== state.activeWorkspaceTabId) return;
+    live.erd = data;
+    live.erdView = { ...(live.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
+    const tableCount = (data.tables || []).length;
+    const relCount = (data.relations || []).length;
+    if (subtitle) {
+      subtitle.textContent = `${tableCount} table${tableCount === 1 ? "" : "s"} · ${relCount} relation${relCount === 1 ? "" : "s"}`;
+    }
+    setStatus(`ERD · ${tab.schema}`);
+    renderErdDiagram(data, live);
+  } catch (err) {
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = err.message || "Failed to load ER diagram";
+    }
+    setErdCanvasEmpty();
+    setStatus(err.message || "ERD failed");
+  }
+}
+
+function setErdCanvasEmpty() {
+  const svg = $("#erd-canvas");
+  if (svg) {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+  }
+}
+
+function updateErdZoomLabel(scale) {
+  const label = $("#erd-zoom-label");
+  if (label) label.textContent = `${Math.round((scale || 1) * 100)}%`;
+}
+
+function applyErdTransform(tab) {
+  const svg = $("#erd-canvas");
+  if (!svg || !tab) return;
+  const view = tab.erdView || { x: 0, y: 0, scale: 1 };
+  tab.erdView = view;
+  const root = svg.querySelector(".erd-root");
+  if (root) {
+    root.setAttribute("transform", `translate(${view.x} ${view.y}) scale(${view.scale})`);
+  }
+  updateErdZoomLabel(view.scale);
+}
+
+function fitErdToViewport(tab) {
+  if (!tab?.erdLayout) return;
+  const viewport = $("#erd-viewport");
+  if (!viewport) return;
+  const pad = 32;
+  const vw = Math.max(1, viewport.clientWidth - pad * 2);
+  const vh = Math.max(1, viewport.clientHeight - pad * 2);
+  const { width, height } = tab.erdLayout;
+  if (!width || !height) return;
+  const scale = Math.min(1.4, Math.max(0.15, Math.min(vw / Math.max(width, 1), vh / Math.max(height, 1))));
+  tab.erdView = {
+    scale,
+    x: pad + (vw - width * scale) / 2,
+    y: pad + (vh - height * scale) / 2,
+  };
+  applyErdTransform(tab);
+}
+
+function erdZoomBy(factor) {
+  const tab = activeWorkspaceTab();
+  if (!tab || tab.kind !== "erd") return;
+  const viewport = $("#erd-viewport");
+  if (!viewport) return;
+  const view = tab.erdView || { x: 0, y: 0, scale: 1 };
+  const rect = viewport.getBoundingClientRect();
+  const cx = rect.width / 2;
+  const cy = rect.height / 2;
+  const next = Math.min(2.5, Math.max(0.15, view.scale * factor));
+  const wx = (cx - view.x) / view.scale;
+  const wy = (cy - view.y) / view.scale;
+  tab.erdView = {
+    scale: next,
+    x: cx - wx * next,
+    y: cy - wy * next,
+  };
+  applyErdTransform(tab);
+}
+
+/** Tables connected to `tableName` via FK (either direction), including itself. */
+function erdFocusNeighborhood(data, tableName) {
+  const related = new Set([tableName]);
+  for (const rel of data?.relations || []) {
+    if (rel.fromTable === tableName && rel.toTable) related.add(rel.toTable);
+    if (rel.toTable === tableName && rel.fromTable) related.add(rel.fromTable);
+  }
+  return related;
+}
+
+function updateErdFocusButton(tab) {
+  const btn = $("#btn-erd-clear-focus");
+  if (!btn) return;
+  const active = !!(tab && tab.kind === "erd" && tab.erdFocusTable);
+  btn.disabled = !active;
+  btn.classList.toggle("active", active);
+  btn.title = active
+    ? `Clear focus on ${tab.erdFocusTable}`
+    : "Click a table to enter focus mode";
+}
+
+function setErdFocus(tab, tableName) {
+  if (!tab || tab.kind !== "erd") return;
+  if (!tableName || tab.erdFocusTable === tableName) {
+    tab.erdFocusTable = null;
+  } else {
+    tab.erdFocusTable = tableName;
+  }
+  applyErdFocusStyles(tab);
+  updateErdFocusButton(tab);
+  applyErdSearchStyles(tab);
+  const subtitle = $("#erd-subtitle");
+  const tables = tab.erd?.tables || [];
+  const relations = tab.erd?.relations || [];
+  if (subtitle) {
+    if (tab.erdFocusTable) {
+      const n = erdFocusNeighborhood(tab.erd, tab.erdFocusTable).size;
+      subtitle.textContent = `Focus · ${tab.erdFocusTable} · ${n} related table${n === 1 ? "" : "s"}`;
+    } else {
+      subtitle.textContent = `${tables.length} table${tables.length === 1 ? "" : "s"} · ${relations.length} relation${relations.length === 1 ? "" : "s"}`;
+    }
+  }
+  if (tab.erdFocusTable) {
+    setStatus(`ERD focus · ${tab.erdFocusTable}`);
+  }
+}
+
+function clearErdFocus(tab = activeWorkspaceTab()) {
+  if (!tab || tab.kind !== "erd") return;
+  if (!tab.erdFocusTable) {
+    updateErdFocusButton(tab);
+    return;
+  }
+  tab.erdFocusTable = null;
+  applyErdFocusStyles(tab);
+  applyErdSearchStyles(tab);
+  updateErdFocusButton(tab);
+  const subtitle = $("#erd-subtitle");
+  const tables = tab.erd?.tables || [];
+  const relations = tab.erd?.relations || [];
+  if (subtitle) {
+    subtitle.textContent = `${tables.length} table${tables.length === 1 ? "" : "s"} · ${relations.length} relation${relations.length === 1 ? "" : "s"}`;
+  }
+}
+
+function applyErdFocusStyles(tab) {
+  const svg = $("#erd-canvas");
+  const root = svg?.querySelector(".erd-root");
+  if (!root) return;
+  const focus = tab?.erdFocusTable || null;
+  root.classList.toggle("erd-focus-mode", !!focus);
+  const related = focus ? erdFocusNeighborhood(tab.erd, focus) : null;
+
+  root.querySelectorAll(".erd-table").forEach((g) => {
+    const name = g.dataset.table;
+    g.classList.remove("erd-focused", "erd-related", "erd-dimmed");
+    if (!focus) return;
+    if (name === focus) g.classList.add("erd-focused");
+    else if (related?.has(name)) g.classList.add("erd-related");
+    else g.classList.add("erd-dimmed");
+  });
+
+  root.querySelectorAll(".erd-edge, .erd-edge-label").forEach((el) => {
+    el.classList.remove("erd-edge-active", "erd-dimmed");
+    if (!focus) {
+      if (el.classList.contains("erd-edge")) {
+        el.setAttribute("marker-end", "url(#erd-arrow)");
+      }
+      return;
+    }
+    const from = el.dataset.from;
+    const to = el.dataset.to;
+    const incident = from === focus || to === focus;
+    if (incident) {
+      el.classList.add("erd-edge-active");
+      if (el.classList.contains("erd-edge")) {
+        el.setAttribute("marker-end", "url(#erd-arrow-active)");
+      }
+    } else {
+      el.classList.add("erd-dimmed");
+      if (el.classList.contains("erd-edge")) {
+        el.setAttribute("marker-end", "url(#erd-arrow)");
+      }
+    }
+  });
+}
+
+function syncErdSearchUi(tab) {
+  const input = $("#erd-search-input");
+  const scope = $("#erd-search-scope");
+  if (!input || !scope) return;
+  if (tab?.kind === "erd") {
+    if (document.activeElement !== input) {
+      input.value = tab.erdSearchQuery || "";
+    }
+    if (document.activeElement !== scope) {
+      scope.value = tab.erdSearchScope === "column" ? "column" : "table";
+    }
+  } else {
+    input.value = "";
+    scope.value = "table";
+  }
+  updateErdSearchNav(tab);
+}
+
+function updateErdSearchNav(tab) {
+  const countEl = $("#erd-search-count");
+  const prev = $("#btn-erd-search-prev");
+  const next = $("#btn-erd-search-next");
+  const matches = tab?.kind === "erd" ? (tab.erdSearchMatches || []) : [];
+  const q = (tab?.erdSearchQuery || "").trim();
+  const has = matches.length > 0;
+  if (countEl) {
+    if (!q) {
+      countEl.hidden = true;
+      countEl.textContent = "";
+    } else {
+      countEl.hidden = false;
+      countEl.textContent = has
+        ? `${(tab.erdSearchIndex || 0) + 1}/${matches.length}`
+        : "0";
+    }
+  }
+  if (prev) prev.disabled = !has;
+  if (next) next.disabled = !has;
+}
+
+function collectErdSearchMatches(tab) {
+  const q = (tab?.erdSearchQuery || "").trim().toLowerCase();
+  const scope = tab?.erdSearchScope === "column" ? "column" : "table";
+  if (!q || !tab?.erd?.tables) return [];
+  const matches = [];
+  for (const t of tab.erd.tables) {
+    const tableName = String(t.name || "");
+    if (scope === "table") {
+      if (tableName.toLowerCase().includes(q)) {
+        matches.push({ table: tableName, column: null });
+      }
+      continue;
+    }
+    for (const c of t.columns || []) {
+      const colName = String(c.name || "");
+      if (colName.toLowerCase().includes(q)) {
+        matches.push({ table: tableName, column: colName });
+      }
+    }
+  }
+  matches.sort((a, b) => {
+    const t = a.table.localeCompare(b.table, undefined, { sensitivity: "base" });
+    if (t) return t;
+    return String(a.column || "").localeCompare(String(b.column || ""), undefined, { sensitivity: "base" });
+  });
+  return matches;
+}
+
+function applyErdSearchStyles(tab) {
+  const svg = $("#erd-canvas");
+  const root = svg?.querySelector(".erd-root");
+  if (!root) return;
+  const q = (tab?.erdSearchQuery || "").trim().toLowerCase();
+  const scope = tab?.erdSearchScope === "column" ? "column" : "table";
+  const matches = tab?.erdSearchMatches || [];
+  const hitTables = new Set(matches.map((m) => m.table));
+  const active = matches[tab?.erdSearchIndex || 0] || null;
+  const searching = !!q;
+
+  root.classList.toggle("erd-search-mode", searching);
+
+  root.querySelectorAll(".erd-table").forEach((g) => {
+    const name = g.dataset.table;
+    g.classList.remove("erd-search-hit", "erd-search-miss", "erd-search-current");
+    if (!searching) return;
+    if (hitTables.has(name)) {
+      g.classList.add("erd-search-hit");
+      if (active && active.table === name) g.classList.add("erd-search-current");
+    } else {
+      g.classList.add("erd-search-miss");
+    }
+  });
+
+  root.querySelectorAll(".erd-col").forEach((el) => {
+    el.classList.remove("erd-col-match", "erd-col-current");
+    if (!searching || scope !== "column") return;
+    const col = el.dataset.col || "";
+    const table = el.closest(".erd-table")?.dataset?.table || "";
+    if (!col || !table) return;
+    if (col.toLowerCase().includes(q)) {
+      el.classList.add("erd-col-match");
+      if (active && active.table === table && active.column === col) {
+        el.classList.add("erd-col-current");
+      }
+    }
+  });
+
+  // Dim edges that don't touch a hit table while searching
+  root.querySelectorAll(".erd-edge, .erd-edge-label").forEach((el) => {
+    el.classList.remove("erd-search-miss");
+    if (!searching) return;
+    const from = el.dataset.from;
+    const to = el.dataset.to;
+    if (!hitTables.has(from) && !hitTables.has(to)) {
+      el.classList.add("erd-search-miss");
+    }
+  });
+}
+
+function panErdToTable(tab, tableName) {
+  if (!tab?.erdLayout?.boxes || !tableName) return;
+  const box = tab.erdLayout.boxes[tableName];
+  const viewport = $("#erd-viewport");
+  if (!box || !viewport) return;
+  const view = tab.erdView || { x: 0, y: 0, scale: 1 };
+  const scale = view.scale || 1;
+  const cx = box.x + box.w / 2;
+  const cy = box.y + box.h / 2;
+  tab.erdView = {
+    scale,
+    x: viewport.clientWidth / 2 - cx * scale,
+    y: viewport.clientHeight / 2 - cy * scale,
+  };
+  applyErdTransform(tab);
+}
+
+function runErdSearch(tab, { pan = true } = {}) {
+  if (!tab || tab.kind !== "erd") return;
+  tab.erdSearchMatches = collectErdSearchMatches(tab);
+  if (!tab.erdSearchMatches.length) {
+    tab.erdSearchIndex = 0;
+  } else {
+    const idx = Number(tab.erdSearchIndex) || 0;
+    tab.erdSearchIndex = ((idx % tab.erdSearchMatches.length) + tab.erdSearchMatches.length)
+      % tab.erdSearchMatches.length;
+  }
+  applyErdSearchStyles(tab);
+  updateErdSearchNav(tab);
+  if (pan && tab.erdSearchMatches.length) {
+    const cur = tab.erdSearchMatches[tab.erdSearchIndex];
+    panErdToTable(tab, cur.table);
+    const label = cur.column ? `${cur.table}.${cur.column}` : cur.table;
+    setStatus(`ERD search · ${label}`);
+  } else if ((tab.erdSearchQuery || "").trim() && !tab.erdSearchMatches.length) {
+    setStatus("ERD search · no matches");
+  }
+}
+
+function erdSearchStep(delta) {
+  const tab = activeWorkspaceTab();
+  if (!tab || tab.kind !== "erd") return;
+  const matches = tab.erdSearchMatches || [];
+  if (!matches.length) return;
+  tab.erdSearchIndex = (tab.erdSearchIndex + delta + matches.length) % matches.length;
+  applyErdSearchStyles(tab);
+  updateErdSearchNav(tab);
+  const cur = matches[tab.erdSearchIndex];
+  panErdToTable(tab, cur.table);
+  const label = cur.column ? `${cur.table}.${cur.column}` : cur.table;
+  setStatus(`ERD search · ${label}`);
+}
+
+function wireErdSearch() {
+  const input = $("#erd-search-input");
+  const scope = $("#erd-search-scope");
+  if (!input || !scope || input.dataset.wired === "1") return;
+  input.dataset.wired = "1";
+
+  const applyFromUi = ({ pan = true } = {}) => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    tab.erdSearchQuery = input.value || "";
+    tab.erdSearchScope = scope.value === "column" ? "column" : "table";
+    tab.erdSearchIndex = 0;
+    runErdSearch(tab, { pan });
+  };
+
+  let timer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => applyFromUi({ pan: true }), 120);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      clearTimeout(timer);
+      applyFromUi({ pan: false });
+      if (e.shiftKey) erdSearchStep(-1);
+      else erdSearchStep(1);
+    } else if (e.key === "Escape" && input.value) {
+      e.preventDefault();
+      clearTimeout(timer);
+      input.value = "";
+      applyFromUi({ pan: false });
+    }
+  });
+  scope.addEventListener("change", () => applyFromUi({ pan: true }));
+  $("#btn-erd-search-prev")?.addEventListener("click", () => erdSearchStep(-1));
+  $("#btn-erd-search-next")?.addEventListener("click", () => erdSearchStep(1));
+}
+
+function renderErdDiagram(data, tab) {
+  const svg = $("#erd-canvas");
+  const empty = $("#erd-empty");
+  const title = $("#erd-title");
+  const subtitle = $("#erd-subtitle");
+  if (!svg || !tab) return;
+
+  const tables = [...(data?.tables || [])].sort((a, b) =>
+    String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" }),
+  );
+  const relations = data?.relations || [];
+
+  if (title) title.textContent = tab.schema || data?.schema || "ER Diagram";
+  if (subtitle) {
+    subtitle.textContent = `${tables.length} table${tables.length === 1 ? "" : "s"} · ${relations.length} relation${relations.length === 1 ? "" : "s"}`;
+  }
+
+  setErdCanvasEmpty();
+  if (!tables.length) {
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = "No tables in this database/schema.";
+    }
+    tab.erdLayout = { width: 0, height: 0, boxes: {} };
+    return;
+  }
+  if (empty) empty.hidden = true;
+
+  const CARD_W = 200;
+  const HEADER_H = 28;
+  const ROW_H = 18;
+  const PAD_X = 10;
+  const GAP_X = 48;
+  const GAP_Y = 40;
+  const cols = Math.max(1, Math.ceil(Math.sqrt(tables.length)));
+
+  const boxes = {};
+  let maxBottom = 0;
+  let maxRight = 0;
+  tables.forEach((t, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const colCount = Math.min((t.columns || []).length, 24);
+    const moreRow = (t.columns || []).length > 24 ? 1 : 0;
+    const h = HEADER_H + Math.max(1, colCount + moreRow) * ROW_H + 8;
+    const x = col * (CARD_W + GAP_X);
+    const y = row * 0; // placeholder; compute after measuring row heights
+    boxes[t.name] = { name: t.name, table: t, x, y, w: CARD_W, h, col, row, colCount };
+  });
+
+  // Compact row packing: track max height per grid row
+  const rowHeights = [];
+  tables.forEach((t) => {
+    const b = boxes[t.name];
+    rowHeights[b.row] = Math.max(rowHeights[b.row] || 0, b.h);
+  });
+  const rowTops = [];
+  let accY = 0;
+  for (let r = 0; r < rowHeights.length; r++) {
+    rowTops[r] = accY;
+    accY += (rowHeights[r] || HEADER_H) + GAP_Y;
+  }
+  Object.values(boxes).forEach((b) => {
+    b.y = rowTops[b.row] || 0;
+    maxBottom = Math.max(maxBottom, b.y + b.h);
+    maxRight = Math.max(maxRight, b.x + b.w);
+  });
+
+  tab.erdLayout = { width: maxRight, height: maxBottom, boxes };
+
+  const NS = "http://www.w3.org/2000/svg";
+  const root = document.createElementNS(NS, "g");
+  root.classList.add("erd-root");
+
+  // Marker for FK arrows
+  let defs = svg.querySelector("defs");
+  if (!defs) {
+    defs = document.createElementNS(NS, "defs");
+    svg.appendChild(defs);
+  }
+  defs.innerHTML = `
+    <marker id="erd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="erd-arrow-fill"/>
+    </marker>
+    <marker id="erd-arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="erd-arrow-fill-active"/>
+    </marker>
+  `;
+
+  const edges = document.createElementNS(NS, "g");
+  edges.classList.add("erd-edges");
+  root.appendChild(edges);
+
+  const nodes = document.createElementNS(NS, "g");
+  nodes.classList.add("erd-nodes");
+  root.appendChild(nodes);
+
+  Object.values(boxes).forEach((b) => {
+    const g = document.createElementNS(NS, "g");
+    g.classList.add("erd-table");
+    g.setAttribute("transform", `translate(${b.x} ${b.y})`);
+    g.dataset.table = b.name;
+
+    const rect = document.createElementNS(NS, "rect");
+    rect.setAttribute("width", String(b.w));
+    rect.setAttribute("height", String(b.h));
+    rect.setAttribute("rx", "6");
+    rect.classList.add("erd-table-card");
+    g.appendChild(rect);
+
+    const head = document.createElementNS(NS, "rect");
+    head.setAttribute("width", String(b.w));
+    head.setAttribute("height", String(HEADER_H));
+    head.setAttribute("rx", "6");
+    head.classList.add("erd-table-head");
+    g.appendChild(head);
+    // Square off bottom of header
+    const headFix = document.createElementNS(NS, "rect");
+    headFix.setAttribute("y", String(HEADER_H - 6));
+    headFix.setAttribute("width", String(b.w));
+    headFix.setAttribute("height", "6");
+    headFix.classList.add("erd-table-head");
+    g.appendChild(headFix);
+
+    const nameText = document.createElementNS(NS, "text");
+    nameText.setAttribute("x", String(PAD_X));
+    nameText.setAttribute("y", "18");
+    nameText.classList.add("erd-table-name");
+    nameText.textContent = b.name;
+    g.appendChild(nameText);
+
+    const colsList = b.table.columns || [];
+    const shown = colsList.slice(0, 24);
+    shown.forEach((c, idx) => {
+      const y = HEADER_H + 14 + idx * ROW_H;
+      const row = document.createElementNS(NS, "text");
+      row.setAttribute("x", String(PAD_X));
+      row.setAttribute("y", String(y));
+      row.classList.add("erd-col");
+      row.dataset.col = c.name || "";
+      if (c.primaryKey) row.classList.add("erd-col-pk");
+      const pk = c.primaryKey ? "PK " : "";
+      const type = c.type ? ` : ${c.type}` : "";
+      const label = `${pk}${c.name}${type}`;
+      row.textContent = label.length > 28 ? `${label.slice(0, 27)}…` : label;
+      g.appendChild(row);
+    });
+    if (colsList.length > 24) {
+      const more = document.createElementNS(NS, "text");
+      more.setAttribute("x", String(PAD_X));
+      more.setAttribute("y", String(HEADER_H + 14 + 24 * ROW_H));
+      more.classList.add("erd-col", "erd-col-more");
+      more.textContent = `+${colsList.length - 24} more…`;
+      g.appendChild(more);
+    }
+
+    let focusClickTimer = null;
+    g.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const live = state.workspaceTabs.find((t) => t.id === tab.id) || tab;
+      clearTimeout(focusClickTimer);
+      focusClickTimer = setTimeout(() => setErdFocus(live, b.name), 220);
+    });
+    g.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      clearTimeout(focusClickTimer);
+      openTable(tab.schema, b.name, tab.connectionId, tab.database).catch((err) => alert(err.message));
+    });
+
+    nodes.appendChild(g);
+  });
+
+  const portY = (box, colName) => {
+    const colsList = box.table.columns || [];
+    let idx = colsList.findIndex((c) => c.name === colName);
+    if (idx < 0) idx = 0;
+    idx = Math.min(idx, Math.max(0, box.colCount - 1));
+    return box.y + HEADER_H + 10 + idx * ROW_H;
+  };
+
+  relations.forEach((rel) => {
+    const from = boxes[rel.fromTable];
+    const to = boxes[rel.toTable];
+    if (!from || !to) return;
+    const fromCol = (rel.fromColumns && rel.fromColumns[0]) || "";
+    const toCol = (rel.toColumns && rel.toColumns[0]) || "";
+    const y1 = portY(from, fromCol);
+    const y2 = portY(to, toCol);
+    // Exit from right or left depending on relative position
+    let x1;
+    let x2;
+    if (to.x + to.w / 2 >= from.x + from.w / 2) {
+      x1 = from.x + from.w;
+      x2 = to.x;
+    } else {
+      x1 = from.x;
+      x2 = to.x + to.w;
+    }
+    const dx = Math.max(24, Math.abs(x2 - x1) * 0.4);
+    const c1x = x1 <= x2 ? x1 + dx : x1 - dx;
+    const c2x = x1 <= x2 ? x2 - dx : x2 + dx;
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${c1x} ${y1}, ${c2x} ${y2}, ${x2} ${y2}`);
+    path.classList.add("erd-edge");
+    path.dataset.from = rel.fromTable || "";
+    path.dataset.to = rel.toTable || "";
+    path.setAttribute("marker-end", "url(#erd-arrow)");
+    edges.appendChild(path);
+
+    if (rel.name) {
+      const mx = (x1 + x2) / 2;
+      const my = (y1 + y2) / 2 - 4;
+      const label = document.createElementNS(NS, "text");
+      label.setAttribute("x", String(mx));
+      label.setAttribute("y", String(my));
+      label.setAttribute("text-anchor", "middle");
+      label.classList.add("erd-edge-label");
+      label.dataset.from = rel.fromTable || "";
+      label.dataset.to = rel.toTable || "";
+      const nm = String(rel.name);
+      label.textContent = nm.length > 22 ? `${nm.slice(0, 21)}…` : nm;
+      edges.appendChild(label);
+    }
+  });
+
+  svg.appendChild(root);
+
+  if (!tab.erdView || tab.erdView._needsFit) {
+    tab.erdView = { x: 0, y: 0, scale: 1, _needsFit: false };
+    requestAnimationFrame(() => fitErdToViewport(tab));
+  } else {
+    applyErdTransform(tab);
+  }
+  applyErdFocusStyles(tab);
+  updateErdFocusButton(tab);
+  syncErdSearchUi(tab);
+  tab.erdSearchMatches = collectErdSearchMatches(tab);
+  if (tab.erdSearchMatches.length) {
+    const idx = Number(tab.erdSearchIndex) || 0;
+    tab.erdSearchIndex = ((idx % tab.erdSearchMatches.length) + tab.erdSearchMatches.length)
+      % tab.erdSearchMatches.length;
+  } else {
+    tab.erdSearchIndex = 0;
+  }
+  applyErdSearchStyles(tab);
+  updateErdSearchNav(tab);
+  if (tab.erdFocusTable) {
+    const subtitleEl = $("#erd-subtitle");
+    if (subtitleEl && !(tab.erdSearchQuery || "").trim()) {
+      const n = erdFocusNeighborhood(data, tab.erdFocusTable).size;
+      subtitleEl.textContent = `Focus · ${tab.erdFocusTable} · ${n} related table${n === 1 ? "" : "s"}`;
+    }
+  }
+  ensureErdInteractions();
+}
+
+let erdInteractionsBound = false;
+
+function ensureErdInteractions() {
+  if (erdInteractionsBound) return;
+  const viewport = $("#erd-viewport");
+  if (!viewport) return;
+  erdInteractionsBound = true;
+
+  let dragging = false;
+  let moved = false;
+  let lastX = 0;
+  let lastY = 0;
+
+  viewport.addEventListener("pointerdown", (e) => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    if (e.target.closest?.(".erd-table")) return;
+    dragging = true;
+    moved = false;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    viewport.setPointerCapture?.(e.pointerId);
+    viewport.classList.add("erd-panning");
+  });
+  viewport.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+    const view = tab.erdView || { x: 0, y: 0, scale: 1 };
+    view.x += dx;
+    view.y += dy;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    tab.erdView = view;
+    applyErdTransform(tab);
+  });
+  const endDrag = (e) => {
+    if (!dragging) return;
+    const wasMoved = moved;
+    dragging = false;
+    moved = false;
+    viewport.classList.remove("erd-panning");
+    try { viewport.releasePointerCapture?.(e.pointerId); } catch (_) { /* ignore */ }
+    if (!wasMoved) {
+      const tab = activeWorkspaceTab();
+      if (tab?.kind === "erd" && tab.erdFocusTable) clearErdFocus(tab);
+    }
+  };
+  viewport.addEventListener("pointerup", endDrag);
+  viewport.addEventListener("pointercancel", endDrag);
+
+  // Two-finger trackpad scroll pans; pinch / ctrl+wheel zoom stays blocked (toolbar ±).
+  viewport.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) return;
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    const view = tab.erdView || { x: 0, y: 0, scale: 1 };
+    // deltaMode: 0=pixels, 1=lines, 2=pages
+    let dx = e.deltaX;
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) {
+      dx *= 16;
+      dy *= 16;
+    } else if (e.deltaMode === 2) {
+      dx *= viewport.clientWidth;
+      dy *= viewport.clientHeight;
+    }
+    // Shift+wheel often maps vertical to horizontal on mice; keep both axes.
+    if (e.shiftKey && dx === 0 && dy !== 0) {
+      dx = dy;
+      dy = 0;
+    }
+    view.x -= dx;
+    view.y -= dy;
+    tab.erdView = view;
+    applyErdTransform(tab);
+  }, { passive: false });
+  viewport.addEventListener("gesturestart", (e) => e.preventDefault());
+  viewport.addEventListener("gesturechange", (e) => e.preventDefault());
+  viewport.addEventListener("gestureend", (e) => e.preventDefault());
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const tab = activeWorkspaceTab();
+    if (tab?.kind === "erd" && tab.erdFocusTable) {
+      clearErdFocus(tab);
+      e.stopPropagation();
+    }
+  });
 }
 
 function sqlTabId(connectionId, database, schema) {
@@ -5410,7 +6314,9 @@ function switchTab(name, { skipTitle = false } = {}) {
 
   // Without a table workspace tab, Structure/Details don't apply to SQL tabs.
   if (!isTable) {
-    if (tab?.kind === "sql") {
+    if (tab?.kind === "erd") {
+      target = "erd";
+    } else if (tab?.kind === "sql") {
       target = (name === "data" && (state.result || tab.result)) ? "data" : "sql";
     } else if (tab?.kind === "context" || tab?.kind === "home") {
       if (name === "data" && (state.result || tab.result)) target = "data";
@@ -6732,6 +7638,22 @@ function wire() {
     cellEditContext = null;
   });
   $("#btn-add-col-row").onclick = () => addCreateTableColumnRow();
+
+  $("#btn-erd-zoom-in")?.addEventListener("click", () => erdZoomBy(1.15));
+  $("#btn-erd-zoom-out")?.addEventListener("click", () => erdZoomBy(1 / 1.15));
+  $("#btn-erd-fit")?.addEventListener("click", () => {
+    const tab = activeWorkspaceTab();
+    if (tab?.kind === "erd") fitErdToViewport(tab);
+  });
+  $("#btn-erd-clear-focus")?.addEventListener("click", () => {
+    clearErdFocus(activeWorkspaceTab());
+  });
+  $("#btn-erd-refresh")?.addEventListener("click", () => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    applyWorkspaceTab(tab.id, { forceReload: true }).catch((err) => alert(err.message));
+  });
+  wireErdSearch();
 
   for (const sel of CTX_MENUS) {
     $(sel).onclick = (e) => {

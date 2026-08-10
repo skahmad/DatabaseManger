@@ -315,6 +315,39 @@
         </div>
       </section>
 
+      <section id="panel-erd" class="panel">
+        <div class="erd-layout">
+          <div class="erd-toolbar">
+            <div class="erd-toolbar-text">
+              <h3 id="erd-title">ER Diagram</h3>
+              <p id="erd-subtitle" class="details-subtitle">Tables and foreign keys for the selected database/schema.</p>
+            </div>
+            <div class="erd-toolbar-actions">
+              <div class="erd-search" id="erd-search">
+                <select id="erd-search-scope" class="erd-search-scope input" title="Search scope" aria-label="Search scope">
+                  <option value="table">Tables</option>
+                  <option value="column">Columns</option>
+                </select>
+                <input id="erd-search-input" class="erd-search-input input" type="search" placeholder="Search…" autocomplete="off" spellcheck="false" />
+                <span id="erd-search-count" class="erd-search-count" hidden>0</span>
+                <button type="button" class="btn ghost sm" id="btn-erd-search-prev" title="Previous match" disabled>↑</button>
+                <button type="button" class="btn ghost sm" id="btn-erd-search-next" title="Next match" disabled>↓</button>
+              </div>
+              <button type="button" class="btn ghost sm" id="btn-erd-zoom-out" title="Zoom out">−</button>
+              <span id="erd-zoom-label" class="erd-zoom-label">100%</span>
+              <button type="button" class="btn ghost sm" id="btn-erd-zoom-in" title="Zoom in">+</button>
+              <button type="button" class="btn ghost sm" id="btn-erd-fit" title="Fit diagram">Fit</button>
+              <button type="button" class="btn ghost sm" id="btn-erd-clear-focus" title="Clear focus mode" disabled>Clear focus</button>
+              <button type="button" class="btn ghost sm" id="btn-erd-refresh" title="Refresh ERD">Refresh</button>
+            </div>
+          </div>
+          <div id="erd-viewport" class="erd-viewport" tabindex="0" aria-label="ER diagram canvas">
+            <svg id="erd-canvas" class="erd-canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div id="erd-empty" class="empty">Open ER Diagram from a database or schema menu.</div>
+          </div>
+        </div>
+      </section>
+
       <footer class="status-bar">
         <span id="status">Ready</span>
       </footer>
@@ -404,6 +437,7 @@
     <button type="button" class="ctx-item" data-action="properties" role="menuitem">Properties</button>
     <button type="button" class="ctx-item" data-action="refresh-tree" role="menuitem">Refresh</button>
     <button type="button" class="ctx-item" data-action="open-sql" role="menuitem">SQL (Query Editor)</button>
+    <button type="button" class="ctx-item" data-action="open-erd" role="menuitem">ER Diagram</button>
     <button type="button" class="ctx-item ctx-db-only" data-action="create-schema" role="menuitem">Create schema…</button>
     <button type="button" class="ctx-item" data-action="create-table" role="menuitem">Create table…</button>
     <button type="button" class="ctx-item" data-action="create-view" role="menuitem">Create view…</button>
