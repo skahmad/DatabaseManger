@@ -638,6 +638,22 @@
     </form>
   </dialog>
 
+  <dialog id="modal-cell-edit" class="modal">
+    <form method="dialog" id="form-cell-edit" class="modal-card modal-card-wide">
+      <h3 id="cell-edit-title">Edit value</h3>
+      <p id="cell-edit-meta" class="hint"></p>
+      <label>Value
+        <textarea id="cell-edit-value" class="input cell-edit-value" rows="8" spellcheck="false"></textarea>
+      </label>
+      <label class="check"><input type="checkbox" id="cell-edit-null" /> Set NULL</label>
+      <p id="cell-edit-error" class="error-text" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="btn-cancel-cell-edit">Cancel</button>
+        <button type="submit" class="btn primary" id="btn-save-cell-edit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="col-filter-popup" class="col-filter-popup" hidden role="dialog" aria-label="Column filter">
     <div class="col-filter-head">
       <span id="col-filter-title" class="col-filter-title">Filter column</span>

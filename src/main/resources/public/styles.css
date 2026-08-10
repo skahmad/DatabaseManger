@@ -1485,6 +1485,22 @@ th {
   font-weight: 600; font-size: 0.8rem; z-index: 1;
 }
 tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
+#data-table tbody td.cell-editable {
+  cursor: pointer;
+}
+#data-table tbody td.cell-editable:hover {
+  background: rgba(var(--accent-rgb), 0.08);
+  outline: 1px solid rgba(var(--accent-rgb), 0.25);
+  outline-offset: -1px;
+}
+.cell-edit-value {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  resize: vertical;
+  min-height: 8rem;
+  white-space: pre-wrap;
+}
 .null { color: var(--muted); font-style: italic; }
 .empty {
   position: absolute; inset: 0; display: grid; place-items: center;

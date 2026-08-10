@@ -5831,6 +5831,163 @@ function setAllColumnsVisible(show) {
   renderData(state.result);
 }
 
+function canEditDataCells() {
+  const tab = activeWorkspaceTab();
+  return !!(tab && tab.kind === "table" && tab.table && tab.schema);
+}
+
+function primaryKeyColumnNames() {
+  return (state.columns || [])
+    .filter((c) => c && c.primaryKey && c.name)
+    .map((c) => c.name);
+}
+
+function formatCellEditorValue(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function parseCellEditorValue(text, original) {
+  const raw = text ?? "";
+  if (typeof original === "number" && raw.trim() !== "" && Number.isFinite(Number(raw))) {
+    return Number(raw);
+  }
+  if (typeof original === "boolean") {
+    const lower = raw.trim().toLowerCase();
+    if (lower === "true") return true;
+    if (lower === "false") return false;
+  }
+  if (original != null && typeof original === "object") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
+}
+
+let cellEditContext = null;
+
+function openCellValueEditor(row, column) {
+  if (!canEditDataCells()) {
+    setStatus("Open a table to edit cell values");
+    return;
+  }
+  const pks = primaryKeyColumnNames();
+  if (!pks.length) {
+    alert("Cannot update this table: no primary key is defined.");
+    return;
+  }
+  for (const pk of pks) {
+    if (!(pk in row)) {
+      alert(`Cannot update: primary key column “${pk}” is missing from this row.`);
+      return;
+    }
+  }
+
+  const tab = activeWorkspaceTab();
+  const modal = $("#modal-cell-edit");
+  const valueEl = $("#cell-edit-value");
+  const nullEl = $("#cell-edit-null");
+  const err = $("#cell-edit-error");
+  if (!modal || !valueEl || !nullEl) return;
+
+  cellEditContext = {
+    row,
+    column,
+    schema: tab.schema,
+    table: tab.table,
+    connectionId: tab.connectionId || state.activeConnectionId,
+  };
+
+  $("#cell-edit-title").textContent = `Edit ${column}`;
+  $("#cell-edit-meta").textContent = `${tab.schema}.${tab.table}`;
+  const isNull = row[column] == null;
+  nullEl.checked = isNull;
+  valueEl.value = formatCellEditorValue(row[column]);
+  valueEl.disabled = isNull;
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  nullEl.onchange = () => {
+    valueEl.disabled = nullEl.checked;
+    if (!nullEl.checked) valueEl.focus();
+  };
+  modal.showModal();
+  if (!isNull) {
+    valueEl.focus();
+    valueEl.select();
+  }
+}
+
+function closeCellValueEditor() {
+  cellEditContext = null;
+  $("#modal-cell-edit")?.close();
+}
+
+async function saveCellValueEdit(e) {
+  e.preventDefault();
+  const ctx = cellEditContext;
+  const err = $("#cell-edit-error");
+  if (!ctx) return;
+  const pks = primaryKeyColumnNames();
+  if (!pks.length) {
+    if (err) {
+      err.hidden = false;
+      err.textContent = "No primary key columns available.";
+    }
+    return;
+  }
+
+  const pk = {};
+  for (const name of pks) {
+    pk[name] = ctx.row[name];
+  }
+
+  const setNull = !!$("#cell-edit-null")?.checked;
+  const raw = $("#cell-edit-value")?.value ?? "";
+  const nextValue = setNull ? null : parseCellEditorValue(raw, ctx.row[ctx.column]);
+  const values = { [ctx.column]: nextValue };
+
+  const saveBtn = $("#btn-save-cell-edit");
+  if (saveBtn) saveBtn.disabled = true;
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  try {
+    const base = `/api/databases/${encodeURIComponent(ctx.schema)}/tables/${encodeURIComponent(ctx.table)}/rows`;
+    await api(withConnectionId(base, ctx.connectionId), {
+      method: "PUT",
+      body: JSON.stringify({ pk, values }),
+    });
+    ctx.row[ctx.column] = nextValue;
+    const tab = state.workspaceTabs.find((t) => t.id === state.activeWorkspaceTabId);
+    if (tab?.result) tab.result = state.result;
+    closeCellValueEditor();
+    renderData(state.result);
+    setStatus(`Updated ${ctx.table}.${ctx.column}`);
+  } catch (ex) {
+    if (err) {
+      err.hidden = false;
+      err.textContent = ex.message || "Failed to update value";
+    } else {
+      alert(ex.message || "Failed to update value");
+    }
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+}
+
 function renderData(result) {
   const thead = $("#data-table thead");
   const tbody = $("#data-table tbody");
@@ -5941,8 +6098,18 @@ function renderData(result) {
       if (v == null) {
         td.innerHTML = `<span class="null">NULL</span>`;
       } else {
-        td.textContent = v;
-        td.title = v;
+        td.textContent = typeof v === "object" ? JSON.stringify(v) : String(v);
+        td.title = typeof v === "object" ? JSON.stringify(v) : String(v);
+      }
+      if (canEditDataCells()) {
+        td.classList.add("cell-editable");
+        const tip = v == null ? "NULL" : (typeof v === "object" ? JSON.stringify(v) : String(v));
+        td.title = `${tip} · double-click to edit`;
+        td.ondblclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openCellValueEditor(row, c);
+        };
       }
       tr.appendChild(td);
     }
@@ -6557,6 +6724,13 @@ function wire() {
   $("#btn-cancel-clone").onclick = () => $("#modal-clone").close();
   $("#btn-cancel-export").onclick = () => $("#modal-export").close();
   $("#btn-cancel-import").onclick = () => $("#modal-import").close();
+  $("#btn-cancel-cell-edit")?.addEventListener("click", () => closeCellValueEditor());
+  $("#form-cell-edit")?.addEventListener("submit", (e) => {
+    saveCellValueEdit(e).catch((err) => console.error(err));
+  });
+  $("#modal-cell-edit")?.addEventListener("close", () => {
+    cellEditContext = null;
+  });
   $("#btn-add-col-row").onclick = () => addCreateTableColumnRow();
 
   for (const sel of CTX_MENUS) {
