@@ -95,6 +95,8 @@ const state = {
   columnFilters: {},
   /** Column name currently shown in the filter popup. */
   filterPopupColumn: null,
+  /** Cached SQL context dropdown options: { [connectionId]: { databases, schemasByDb } } */
+  sqlContextCache: {},
 };
 
 const COLUMN_FILTER_OPS = [
@@ -1406,6 +1408,7 @@ async function resetSession() {
   state.result = null;
   state.page = 1;
   state.expandedProfileIds = {};
+  state.sqlContextCache = {};
   invalidateExplorerCache();
   clearExplorerSearchScope({ refresh: false });
   setDetailFocus({ scope: "connection" });
@@ -1444,6 +1447,7 @@ async function disconnectCurrent(profileId) {
   delete state.connectedIds[id];
   setExpanded(id, false);
   invalidateExplorerCache(id);
+  if (state.sqlContextCache) delete state.sqlContextCache[id];
   closeWorkspaceTabsForConnection(id);
   if (explorerSearchScope()?.connectionId === id) {
     clearExplorerSearchScope({ refresh: false });
@@ -4869,8 +4873,9 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
   closeColumnFilterPopup();
   updateClearFiltersButton();
 
-  const hasCache = !forceReload && tab.columns && tab.result;
-  if (hasCache) {
+  const hasColCache = !forceReload && Array.isArray(tab.columns) && tab.columns.length > 0;
+  const hasRowCache = !forceReload && tab.result && Array.isArray(tab.result.columns);
+  if (hasColCache && hasRowCache) {
     state.columns = tab.columns;
     state.result = tab.result;
     state.page = tab.page || 1;
@@ -4885,12 +4890,34 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
       ? (tab.viewMode === "ddl" ? "structure" : "data")
       : (tab.viewMode || "data");
     switchTab(cachedMode, { skipTitle: true });
-    await refreshSqlContextUi();
+    // Don't block tab switches on SQL context dropdown refresh.
+    refreshSqlContextUi().catch(() => {});
+    return;
+  }
+
+  if (hasColCache && !hasRowCache) {
+    state.columns = tab.columns;
+    state.result = null;
+    state.page = tab.page || 1;
+    setSqlEditorValue(tab.sql || `SELECT * FROM ${quoteIdent(tab.table)} LIMIT ${Number($("#row-limit").value) || 1000}`);
+    state.sqlFileName = tab.sqlFileName || null;
+    state.sqlFilePath = tab.sqlFilePath || null;
+    updateSqlFileChip(state.sqlFileName);
+    $("#ddl-view").textContent = tab.ddl || "";
+    renderStructure(tab.columns);
+    const mode = tab.viewMode === "structure" || tab.viewMode === "details"
+      ? tab.viewMode
+      : "data";
+    switchTab(mode, { skipTitle: true });
+    refreshSqlContextUi().catch(() => {});
+    if (mode === "data" || !tab.result) {
+      await loadTableIntoActiveTab(tab, { rowsOnly: true });
+    }
     return;
   }
 
   await loadTableIntoActiveTab(tab);
-  await refreshSqlContextUi();
+  refreshSqlContextUi().catch(() => {});
 }
 
 function dataPageSize() {
@@ -4977,7 +5004,7 @@ async function changeDataPage(delta) {
   renderData(result);
 }
 
-async function loadTableIntoActiveTab(tab) {
+async function loadTableIntoActiveTab(tab, { rowsOnly = false } = {}) {
   const schema = tab.schema;
   const table = tab.table;
   const cid = tab.connectionId || state.activeConnectionId;
@@ -4985,18 +5012,32 @@ async function loadTableIntoActiveTab(tab) {
   setStatus(`Loading ${table}…`);
   const pageSize = dataPageSize();
   const base = `/api/databases/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}`;
-  const [cols, rows] = await Promise.all([
-    api(withConnectionId(`${base}/columns`, cid)),
-    api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=0`, cid)),
-  ]);
-  let ddlText = "DDL unavailable";
-  try {
-    const ddl = await api(withConnectionId(`${base}/ddl`, cid));
-    ddlText = ddl.ddl || "";
-  } catch {
-    /* ignore */
+  const page = Math.max(1, Number(tab.page) || 1);
+  const offset = (page - 1) * pageSize;
+
+  let cols = rowsOnly && Array.isArray(tab.columns) ? tab.columns : null;
+  let ddlText = rowsOnly && tab.ddl ? tab.ddl : null;
+  let rows;
+
+  if (rowsOnly && cols) {
+    rows = await api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}`, cid));
+  } else {
+    const [fetchedCols, fetchedRows] = await Promise.all([
+      api(withConnectionId(`${base}/columns`, cid)),
+      api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}`, cid)),
+    ]);
+    cols = fetchedCols;
+    rows = fetchedRows;
+    ddlText = "DDL unavailable";
+    try {
+      const ddl = await api(withConnectionId(`${base}/ddl`, cid));
+      ddlText = ddl.ddl || "";
+    } catch {
+      /* ignore */
+    }
   }
-  const sql = tablePageSql(table, 1, pageSize);
+
+  const sql = tablePageSql(table, page, pageSize);
 
   // Tab may have been closed while loading
   const live = state.workspaceTabs.find((t) => t.id === tab.id);
@@ -5004,9 +5045,10 @@ async function loadTableIntoActiveTab(tab) {
 
   live.columns = cols;
   live.result = rows;
-  live.ddl = ddlText;
+  if (ddlText != null) live.ddl = ddlText;
   live.sql = sql;
-  live.page = 1;
+  live.page = page;
+  live.dataCachedAt = Date.now();
   if (live.viewMode === "details" || live.viewMode === "sql") live.viewMode = "data";
   else if (live.viewMode === "ddl") live.viewMode = "structure";
   else live.viewMode = live.viewMode || "data";
@@ -5015,7 +5057,7 @@ async function loadTableIntoActiveTab(tab) {
 
   state.columns = cols;
   state.result = rows;
-  state.page = 1;
+  state.page = page;
   // Keep prior hide choices for this tab; drop names that no longer exist.
   state.hiddenColumns = { ...(live.hiddenColumns || {}) };
   pruneHiddenColumns(rows.columns || []);
@@ -5023,12 +5065,45 @@ async function loadTableIntoActiveTab(tab) {
   state.currentSchema = schema;
   state.currentTable = table;
   setSqlEditorValue(sql);
-  $("#ddl-view").textContent = ddlText;
+  if (ddlText != null) $("#ddl-view").textContent = ddlText;
   renderStructure(cols);
   renderData(rows);
   updateContextMeta(`${schema} · ${table}`);
   switchTab(live.viewMode || "data", { skipTitle: true });
   setStatus(rows.message || `Loaded ${table}`);
+}
+
+async function refreshTableData() {
+  const tab = activeWorkspaceTab();
+  if (!tab || tab.kind !== "table") {
+    setStatus("Open a table to refresh data");
+    return;
+  }
+  snapshotActiveWorkspaceTab();
+  const btn = $("#btn-refresh-data");
+  if (btn) btn.disabled = true;
+  try {
+    setStatus(`Refreshing ${tab.table}…`);
+    await loadTableIntoActiveTab(tab, { rowsOnly: false });
+    setStatus(`Refreshed ${tab.table}`);
+  } catch (err) {
+    setStatus(err.message || "Failed to refresh table data");
+    throw err;
+  } finally {
+    if (btn) btn.disabled = false;
+    updateRefreshDataButton();
+  }
+}
+
+function updateRefreshDataButton() {
+  const btn = $("#btn-refresh-data");
+  if (!btn) return;
+  const tab = activeWorkspaceTab();
+  const show = state.currentTab === "data" && tab?.kind === "table";
+  btn.hidden = !show;
+  if (show) {
+    btn.title = `Refresh data for ${tab.schema}.${tab.table}`;
+  }
 }
 
 function closeWorkspaceTab(tabId) {
@@ -6744,26 +6819,40 @@ function fillSelectOptions(select, values, selected, { allowEmpty = true, emptyL
   }
 }
 
-async function loadSqlDatabaseOptions() {
+async function loadSqlDatabaseOptions({ force = false } = {}) {
   const cid = state.activeConnectionId;
   if (!cid) return [];
+  if (!state.sqlContextCache) state.sqlContextCache = {};
+  const entry = state.sqlContextCache[cid] || (state.sqlContextCache[cid] = { databases: null, schemasByDb: {} });
+  if (!force && Array.isArray(entry.databases)) return entry.databases;
   try {
-    return await api(withConnectionId("/api/databases", cid));
+    const databases = await api(withConnectionId("/api/databases", cid));
+    entry.databases = Array.isArray(databases) ? databases : [];
+    return entry.databases;
   } catch {
     const fallback = profileDatabaseName(cid);
-    return fallback ? [fallback] : [];
+    const databases = fallback ? [fallback] : [];
+    entry.databases = databases;
+    return databases;
   }
 }
 
-async function loadSqlSchemaOptions(database) {
+async function loadSqlSchemaOptions(database, { force = false } = {}) {
   const cid = state.activeConnectionId;
   if (!cid) return [];
   const profile = activeProfile();
   if (!isThreeLayerProfile(profile)) return [];
+  if (!state.sqlContextCache) state.sqlContextCache = {};
+  const entry = state.sqlContextCache[cid] || (state.sqlContextCache[cid] = { databases: null, schemasByDb: {} });
+  const key = database || "";
+  if (!force && Array.isArray(entry.schemasByDb[key])) return entry.schemasByDb[key];
   try {
     const q = database ? `?database=${encodeURIComponent(database)}` : "";
-    return await api(withConnectionId(`/api/schemas${q}`, cid));
+    const schemas = await api(withConnectionId(`/api/schemas${q}`, cid));
+    entry.schemasByDb[key] = Array.isArray(schemas) ? schemas : [];
+    return entry.schemasByDb[key];
   } catch {
+    entry.schemasByDb[key] = [];
     return [];
   }
 }
@@ -7171,6 +7260,7 @@ function updateViewTabBarVisibility() {
     backBtn.hidden = isTable || !onData || !(tab && (tab.kind === "sql" || tab.kind === "context" || tab.kind === "home"));
   }
   updateDetailsActionButtons();
+  updateRefreshDataButton();
 }
 
 /** Show Details → Structure only when a table workspace is active. */
@@ -7250,6 +7340,29 @@ function switchTab(name, { skipTitle = false } = {}) {
     refreshDetails().catch((e) => console.error(e));
   } else {
     updateDetailsActionButtons();
+  }
+  if (target === "data") {
+    // Prefer cached rows on the workspace tab — never refetch just for a view switch.
+    if (isTable) {
+      if (tab.result && state.result !== tab.result) {
+        state.result = tab.result;
+        state.columns = tab.columns || state.columns;
+        state.page = tab.page || state.page || 1;
+        state.hiddenColumns = { ...(tab.hiddenColumns || {}) };
+        state.columnFilters = { ...(tab.columnFilters || {}) };
+        renderData(tab.result);
+      } else if (!tab.result && !tab._loadingRows) {
+        tab._loadingRows = true;
+        loadTableIntoActiveTab(tab, { rowsOnly: !!tab.columns?.length })
+          .catch((e) => setStatus(e.message || "Failed to load table data"))
+          .finally(() => { tab._loadingRows = false; });
+      }
+    } else if (tab?.result && state.result !== tab.result) {
+      state.result = tab.result;
+      state.page = tab.page || state.page || 1;
+      renderData(tab.result);
+    }
+    updateRefreshDataButton();
   }
   if (target === "structure") {
     const st = $("#structure-title");
@@ -9123,6 +9236,9 @@ function wire() {
       console.error(e);
       setStatus(e.message || "Failed to refresh details");
     });
+  });
+  $("#btn-refresh-data")?.addEventListener("click", () => {
+    refreshTableData().catch((e) => console.error(e));
   });
   $("#btn-back-to-details")?.addEventListener("click", () => {
     switchTab("details");
