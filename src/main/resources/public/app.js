@@ -22,7 +22,7 @@ const state = {
   columns: [],
   result: null,
   page: 1,
-  pageSize: 1000,
+  pageSize: 200,
   contextDb: null,
   contextTarget: null,
   expandedProfileIds: {},
@@ -860,7 +860,17 @@ function paintExplorerSearchFilter(matches, entity) {
   const tree = $("#conn-tree");
   if (!tree) return;
   tree.classList.add("is-searching");
-  const matchConnIds = new Set((matches || []).map((m) => m.connectionId));
+  const list = matches || [];
+  const matchConnIds = new Set(list.map((m) => m.connectionId));
+  const nameKeys = new Set();
+  const schemaKeys = new Set();
+  const leafKeys = new Set();
+  for (const m of list) {
+    const cid = m.connectionId;
+    if (m.name) nameKeys.add(`${cid}\0${m.name}`);
+    if (m.schema) schemaKeys.add(`${cid}\0${m.schema}`);
+    if (m.name && m.schema) leafKeys.add(`${cid}\0${m.schema}\0${m.name}`);
+  }
 
   for (const conn of tree.querySelectorAll(".conn-node")) {
     const id = conn.dataset.profileId;
@@ -875,7 +885,7 @@ function paintExplorerSearchFilter(matches, entity) {
     for (const node of tree.querySelectorAll(".tree-node[data-tree-kind='database']")) {
       const cid = node.dataset.treeConnectionId;
       const key = node.dataset.treeSchema;
-      const hit = matches.some((m) => m.connectionId === cid && (m.name === key || m.schema === key));
+      const hit = nameKeys.has(`${cid}\0${key}`) || schemaKeys.has(`${cid}\0${key}`);
       node.classList.toggle("search-miss", !hit);
       node.classList.toggle("search-hit", hit);
       node.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
@@ -893,7 +903,7 @@ function paintExplorerSearchFilter(matches, entity) {
         let any = false;
         for (const sch of childSchemas) {
           const key = sch.dataset.treeSchema;
-          const hit = matches.some((m) => m.connectionId === cid && (m.name === key || m.schema === key));
+          const hit = nameKeys.has(`${cid}\0${key}`) || schemaKeys.has(`${cid}\0${key}`);
           sch.classList.toggle("search-miss", !hit);
           sch.classList.toggle("search-hit", hit);
           sch.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
@@ -902,7 +912,7 @@ function paintExplorerSearchFilter(matches, entity) {
         node.classList.toggle("search-miss", !any);
         node.classList.toggle("search-hit", any);
       } else {
-        const hit = matches.some((m) => m.connectionId === cid && (m.name === dbName || m.schema === dbName));
+        const hit = nameKeys.has(`${cid}\0${dbName}`) || schemaKeys.has(`${cid}\0${dbName}`);
         node.classList.toggle("search-miss", !hit);
         node.classList.toggle("search-hit", hit);
         node.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
@@ -913,12 +923,8 @@ function paintExplorerSearchFilter(matches, entity) {
 
   const wantKind = searchLeafKind(entity);
   for (const leaf of tree.querySelectorAll(".tree-leaf")) {
-    const hit = matches.some((m) => (
-      m.connectionId === leaf.dataset.treeConnectionId
-      && m.schema === leaf.dataset.treeSchema
-      && m.name === leaf.dataset.treeTable
-      && leaf.dataset.treeKind === wantKind
-    ));
+    const hit = leaf.dataset.treeKind === wantKind
+      && leafKeys.has(`${leaf.dataset.treeConnectionId}\0${leaf.dataset.treeSchema}\0${leaf.dataset.treeTable}`);
     leaf.classList.toggle("search-miss", !hit);
     leaf.classList.toggle("search-hit", hit);
     leaf.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
@@ -2751,6 +2757,9 @@ function refreshSqlHighlight() {
     const matchCase = !!$("#sql-find-case")?.checked;
     const idx = Math.max(0, state.sqlFindIndex);
     pre.innerHTML = renderSqlFindMarkedHtml(text, query, matchCase, idx) || " ";
+  } else if (text.length > 60000) {
+    // Huge scripts: skip token highlight so typing stays responsive in WebView.
+    pre.textContent = text || " ";
   } else {
     pre.innerHTML = highlightSql(text) || " ";
   }
@@ -2768,9 +2777,15 @@ function refreshSqlGutter() {
   const widthDigits = String(Math.max(lineCount, 1)).length;
   gutter.style.minWidth = `${Math.max(2.35, 1.1 + widthDigits * 0.55)}rem`;
 
+  // Cap gutter DOM for huge files — still show active line context.
+  const maxLines = 4000;
+  const shown = Math.min(lineCount, maxLines);
   let html = "";
-  for (let i = 1; i <= lineCount; i++) {
+  for (let i = 1; i <= shown; i++) {
     html += `<span class="sql-gutter-line${i === activeLine ? " active" : ""}">${i}</span>`;
+  }
+  if (lineCount > maxLines) {
+    html += `<span class="sql-gutter-line">…${lineCount}</span>`;
   }
   gutter.innerHTML = html;
   gutter.scrollTop = editor.scrollTop;
@@ -3307,16 +3322,22 @@ function wireSqlEditor() {
   const editor = getSqlEditor();
   if (!editor || editor.dataset.sqlEditorWired === "1") return;
   editor.dataset.sqlEditorWired = "1";
+  let sqlUiTimer = null;
   editor.addEventListener("keydown", handleSqlEditorKeydown);
   editor.addEventListener("input", () => {
-    refreshSqlEditorUi();
-    if (!$("#sql-find-bar")?.hidden) runSqlFind(0, { focusEditor: false });
+    refreshSqlCursorStatus();
+    clearTimeout(sqlUiTimer);
+    sqlUiTimer = setTimeout(() => {
+      refreshSqlHighlight();
+      refreshSqlGutter();
+      if (!$("#sql-find-bar")?.hidden) runSqlFind(0, { focusEditor: false });
+    }, 70);
     updateSqlSuggest().catch(() => {});
   });
   editor.addEventListener("scroll", syncSqlEditorScroll);
   editor.addEventListener("keyup", refreshSqlCursorStatus);
   editor.addEventListener("click", () => {
-    refreshSqlEditorUi();
+    refreshSqlCursorStatus();
     closeSqlSuggest();
   });
   editor.addEventListener("select", refreshSqlCursorStatus);
@@ -4218,7 +4239,25 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
     if (kids.hidden) wrap.dataset.userCollapsed = "1";
     else delete wrap.dataset.userCollapsed;
   };
-  for (const name of items) {
+  // While searching, only materialize matching leaves (avoids 1000s of DOM nodes).
+  let leafNames = items;
+  const searchQ = explorerSearchQuery();
+  const searchEntity = explorerSearchEntity();
+  if (
+    searchQ
+    && needsExplorerObjectIndex(searchEntity)
+    && searchLeafKind(searchEntity) === kind
+    && connectionId
+  ) {
+    const want = new Set(
+      (state.explorerSearch.matches || [])
+        .filter((m) => m.connectionId === connectionId && m.schema === schema)
+        .map((m) => m.name),
+    );
+    if (want.size) leafNames = items.filter((n) => want.has(n));
+  }
+  const frag = document.createDocumentFragment();
+  for (const name of leafNames) {
     const leaf = document.createElement("div");
     leaf.className = "tree-node tree-leaf";
     leaf.dataset.treeKind = kind;
@@ -4277,8 +4316,9 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
       }
     };
     leaf.appendChild(item);
-    kids.appendChild(leaf);
+    frag.appendChild(leaf);
   }
+  kids.appendChild(frag);
   if (!items.length) {
     kids.innerHTML = `<div class="hint" style="padding:.35rem">(empty)</div>`;
   }
@@ -4761,9 +4801,11 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     updateContextMeta(tab.title || "");
     await refreshSqlContextUi();
     if (epoch !== state.workspaceApplyEpoch) return;
-    // Re-assert editor/results in case an older refresh raced.
-    if (tab.sql != null) setSqlEditorValue(tab.sql);
-    if (tab.result) {
+    // Re-assert editor/results in case an older refresh raced — avoid rebuilding the grid twice.
+    if (tab.sql != null && ($("#sql-editor")?.value ?? "") !== tab.sql) {
+      setSqlEditorValue(tab.sql);
+    }
+    if (tab.result && state.result !== tab.result) {
       state.result = tab.result;
       renderData(tab.result);
     }
@@ -4809,7 +4851,9 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     await refreshSqlContextUi();
     if (epoch !== state.workspaceApplyEpoch) return;
     // File/query tabs: never let a stale refresh wipe the editor or result grid.
-    if (tab.sql != null) setSqlEditorValue(tab.sql);
+    if (tab.sql != null && ($("#sql-editor")?.value ?? "") !== tab.sql) {
+      setSqlEditorValue(tab.sql);
+    }
     if (tab.sqlFileName) {
       tab.title = tab.sqlFileName;
       state.sqlFileName = tab.sqlFileName;
@@ -4817,7 +4861,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     } else if (tab.table) {
       tab.title = tab.table;
     }
-    if (tab.result) {
+    if (tab.result && state.result !== tab.result) {
       state.result = tab.result;
       renderData(tab.result);
     }
@@ -4921,7 +4965,7 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
 }
 
 function dataPageSize() {
-  return Math.max(1, state.pageSize || 1000);
+  return Math.max(1, state.pageSize || 200);
 }
 
 function usesServerTablePaging(result = state.result, tab = activeWorkspaceTab()) {
@@ -6287,6 +6331,11 @@ function redrawErdEdges(tab) {
   applyErdSearchStyles(tab);
 }
 
+function setErdEdgesHidden(hidden) {
+  const edges = $("#erd-canvas")?.querySelector(".erd-edges");
+  if (edges) edges.style.visibility = hidden ? "hidden" : "";
+}
+
 function renderErdDiagram(data, tab) {
   const svg = $("#erd-canvas");
   const empty = $("#erd-empty");
@@ -6650,8 +6699,11 @@ function ensureErdInteractions() {
       tableDrag.el.setAttribute("transform", `translate(${box.x} ${box.y})`);
       if (!tab.erdPositions) tab.erdPositions = {};
       tab.erdPositions[tableDrag.name] = { x: box.x, y: box.y };
-      updateErdLayoutBounds(tab);
-      redrawErdEdges(tab);
+      // Hide edges while dragging — redrawing hundreds of paths each move freezes WebView.
+      if (!tableDrag.edgesHidden) {
+        setErdEdgesHidden(true);
+        tableDrag.edgesHidden = true;
+      }
       return;
     }
 
@@ -6676,6 +6728,13 @@ function ensureErdInteractions() {
       drag.el.classList.remove("erd-dragging");
       viewport.classList.remove("erd-dragging-table");
       try { viewport.releasePointerCapture?.(e.pointerId); } catch (_) { /* ignore */ }
+      if (drag.moved && tab?.kind === "erd") {
+        updateErdLayoutBounds(tab);
+        setErdEdgesHidden(false);
+        redrawErdEdges(tab);
+      } else {
+        setErdEdgesHidden(false);
+      }
       if (!drag.moved && tab?.kind === "erd") {
         clearTimeout(erdTableFocusTimer);
         if (e.shiftKey) {
@@ -7910,6 +7969,27 @@ function selectDataTableRow(tr) {
   if (!wasSelected) tr.classList.add("row-selected");
 }
 
+function ensureDataTableInteractions() {
+  const tbody = $("#data-table tbody");
+  if (!tbody || tbody.dataset.rowWired === "1") return;
+  tbody.dataset.rowWired = "1";
+  tbody.addEventListener("click", (e) => {
+    if (e.target.closest("button, a, input, textarea, select")) return;
+    const tr = e.target.closest("tr.data-row");
+    if (tr) selectDataTableRow(tr);
+  });
+  tbody.addEventListener("dblclick", (e) => {
+    const td = e.target.closest("td.cell-editable");
+    if (!td || !canEditDataCells()) return;
+    e.preventDefault();
+    const tr = td.closest("tr.data-row");
+    const idx = Number(tr?.dataset?.rowIndex);
+    const col = td.dataset.col;
+    const row = state.dataPageRows?.[idx];
+    if (row && col) openCellValueEditor(row, col);
+  });
+}
+
 function renderData(result) {
   const thead = $("#data-table thead");
   const tbody = $("#data-table tbody");
@@ -8012,37 +8092,35 @@ function renderData(result) {
     pagerTotal = rows.length;
   }
 
-  for (const row of pageRows) {
+  const frag = document.createDocumentFragment();
+  const editable = canEditDataCells();
+  state.dataPageRows = pageRows;
+  pageRows.forEach((row, rowIndex) => {
     const tr = document.createElement("tr");
     tr.classList.add("data-row");
-    tr.tabIndex = -1;
+    tr.dataset.rowIndex = String(rowIndex);
     for (const c of columns) {
       const td = document.createElement("td");
+      td.dataset.col = c;
       const v = row[c];
       if (v == null) {
         td.innerHTML = `<span class="null">NULL</span>`;
       } else {
-        td.textContent = typeof v === "object" ? JSON.stringify(v) : String(v);
-        td.title = typeof v === "object" ? JSON.stringify(v) : String(v);
+        const text = typeof v === "object" ? JSON.stringify(v) : String(v);
+        td.textContent = text;
+        td.title = text;
       }
-      if (canEditDataCells()) {
+      if (editable) {
         td.classList.add("cell-editable");
         const tip = v == null ? "NULL" : (typeof v === "object" ? JSON.stringify(v) : String(v));
         td.title = `${tip} · double-click to edit`;
-        td.ondblclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          openCellValueEditor(row, c);
-        };
       }
       tr.appendChild(td);
     }
-    tr.addEventListener("click", (e) => {
-      if (e.target.closest("button, a, input, textarea, select")) return;
-      selectDataTableRow(tr);
-    });
-    tbody.appendChild(tr);
-  }
+    frag.appendChild(tr);
+  });
+  tbody.appendChild(frag);
+  ensureDataTableInteractions();
 
   const schemaBit = state.currentSchema ? `${state.currentSchema} · ` : "";
   const tableBit = state.currentTable ? `${state.currentTable} · ` : "";
@@ -9144,9 +9222,12 @@ function wire() {
   updateRunButton();
   updateSqlFileChip();
   $("#data-search").oninput = () => {
-    state.page = 1;
-    updateFilterIndicators();
-    renderData(state.result);
+    clearTimeout(state._dataSearchTimer);
+    state._dataSearchTimer = setTimeout(() => {
+      state.page = 1;
+      updateFilterIndicators();
+      renderData(state.result);
+    }, 120);
   };
   $("#btn-columns").onclick = (e) => {
     e.stopPropagation();
