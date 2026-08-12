@@ -118,6 +118,94 @@
   --scheme: light;
 }
 
+[data-theme="light-ocean"] {
+  --bg: #f0f7ff;
+  --bg-elev: #ffffff;
+  --bg-panel: #e8f2fc;
+  --bg-input: #ffffff;
+  --line: #c9ddf2;
+  --text: #0f2744;
+  --muted: #4d6b8a;
+  --accent: #0284c7;
+  --accent-dim: #0369a1;
+  --accent-rgb: 2, 132, 199;
+  --danger: #e11d48;
+  --warn: #d97706;
+  --shadow: 0 18px 40px rgba(15, 39, 68, 0.12);
+  --primary-fg: #ffffff;
+  --btn-bg: #e4eef8;
+  --btn-hover: #d5e6f5;
+  --table-head: #dfeaf6;
+  --editor-bg: #f7fbff;
+  --scheme: light;
+}
+
+[data-theme="light-ember"] {
+  --bg: #faf6f3;
+  --bg-elev: #ffffff;
+  --bg-panel: #f4ebe4;
+  --bg-input: #ffffff;
+  --line: #e6d5c8;
+  --text: #2a1810;
+  --muted: #7a5c4c;
+  --accent: #ea580c;
+  --accent-dim: #c2410c;
+  --accent-rgb: 234, 88, 12;
+  --danger: #e11d48;
+  --warn: #ca8a04;
+  --shadow: 0 18px 40px rgba(42, 24, 16, 0.12);
+  --primary-fg: #ffffff;
+  --btn-bg: #f0e6de;
+  --btn-hover: #e6d8cc;
+  --table-head: #eee2d8;
+  --editor-bg: #fcf9f7;
+  --scheme: light;
+}
+
+[data-theme="light-violet"] {
+  --bg: #f6f4fb;
+  --bg-elev: #ffffff;
+  --bg-panel: #eeeaf8;
+  --bg-input: #ffffff;
+  --line: #d9d2ea;
+  --text: #1e1535;
+  --muted: #6b5f86;
+  --accent: #7c3aed;
+  --accent-dim: #6d28d9;
+  --accent-rgb: 124, 58, 237;
+  --danger: #e11d48;
+  --warn: #d97706;
+  --shadow: 0 18px 40px rgba(30, 21, 53, 0.12);
+  --primary-fg: #ffffff;
+  --btn-bg: #ebe6f5;
+  --btn-hover: #ddd5ef;
+  --table-head: #e7e1f4;
+  --editor-bg: #faf8fd;
+  --scheme: light;
+}
+
+[data-theme="light-slate"] {
+  --bg: #f4f5f7;
+  --bg-elev: #ffffff;
+  --bg-panel: #ebedef;
+  --bg-input: #ffffff;
+  --line: #d3d8e0;
+  --text: #1e2430;
+  --muted: #5c6678;
+  --accent: #475569;
+  --accent-dim: #334155;
+  --accent-rgb: 71, 85, 105;
+  --danger: #e11d48;
+  --warn: #d97706;
+  --shadow: 0 18px 40px rgba(30, 36, 48, 0.12);
+  --primary-fg: #ffffff;
+  --btn-bg: #e8eaee;
+  --btn-hover: #dde1e7;
+  --table-head: #e4e7ec;
+  --editor-bg: #f8f9fb;
+  --scheme: light;
+}
+
 * { box-sizing: border-box; }
 
 /* Author styles can override the UA [hidden] rule — force hide. */
@@ -565,6 +653,15 @@ body.resizing-sidebar * {
 .conn-tree.is-searching .tree-node.search-miss {
   display: none !important;
 }
+.conn-tree.is-searching .tree-node.search-scope-alt > .tree-row {
+  opacity: 0.72;
+}
+.conn-tree.is-searching .tree-node.search-scope-alt > .tree-row:hover {
+  opacity: 1;
+}
+.conn-tree.is-searching .tree-node.search-scope-alt > .tree-children {
+  display: none !important;
+}
 .conn-tree.is-searching .tree-row.search-hit {
   background: rgba(var(--accent-rgb), 0.14);
   color: var(--text);
@@ -988,6 +1085,22 @@ body.resizing-sidebar * {
   padding-bottom: 0.35rem;
   border-bottom: 1px solid var(--line);
 }
+.col-vis-search {
+  width: 100%;
+  min-width: 0;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.8rem;
+  border-radius: 8px;
+}
+.col-vis-search::-webkit-search-decoration,
+.col-vis-search::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+.col-vis-empty {
+  padding: 0.45rem 0.35rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
 .col-vis-list {
   overflow: auto;
   display: flex;
@@ -1316,14 +1429,19 @@ body.resizing-sidebar * {
 .sql-tok-tbl { color: #5eead4; }
 .sql-tok-col { color: #fde68a; }
 .sql-tok-id { color: var(--text); }
-[data-theme="light"] .sql-tok-kw { color: #0369a1; }
-[data-theme="light"] .sql-tok-fn { color: #6d28d9; }
-[data-theme="light"] .sql-tok-type { color: #15803d; }
-[data-theme="light"] .sql-tok-str { color: #be185d; }
-[data-theme="light"] .sql-tok-num { color: #b45309; }
-[data-theme="light"] .sql-tok-cm { color: #94a3b8; }
-[data-theme="light"] .sql-tok-tbl { color: #0f766e; }
-[data-theme="light"] .sql-tok-col { color: #a16207; }
+[data-theme^="light"] .sql-tok-kw { color: #0369a1; }
+[data-theme^="light"] .sql-tok-fn { color: #6d28d9; }
+[data-theme^="light"] .sql-tok-type { color: #15803d; }
+[data-theme^="light"] .sql-tok-str { color: #be185d; }
+[data-theme^="light"] .sql-tok-num { color: #b45309; }
+[data-theme^="light"] .sql-tok-cm { color: #64748b; }
+[data-theme^="light"] .sql-tok-tbl { color: #0f766e; }
+[data-theme^="light"] .sql-tok-col { color: #a16207; }
+[data-theme^="light"] .sql-log-entry.ok .sql-log-entry-head { color: #059669; }
+[data-theme^="light"] .sql-log-entry.err .sql-log-entry-head { color: #e11d48; }
+[data-theme^="light"] .explorer-entity-menu {
+  box-shadow: 0 10px 28px rgba(21, 32, 51, 0.14);
+}
 .sql-suggest {
   position: absolute;
   z-index: 40;

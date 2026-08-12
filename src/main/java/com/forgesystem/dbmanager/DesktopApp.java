@@ -29,7 +29,10 @@ import netscape.javascript.JSObject;
 public class DesktopApp extends Application {
     private static final int DEFAULT_PORT = 7070;
 
-    private static final String[] THEMES = {"teal", "ocean", "ember", "violet", "slate", "light"};
+    private static final String[] THEMES = {
+            "teal", "ocean", "ember", "violet", "slate",
+            "light", "light-ocean", "light-ember", "light-violet", "light-slate"
+    };
     private static final int[] ZOOM_LEVELS = {75, 90, 100, 110, 125, 150};
 
     private ApiServer server;
@@ -139,7 +142,7 @@ public class DesktopApp extends Application {
         Menu themeMenu = new Menu("Theme");
         ToggleGroup themeGroup = new ToggleGroup();
         for (String theme : THEMES) {
-            RadioMenuItem item = new RadioMenuItem(capitalize(theme));
+            RadioMenuItem item = new RadioMenuItem(themeLabel(theme));
             item.setToggleGroup(themeGroup);
             item.setUserData(theme);
             if ("teal".equals(theme)) {
@@ -204,6 +207,20 @@ public class DesktopApp extends Application {
                 // UI may not be ready yet.
             }
         });
+    }
+
+    private static String themeLabel(String theme) {
+        if (theme == null || theme.isBlank()) {
+            return "";
+        }
+        return switch (theme) {
+            case "light" -> "Light Teal";
+            case "light-ocean" -> "Light Ocean";
+            case "light-ember" -> "Light Ember";
+            case "light-violet" -> "Light Violet";
+            case "light-slate" -> "Light Slate";
+            default -> Character.toUpperCase(theme.charAt(0)) + theme.substring(1);
+        };
     }
 
     private static String capitalize(String value) {

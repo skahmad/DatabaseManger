@@ -2,7 +2,10 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const PREFS_KEY = "forge-dbmanager-prefs";
-const THEMES = ["teal", "ocean", "ember", "violet", "slate", "light"];
+const THEMES = [
+  "teal", "ocean", "ember", "violet", "slate",
+  "light", "light-ocean", "light-ember", "light-violet", "light-slate",
+];
 const DENSITIES = ["comfortable", "compact"];
 const ZOOM_LEVELS = [75, 90, 100, 110, 125, 150];
 const SQL_EDITOR_ZOOM_LEVELS = [70, 80, 90, 100, 110, 125, 150, 175, 200];
@@ -494,9 +497,8 @@ function syncExplorerSearchScopeUi() {
     if (label) label.textContent = "";
     return;
   }
-  const conn = connectionLabel(scope.connectionId);
   bar.hidden = false;
-  if (label) label.textContent = `${conn} · ${scope.database}`;
+  if (label) label.textContent = scope.database;
 }
 
 function setExplorerSearchScope({ connectionId, database } = {}, { refresh = true } = {}) {
@@ -576,7 +578,11 @@ function setExplorerSearchEntity(entity, { refresh = true } = {}) {
   const chip = $("#explorer-entity-chip");
   if (chip) chip.title = `Search ${meta.label.toLowerCase()}s`;
   const input = $("#explorer-search");
-  if (input) input.placeholder = meta.placeholder || "Search…";
+  if (input) {
+    input.placeholder = meta.placeholder || "Search…";
+    input.value = "";
+  }
+  state.explorerSearch.query = "";
   $$(".explorer-entity-option").forEach((opt) => {
     opt.setAttribute("aria-selected", opt.dataset.entity === next ? "true" : "false");
   });
@@ -619,7 +625,8 @@ function collectExplorerSearchMatches(query, entity) {
   const q = (query || "").trim().toLowerCase();
   if (!q) return [];
   const out = [];
-  const scope = explorerSearchScope();
+  // Database search always spans the connection list so you can switch scope.
+  const scope = entity === "db" ? null : explorerSearchScope();
   const liveIds = Object.keys(state.connectedIds || {}).filter((id) => state.connectedIds[id]);
   let ids = liveIds.length
     ? liveIds
@@ -644,7 +651,6 @@ function collectExplorerSearchMatches(query, entity) {
       for (const node of nodes) {
         if ((node.kind || "database") !== "database") continue;
         const name = node.name || "";
-        if (scope && name !== scope.database) continue;
         if (!name.toLowerCase().includes(q)) continue;
         out.push({
           entity: "db",
@@ -773,8 +779,8 @@ function clearExplorerSearchFilterClasses() {
   const tree = $("#conn-tree");
   if (!tree) return;
   tree.classList.remove("is-searching");
-  tree.querySelectorAll(".search-miss, .search-hit").forEach((el) => {
-    el.classList.remove("search-miss", "search-hit");
+  tree.querySelectorAll(".search-miss, .search-hit, .search-scope-alt").forEach((el) => {
+    el.classList.remove("search-miss", "search-hit", "search-scope-alt");
   });
 }
 
@@ -918,6 +924,7 @@ function paintExplorerSearchFilter(matches, entity) {
         node.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
       }
     }
+    revealDatabasesForScopeSwitch();
     return;
   }
 
@@ -941,6 +948,40 @@ function paintExplorerSearchFilter(matches, entity) {
     const hasHit = !!node.querySelector(".tree-leaf.search-hit, .tree-node[data-folder-kind].search-hit");
     node.classList.toggle("search-miss", !hasHit);
     node.classList.toggle("search-hit", hasHit);
+  }
+
+  // Keep sibling databases visible while scoped so the user can click another DB to switch.
+  revealDatabasesForScopeSwitch();
+}
+
+/** While a DB scope chip is active, don't hide other databases (needed to change scope). */
+function revealDatabasesForScopeSwitch() {
+  const scope = explorerSearchScope();
+  const tree = $("#conn-tree");
+  if (!scope || !tree) return;
+
+  for (const conn of tree.querySelectorAll(".conn-node")) {
+    const id = conn.dataset.profileId;
+    if (id === scope.connectionId || isLiveProfile({ id })) {
+      conn.classList.remove("search-miss");
+      if (id === scope.connectionId) conn.classList.add("search-hit");
+    }
+  }
+
+  for (const node of tree.querySelectorAll(".tree-node[data-tree-kind='database']")) {
+    const cid = node.dataset.treeConnectionId;
+    const name = node.dataset.treeSchema;
+    const isActiveScope = cid === scope.connectionId && name === scope.database;
+    if (isActiveScope) {
+      node.classList.remove("search-miss");
+      node.classList.add("search-hit");
+      continue;
+    }
+    // Other databases stay clickable; collapse their filtered children visually via miss on kids only.
+    node.classList.remove("search-miss");
+    node.classList.remove("search-hit");
+    node.classList.add("search-scope-alt");
+    node.querySelector(":scope > .tree-row")?.classList.remove("search-hit");
   }
 }
 
@@ -1083,6 +1124,10 @@ async function openExplorerSearchMatch(match) {
   }).catch(() => {});
 
   if (match.entity === "db") {
+    setExplorerSearchScope({
+      connectionId: match.connectionId,
+      database: match.database || match.name,
+    }, { refresh: false });
     await focusHomeDetails({
       scope: "database",
       database: match.database || match.name,
@@ -2004,7 +2049,7 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
       setExplorerSearchScope({
         connectionId,
         database: node.name || node.schema || "",
-      }, { refresh: !!explorerSearchQuery() });
+      }, { refresh: true });
     }
     if (kind === "schema" || (kind === "database" && layout !== "database-schemas")) {
       await focusHomeDetails({
@@ -7715,6 +7760,10 @@ function closeColumnVisibilityMenu() {
   if (menu) menu.hidden = true;
 }
 
+function columnVisibilitySearchQuery() {
+  return ($("#col-visibility-search")?.value || "").trim().toLowerCase();
+}
+
 function closeExportMenu() {
   const menu = $("#export-menu");
   const btn = $("#btn-export");
@@ -7738,11 +7787,21 @@ function renderColumnVisibilityList(columns) {
   list.innerHTML = "";
   const cols = columns || state.result?.columns || [];
   if (!cols.length) {
-    list.innerHTML = `<div class="hint" style="padding:.35rem">No columns</div>`;
+    list.innerHTML = `<div class="col-vis-empty">No columns</div>`;
     return;
   }
   pruneHiddenColumns(cols);
-  for (const name of cols) {
+  const q = columnVisibilitySearchQuery();
+  const shown = q
+    ? cols.filter((name) => String(name).toLowerCase().includes(q))
+    : cols;
+  if (!shown.length) {
+    list.innerHTML = `<div class="col-vis-empty">No columns match “${escapeHtml($("#col-visibility-search")?.value || "")}”</div>`;
+    updateColumnsButton(cols);
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const name of shown) {
     const label = document.createElement("label");
     label.className = "col-vis-item";
     const checked = !state.hiddenColumns?.[name];
@@ -7768,8 +7827,9 @@ function renderColumnVisibilityList(columns) {
       renderData(state.result);
       renderColumnVisibilityList(cols);
     };
-    list.appendChild(label);
+    frag.appendChild(label);
   }
+  list.appendChild(frag);
   updateColumnsButton(cols);
 }
 
@@ -7779,8 +7839,11 @@ function toggleColumnVisibilityMenu() {
   const open = menu.hidden;
   closeExportMenu();
   if (open) {
+    const search = $("#col-visibility-search");
+    if (search) search.value = "";
     renderColumnVisibilityList(state.result?.columns || []);
     menu.hidden = false;
+    requestAnimationFrame(() => search?.focus());
   } else {
     menu.hidden = true;
   }
@@ -9241,6 +9304,21 @@ function wire() {
     e.stopPropagation();
     setAllColumnsVisible(false);
   };
+  $("#col-visibility-search")?.addEventListener("input", () => {
+    renderColumnVisibilityList(state.result?.columns || []);
+  });
+  $("#col-visibility-search")?.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    e.stopPropagation();
+    const search = $("#col-visibility-search");
+    if (search?.value) {
+      search.value = "";
+      renderColumnVisibilityList(state.result?.columns || []);
+    } else {
+      closeColumnVisibilityMenu();
+    }
+  });
   initColumnFilterPopup();
   $("#btn-clear-filters").onclick = () => clearColumnFilters();
   $("#col-filter-op").onchange = () => syncFilterPopupValueEnabled();
