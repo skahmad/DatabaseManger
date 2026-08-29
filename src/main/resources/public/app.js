@@ -5016,19 +5016,108 @@ function dataPageSize() {
 function usesServerTablePaging(result = state.result, tab = activeWorkspaceTab()) {
   if (!tab || tab.kind !== "table") return false;
   const tableTotal = Number(result?.totalRows);
-  if (!Number.isFinite(tableTotal) || tableTotal < 0) return false;
-  const loaded = result?.rows?.length || 0;
-  const filtered = filteredRows(result).length;
-  // Client filters apply only to the loaded page — keep paging local then.
-  return filtered === loaded;
+  return Number.isFinite(tableTotal) && tableTotal >= 0;
+}
+
+function currentResultColumnNames() {
+  if (Array.isArray(state.result?.columns) && state.result.columns.length) {
+    return state.result.columns;
+  }
+  const tab = activeWorkspaceTab();
+  if (Array.isArray(tab?.result?.columns) && tab.result.columns.length) {
+    return tab.result.columns;
+  }
+  return (state.columns || []).map((c) => (typeof c === "string" ? c : c?.name)).filter(Boolean);
+}
+
+function dataSearchQuery() {
+  return ($("#data-search")?.value || "").trim();
+}
+
+function activeColumnFilterList() {
+  const known = new Set(currentResultColumnNames());
+  return Object.entries(state.columnFilters || {})
+    .filter(([col, f]) => (!known.size || known.has(col)) && isColumnFilterActive(f))
+    .map(([column, f]) => ({ column, op: f.op, value: f.value ?? "" }));
+}
+
+function tableRowsFilterQuery() {
+  const params = new URLSearchParams();
+  const filters = activeColumnFilterList();
+  if (filters.length) params.set("filters", JSON.stringify(filters));
+  const search = dataSearchQuery();
+  if (search) {
+    params.set("search", search);
+    const cols = currentResultColumnNames();
+    if (cols.length) params.set("columns", cols.join(","));
+  }
+  const qs = params.toString();
+  return qs ? `&${qs}` : "";
+}
+
+function sqlStringLiteral(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function columnFilterToSql(column, filter) {
+  const col = quoteIdent(column);
+  const v = filter.value ?? "";
+  switch (filter.op) {
+    case "null":
+      return `${col} IS NULL`;
+    case "not_null":
+      return `${col} IS NOT NULL`;
+    case "empty":
+      return `(${col} IS NOT NULL AND TRIM(CAST(${col} AS CHAR)) = '')`;
+    case "not_empty":
+      return `TRIM(CAST(${col} AS CHAR)) <> ''`;
+    case "contains":
+      return `LOWER(CAST(${col} AS CHAR)) LIKE LOWER(${sqlStringLiteral(`%${v}%`)})`;
+    case "not_contains":
+      return `NOT (LOWER(CAST(${col} AS CHAR)) LIKE LOWER(${sqlStringLiteral(`%${v}%`)}))`;
+    case "starts":
+      return `LOWER(CAST(${col} AS CHAR)) LIKE LOWER(${sqlStringLiteral(`${v}%`)})`;
+    case "ends":
+      return `LOWER(CAST(${col} AS CHAR)) LIKE LOWER(${sqlStringLiteral(`%${v}`)})`;
+    case "eq":
+      return `LOWER(CAST(${col} AS CHAR)) = LOWER(${sqlStringLiteral(v)})`;
+    case "neq":
+      return `LOWER(CAST(${col} AS CHAR)) <> LOWER(${sqlStringLiteral(v)})`;
+    case "gt":
+      return `${col} > ${sqlStringLiteral(v)}`;
+    case "gte":
+      return `${col} >= ${sqlStringLiteral(v)}`;
+    case "lt":
+      return `${col} < ${sqlStringLiteral(v)}`;
+    case "lte":
+      return `${col} <= ${sqlStringLiteral(v)}`;
+    default:
+      return "";
+  }
+}
+
+function tableFilterWhereSql() {
+  const parts = [];
+  for (const f of activeColumnFilterList()) {
+    const sql = columnFilterToSql(f.column, f);
+    if (sql) parts.push(sql);
+  }
+  const q = dataSearchQuery();
+  const cols = currentResultColumnNames();
+  if (q && cols.length) {
+    const like = sqlStringLiteral(`%${q}%`);
+    parts.push(`(${cols.map((c) => `LOWER(CAST(${quoteIdent(c)} AS CHAR)) LIKE LOWER(${like})`).join(" OR ")})`);
+  }
+  return parts.length ? ` WHERE ${parts.join(" AND ")}` : "";
 }
 
 function tablePageSql(table, page, pageSize) {
   const offset = Math.max(0, (page - 1) * pageSize);
+  const where = tableFilterWhereSql();
   if (offset > 0) {
-    return `SELECT * FROM ${quoteIdent(table)} LIMIT ${pageSize} OFFSET ${offset}`;
+    return `SELECT * FROM ${quoteIdent(table)}${where} LIMIT ${pageSize} OFFSET ${offset}`;
   }
-  return `SELECT * FROM ${quoteIdent(table)} LIMIT ${pageSize}`;
+  return `SELECT * FROM ${quoteIdent(table)}${where} LIMIT ${pageSize}`;
 }
 
 async function fetchTableRowsPage(tab, page) {
@@ -5036,7 +5125,7 @@ async function fetchTableRowsPage(tab, page) {
   const offset = Math.max(0, (Math.max(1, page) - 1) * pageSize);
   const cid = tab.connectionId || state.activeConnectionId;
   const base = `/api/databases/${encodeURIComponent(tab.schema)}/tables/${encodeURIComponent(tab.table)}`;
-  return api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}`, cid));
+  return api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid));
 }
 
 async function loadTablePage(page) {
@@ -5048,9 +5137,11 @@ async function loadTablePage(page) {
     ? Math.max(1, Math.ceil(tableTotal / pageSize))
     : 1;
   const next = Math.min(totalPages, Math.max(1, page));
+  const seq = (state._tableLoadSeq = (state._tableLoadSeq || 0) + 1);
   setStatus(`Loading page ${next}…`);
   try {
     const rows = await fetchTableRowsPage(tab, next);
+    if (seq !== state._tableLoadSeq) return;
     const live = state.workspaceTabs.find((t) => t.id === tab.id);
     if (!live) return;
     const sql = tablePageSql(tab.table, next, pageSize);
@@ -5109,11 +5200,11 @@ async function loadTableIntoActiveTab(tab, { rowsOnly = false } = {}) {
   let rows;
 
   if (rowsOnly && cols) {
-    rows = await api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}`, cid));
+    rows = await api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid));
   } else {
     const [fetchedCols, fetchedRows] = await Promise.all([
       api(withConnectionId(`${base}/columns`, cid)),
-      api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}`, cid)),
+      api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid)),
     ]);
     cols = fetchedCols;
     rows = fetchedRows;
@@ -7600,27 +7691,35 @@ function setColumnFilter(column, op, value) {
       value: meta.needsValue ? (value ?? "") : "",
     };
   }
-  persistColumnFilters();
-  state.page = 1;
-  updateClearFiltersButton();
-  renderData(state.result);
+  applyGridFilters();
 }
 
 function clearColumnFilter(column) {
   if (!state.columnFilters) state.columnFilters = {};
   delete state.columnFilters[column];
-  persistColumnFilters();
-  state.page = 1;
-  updateClearFiltersButton();
-  renderData(state.result);
+  applyGridFilters();
 }
 
 function clearColumnFilters() {
   state.columnFilters = {};
+  closeColumnFilterPopup();
+  applyGridFilters();
+}
+
+async function applyGridFilters() {
   persistColumnFilters();
   state.page = 1;
-  closeColumnFilterPopup();
   updateClearFiltersButton();
+  const tab = activeWorkspaceTab();
+  if (tab?.kind === "table") {
+    tab.page = 1;
+    try {
+      await loadTablePage(1);
+    } catch (e) {
+      setStatus(e.message || "Failed to apply filter");
+    }
+    return;
+  }
   renderData(state.result);
 }
 
@@ -9289,7 +9388,7 @@ function wire() {
     state._dataSearchTimer = setTimeout(() => {
       state.page = 1;
       updateFilterIndicators();
-      renderData(state.result);
+      applyGridFilters();
     }, 120);
   };
   $("#btn-columns").onclick = (e) => {

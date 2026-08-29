@@ -5,6 +5,7 @@ import com.forgesystem.dbmanager.model.ConnectionMode;
 import com.forgesystem.dbmanager.model.ConnectionProfile;
 import com.forgesystem.dbmanager.model.DbType;
 import com.forgesystem.dbmanager.model.QueryResult;
+import com.forgesystem.dbmanager.model.RowFilter;
 import com.forgesystem.dbmanager.service.CloneMigrateService;
 import com.forgesystem.dbmanager.service.ConnectionService;
 import com.forgesystem.dbmanager.service.ConnectionStore;
@@ -554,16 +555,43 @@ public class ApiServer {
         String table = ctx.pathParam("table");
         int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(1000);
         int offset = ctx.queryParamAsClass("offset", Integer.class).getOrDefault(0);
+        List<RowFilter> filters = parseRowFilters(ctx.queryParam("filters"));
+        String search = ctx.queryParam("search");
+        List<String> searchColumns = parseColumnList(ctx.queryParam("columns"));
         try {
             connectionService.useDatabase(schema);
         } catch (Exception ignored) {
         }
-        QueryResult result = databaseService.previewTable(schema, table, limit, offset);
+        QueryResult result = databaseService.previewTable(
+                schema, table, limit, offset, filters, search, searchColumns);
         Map<String, Object> json = toResultJson(result);
-        json.put("totalRows", databaseService.countTableRows(schema, table));
+        json.put("totalRows", databaseService.countTableRows(schema, table, filters, search, searchColumns));
         json.put("offset", Math.max(0, offset));
         json.put("limit", Math.max(1, limit));
         ctx.json(json);
+    }
+
+    private List<RowFilter> parseRowFilters(String json) {
+        if (json == null || json.isBlank()) {
+            return List.of();
+        }
+        Type type = new TypeToken<List<RowFilter>>() {}.getType();
+        List<RowFilter> parsed = gson.fromJson(json, type);
+        return parsed == null ? List.of() : parsed;
+    }
+
+    private List<String> parseColumnList(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String part : raw.split(",")) {
+            String name = part.trim();
+            if (!name.isEmpty()) {
+                out.add(name);
+            }
+        }
+        return out;
     }
 
     private void query(Context ctx) throws Exception {

@@ -5,8 +5,10 @@ import com.forgesystem.dbmanager.model.ConnectionMode;
 import com.forgesystem.dbmanager.model.ConnectionProfile;
 import com.forgesystem.dbmanager.model.DbType;
 import com.forgesystem.dbmanager.model.QueryResult;
+import com.forgesystem.dbmanager.model.RowFilter;
 import com.forgesystem.dbmanager.util.SqlUtils;
 
+import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
@@ -402,9 +404,16 @@ public class DatabaseService {
     }
 
     public long countTableRows(String schema, String table) {
+        return countTableRows(schema, table, List.of(), null, List.of());
+    }
+
+    public long countTableRows(String schema, String table, List<RowFilter> filters,
+                               String search, List<String> searchColumns) {
         try {
-            String sql = "SELECT COUNT(*) AS c FROM " + qualify(schema, table);
-            QueryResult result = execute(sql);
+            FilterSql filter = buildFilterSql(
+                    filters, search, resolveSearchColumns(schema, table, search, searchColumns));
+            String sql = "SELECT COUNT(*) AS c FROM " + qualify(schema, table) + filter.where;
+            QueryResult result = filter.params.isEmpty() ? execute(sql) : executePrepared(sql, filter.params);
             if (result.getRows() != null && !result.getRows().isEmpty()) {
                 Object c = result.getRows().get(0).get("c");
                 if (c == null) {
@@ -1303,23 +1312,31 @@ public class DatabaseService {
     }
 
     public QueryResult previewTable(String schema, String table, int limit) throws SQLException {
-        return previewTable(schema, table, limit, 0);
+        return previewTable(schema, table, limit, 0, List.of(), null, List.of());
     }
 
     public QueryResult previewTable(String schema, String table, int limit, int offset) throws SQLException {
+        return previewTable(schema, table, limit, offset, List.of(), null, List.of());
+    }
+
+    public QueryResult previewTable(String schema, String table, int limit, int offset,
+                                    List<RowFilter> filters, String search,
+                                    List<String> searchColumns) throws SQLException {
         String qualified = qualify(schema, table);
         int lim = Math.max(1, limit);
         int off = Math.max(0, offset);
+        FilterSql filter = buildFilterSql(
+                filters, search, resolveSearchColumns(schema, table, search, searchColumns));
         DbType type = connectionService.getProfile().getDbType();
         String sql;
         if (type == DbType.SQLSERVER) {
-            sql = "SELECT * FROM " + qualified
+            sql = "SELECT * FROM " + qualified + filter.where
                     + " ORDER BY (SELECT NULL) OFFSET " + off
                     + " ROWS FETCH NEXT " + lim + " ROWS ONLY";
         } else {
-            sql = "SELECT * FROM " + qualified + " LIMIT " + lim + " OFFSET " + off;
+            sql = "SELECT * FROM " + qualified + filter.where + " LIMIT " + lim + " OFFSET " + off;
         }
-        return execute(sql);
+        return filter.params.isEmpty() ? execute(sql) : executePrepared(sql, filter.params);
     }
 
     public QueryResult execute(String sql) throws SQLException {
@@ -1334,6 +1351,173 @@ public class DatabaseService {
                 }
             }
             return QueryResult.update(stmt.getUpdateCount(), ms);
+        }
+    }
+
+    private QueryResult executePrepared(String sql, List<Object> params) throws SQLException {
+        Connection conn = connectionService.getConnection();
+        long start = System.currentTimeMillis();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            for (int i = 0; i < params.size(); i++) {
+                ps.setObject(i + 1, params.get(i));
+            }
+            boolean hasResult = ps.execute();
+            long ms = System.currentTimeMillis() - start;
+            if (hasResult) {
+                try (ResultSet rs = ps.getResultSet()) {
+                    return mapResultSet(rs, ms);
+                }
+            }
+            return QueryResult.update(ps.getUpdateCount(), ms);
+        }
+    }
+
+    private static final Set<String> FILTER_OPS = Set.of(
+            "contains", "not_contains", "eq", "neq", "starts", "ends",
+            "gt", "gte", "lt", "lte", "empty", "not_empty", "null", "not_null"
+    );
+
+    private record FilterSql(String where, List<Object> params) {}
+
+    private List<String> resolveSearchColumns(String schema, String table, String search,
+                                              List<String> searchColumns) {
+        if (search == null || search.isBlank()) {
+            return List.of();
+        }
+        if (searchColumns != null && !searchColumns.isEmpty()) {
+            return searchColumns;
+        }
+        try {
+            return getColumns(schema, table).stream().map(ColumnInfo::getName).toList();
+        } catch (SQLException e) {
+            return List.of();
+        }
+    }
+
+    private FilterSql buildFilterSql(List<RowFilter> filters, String search, List<String> searchColumns) {
+        List<String> clauses = new ArrayList<>();
+        List<Object> params = new ArrayList<>();
+        if (filters != null) {
+            for (RowFilter filter : filters) {
+                if (filter == null || filter.column == null || filter.column.isBlank() || filter.op == null) {
+                    continue;
+                }
+                String op = filter.op.trim().toLowerCase(Locale.ROOT);
+                if (!FILTER_OPS.contains(op)) {
+                    continue;
+                }
+                String col = quoteIdent(filter.column);
+                String value = filter.value == null ? "" : filter.value;
+                appendColumnFilter(clauses, params, col, op, value);
+            }
+        }
+        String q = search == null ? "" : search.trim();
+        if (!q.isEmpty() && searchColumns != null && !searchColumns.isEmpty()) {
+            List<String> ors = new ArrayList<>();
+            String like = "%" + escapeLike(q) + "%";
+            for (String name : searchColumns) {
+                if (name == null || name.isBlank()) continue;
+                ors.add(likeMatch(quoteIdent(name)));
+                params.add(like);
+            }
+            if (!ors.isEmpty()) {
+                clauses.add("(" + String.join(" OR ", ors) + ")");
+            }
+        }
+        if (clauses.isEmpty()) {
+            return new FilterSql("", List.of());
+        }
+        return new FilterSql(" WHERE " + String.join(" AND ", clauses), params);
+    }
+
+    private void appendColumnFilter(List<String> clauses, List<Object> params,
+                                    String col, String op, String value) {
+        String text = asText(col);
+        switch (op) {
+            case "null" -> clauses.add(col + " IS NULL");
+            case "not_null" -> clauses.add(col + " IS NOT NULL");
+            case "empty" -> clauses.add("(" + col + " IS NOT NULL AND TRIM(" + text + ") = '')");
+            case "not_empty" -> clauses.add("TRIM(" + text + ") <> ''");
+            case "contains" -> {
+                clauses.add(likeMatch(col));
+                params.add("%" + escapeLike(value) + "%");
+            }
+            case "not_contains" -> {
+                clauses.add("NOT (" + likeMatch(col) + ")");
+                params.add("%" + escapeLike(value) + "%");
+            }
+            case "starts" -> {
+                clauses.add(likeMatch(col));
+                params.add(escapeLike(value) + "%");
+            }
+            case "ends" -> {
+                clauses.add(likeMatch(col));
+                params.add("%" + escapeLike(value));
+            }
+            case "eq" -> {
+                clauses.add("LOWER(" + text + ") = LOWER(?)");
+                params.add(value);
+            }
+            case "neq" -> {
+                clauses.add("LOWER(" + text + ") <> LOWER(?)");
+                params.add(value);
+            }
+            case "gt", "gte", "lt", "lte" -> {
+                String sqlOp = switch (op) {
+                    case "gt" -> ">";
+                    case "gte" -> ">=";
+                    case "lt" -> "<";
+                    default -> "<=";
+                };
+                if (looksNumeric(value)) {
+                    clauses.add(col + " " + sqlOp + " ?");
+                    params.add(new BigDecimal(value.trim()));
+                } else {
+                    clauses.add("LOWER(" + text + ") " + sqlOp + " LOWER(?)");
+                    params.add(value);
+                }
+            }
+            default -> {
+            }
+        }
+    }
+
+    private String likeMatch(String col) {
+        DbType type = connectionService.getProfile().getDbType();
+        String text = asText(col);
+        if (type == DbType.POSTGRESQL) {
+            return text + " ILIKE ? ESCAPE '!'";
+        }
+        return "LOWER(" + text + ") LIKE LOWER(?) ESCAPE '!'";
+    }
+
+    private String asText(String quotedCol) {
+        DbType type = connectionService.getProfile().getDbType();
+        return switch (type) {
+            case POSTGRESQL -> quotedCol + "::text";
+            case SQLSERVER -> "CONVERT(NVARCHAR(MAX), " + quotedCol + ")";
+            case SQLITE -> "CAST(" + quotedCol + " AS TEXT)";
+            case MYSQL, MARIADB -> "CONCAT(" + quotedCol + ", '')";
+            default -> "CAST(" + quotedCol + " AS VARCHAR)";
+        };
+    }
+
+    private static String escapeLike(String value) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        return value.replace("!", "!!").replace("%", "!%").replace("_", "!_");
+    }
+
+    private static boolean looksNumeric(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        try {
+            new BigDecimal(value.trim());
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 
