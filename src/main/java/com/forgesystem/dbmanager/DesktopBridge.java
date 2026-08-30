@@ -2,6 +2,8 @@ package com.forgesystem.dbmanager;
 
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
+import javafx.scene.input.Clipboard;
+import javafx.scene.input.ClipboardContent;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
@@ -17,6 +19,18 @@ public class DesktopBridge {
 
     public DesktopBridge(Stage stage) {
         this.stage = stage;
+    }
+
+    /**
+     * Copy text to the system clipboard. The JS Clipboard API is unreliable
+     * inside JavaFX WebView, so the UI calls this instead.
+     */
+    public String copyText(String text) {
+        Clipboard clipboard = Clipboard.getSystemClipboard();
+        ClipboardContent content = new ClipboardContent();
+        content.putString(text == null ? "" : text);
+        clipboard.setContent(content);
+        return "ok";
     }
 
     /**

@@ -1675,7 +1675,12 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
 #data-table tbody tr.row-selected:hover td {
   background: color-mix(in srgb, var(--accent) 24%, var(--bg-panel));
 }
-#data-table tbody tr.row-selected td.cell-editable:hover {
+#data-table tbody td.cell-selected {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-panel));
+}
+#data-table tbody tr.row-selected td.cell-selected {
   background: color-mix(in srgb, var(--accent) 28%, var(--bg-panel));
 }
 .cell-edit-value {

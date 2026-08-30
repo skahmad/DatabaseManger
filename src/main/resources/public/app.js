@@ -140,6 +140,40 @@ async function api(path, options = {}) {
   return data;
 }
 
+async function copyToClipboard(text) {
+  const value = text == null ? "" : String(text);
+  try {
+    if (window.javaApp && typeof window.javaApp.copyText === "function") {
+      window.javaApp.copyText(value);
+      return true;
+    }
+  } catch {
+    /* WebView bridge unavailable — try browser APIs. */
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    /* Clipboard API often throws in JavaFX WebView. */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return !!ok;
+  } catch {
+    return false;
+  }
+}
+
 function setStatus(msg) {
   $("#status").textContent = msg;
 }
@@ -2321,7 +2355,7 @@ const PROP_LABELS = {
   id: "Connection ID",
 };
 
-const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view", "#ctx-menu-wstab", "#ctx-menu-erd"];
+const CTX_MENUS = ["#ctx-menu-conn", "#ctx-menu-db", "#ctx-menu-folder", "#ctx-menu-table", "#ctx-menu-view", "#ctx-menu-wstab", "#ctx-menu-erd", "#ctx-menu-data"];
 let suppressMenuHideUntil = 0;
 
 function hideAllContextMenus() {
@@ -3912,6 +3946,14 @@ async function handleContextAction(action) {
   const schema = target.schema || state.contextDb;
   try {
     switch (action) {
+      case "copy-cell":
+        hideAllContextMenus();
+        await copySelectedDataCell();
+        break;
+      case "copy-row":
+        hideAllContextMenus();
+        await copySelectedDataRow();
+        break;
       case "conn-connect":
         hideAllContextMenus();
         if (target.profile) {
@@ -8131,14 +8173,131 @@ function selectDataTableRow(tr) {
   if (!wasSelected) tr.classList.add("row-selected");
 }
 
+function formatCopiedCell(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function selectedDataRow() {
+  const idx = Number(state.dataSelection?.rowIndex);
+  if (!Number.isFinite(idx) || idx < 0) return null;
+  return state.dataPageRows?.[idx] || null;
+}
+
+function selectDataTableCell(td) {
+  const tbody = $("#data-table tbody");
+  const tr = td?.closest("tr.data-row");
+  if (!tbody || !td || !tr) return;
+  tbody.querySelectorAll("tr.row-selected").forEach((row) => row.classList.remove("row-selected"));
+  tbody.querySelectorAll("td.cell-selected").forEach((cell) => cell.classList.remove("cell-selected"));
+  tr.classList.add("row-selected");
+  td.classList.add("cell-selected");
+  state.dataSelection = {
+    rowIndex: Number(tr.dataset.rowIndex),
+    col: td.dataset.col || "",
+  };
+}
+
+async function copySelectedDataCell() {
+  const row = selectedDataRow();
+  const col = state.dataSelection?.col;
+  if (!row || !col) {
+    setStatus("Select a cell to copy");
+    return false;
+  }
+  const ok = await copyToClipboard(formatCopiedCell(row[col]));
+  setStatus(ok ? `Copied ${col}` : "Copy failed");
+  return ok;
+}
+
+async function copySelectedDataRow() {
+  const row = selectedDataRow();
+  if (!row) {
+    setStatus("Select a row to copy");
+    return false;
+  }
+  const cols = visibleColumns(state.result?.columns || Object.keys(row));
+  const text = cols.map((c) => formatCopiedCell(row[c])).join("\t");
+  const ok = await copyToClipboard(text);
+  setStatus(ok ? "Copied row" : "Copy failed");
+  return ok;
+}
+
+function showDataCellContextMenu(x, y, td) {
+  selectDataTableCell(td);
+  hideAllContextMenus();
+  positionContextMenu($("#ctx-menu-data"), x, y);
+}
+
+function copyFocusedFieldText(el) {
+  if (!el) return "";
+  const tag = (el.tagName || "").toLowerCase();
+  if (tag === "textarea" || tag === "input") {
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const value = el.value ?? "";
+    if (typeof start === "number" && typeof end === "number" && start !== end) {
+      return value.slice(start, end);
+    }
+    return value;
+  }
+  return "";
+}
+
+async function handleAppCopy(e) {
+  const t = e.target;
+  const tag = (t?.tagName || "").toLowerCase();
+  if (tag === "textarea" || (tag === "input" && t.type !== "checkbox" && t.type !== "radio" && t.type !== "file")) {
+    const text = copyFocusedFieldText(t);
+    if (!text) return;
+    e.preventDefault();
+    const ok = await copyToClipboard(text);
+    if (ok) setStatus("Copied");
+    return;
+  }
+  const sel = window.getSelection?.();
+  if (sel && !sel.isCollapsed) {
+    const text = sel.toString();
+    if (text) {
+      e.preventDefault();
+      const ok = await copyToClipboard(text);
+      if (ok) setStatus("Copied");
+    }
+    return;
+  }
+  if (state.dataSelection?.col != null && selectedDataRow()) {
+    e.preventDefault();
+    await copySelectedDataCell();
+  }
+}
+
 function ensureDataTableInteractions() {
   const tbody = $("#data-table tbody");
   if (!tbody || tbody.dataset.rowWired === "1") return;
   tbody.dataset.rowWired = "1";
   tbody.addEventListener("click", (e) => {
     if (e.target.closest("button, a, input, textarea, select")) return;
+    const td = e.target.closest("td");
+    if (td) {
+      selectDataTableCell(td);
+      return;
+    }
     const tr = e.target.closest("tr.data-row");
     if (tr) selectDataTableRow(tr);
+  });
+  tbody.addEventListener("contextmenu", (e) => {
+    const td = e.target.closest("td");
+    if (!td || !td.closest("tr.data-row")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    showDataCellContextMenu(e.clientX, e.clientY, td);
   });
   tbody.addEventListener("dblclick", (e) => {
     const td = e.target.closest("td.cell-editable");
@@ -8157,6 +8316,7 @@ function renderData(result) {
   const tbody = $("#data-table tbody");
   thead.innerHTML = "";
   tbody.innerHTML = "";
+  state.dataSelection = null;
   const empty = $("#data-empty");
   if (!result || result.update || !result.columns?.length) {
     empty.hidden = false;
@@ -8516,21 +8676,8 @@ async function copySqlLog() {
     setStatus("Output is empty");
     return;
   }
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
-    }
-    setStatus("Output copied");
-  } catch (e) {
-    setStatus(e.message || "Copy failed");
-  }
+  const ok = await copyToClipboard(text);
+  setStatus(ok ? "Output copied" : "Copy failed");
 }
 
 function updateSqlLogFindCount(current, total) {
@@ -8991,6 +9138,9 @@ function wire() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") hideAllContextMenus();
+    const copyKey = (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey
+      && (e.code === "KeyC" || (e.key && e.key.toLowerCase() === "c"));
+    if (copyKey) handleAppCopy(e);
   });
   window.addEventListener("blur", () => {
     if (Date.now() < suppressMenuHideUntil) return;
