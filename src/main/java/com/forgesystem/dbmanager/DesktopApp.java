@@ -27,7 +27,7 @@ import netscape.javascript.JSObject;
  * Desktop shell: local API + HTML UI rendered in an embedded WebView.
  */
 public class DesktopApp extends Application {
-    private static final int DEFAULT_PORT = 7070;
+    private static final int DEFAULT_PORT = 7080;
 
     private static final String[] THEMES = {
             "teal", "ocean", "ember", "violet", "slate",
