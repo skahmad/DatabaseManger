@@ -811,7 +811,10 @@ function collectExplorerSearchMatches(query, entity) {
         const database = parsed.database || schemaToDb.get(schema) || schema;
         if (scope) {
           if (scope.connectionId !== connectionId) continue;
-          if (database !== scope.database && schema !== scope.database
+          if (parsed.database) {
+            // Same schema name ("public") exists in every database — compare databases.
+            if (parsed.database !== scope.database) continue;
+          } else if (database !== scope.database && schema !== scope.database
             && !(scopeSchemas && scopeSchemas.has(schema))) {
             continue;
           }
@@ -912,18 +915,31 @@ async function expandTreeForSearchMatches(matches, entity) {
 
     if (entity === "db") continue;
 
-    const schemas = [...new Set(list.map((m) => m.schema).filter(Boolean))];
-    for (const schema of schemas) {
-      const dbNode = [...conn.querySelectorAll(".tree-node[data-tree-kind='database']")]
-        .find((n) => {
-          const kids = n.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']");
-          return [...kids].some((s) => s.dataset.treeSchema === schema);
-        });
+    // Group by database + schema: on PostgreSQL every database has a "public" schema,
+    // so a schema name alone does not identify which tree node to open.
+    const pairs = new Map();
+    for (const m of list) {
+      if (!m.schema) continue;
+      pairs.set(`${m.database || ""}\0${m.schema}`, { database: m.database || "", schema: m.schema });
+    }
+    for (const { database, schema } of pairs.values()) {
+      const dbNodes = [...conn.querySelectorAll(".tree-node[data-tree-kind='database']")];
+      const dbNode = dbNodes.find((n) =>
+        database && (n.dataset.treeDatabase === database || n.dataset.treeSchema === database))
+        || dbNodes.find((n) => [...n.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']")]
+          .some((sch) => sch.dataset.treeSchema === schema));
       if (dbNode && dbNode.dataset.userCollapsed !== "1" && dbNode.expandForSearch) {
         await dbNode.expandForSearch();
       }
 
-      const node = findExplorerTreeNode(connectionId, schema);
+      const schemaInDb = dbNode
+        ? [...dbNode.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']")]
+          .find((sch) => sch.dataset.treeSchema === schema)
+        : null;
+      // MySQL-style: the database node itself holds the object folders.
+      const node = schemaInDb
+        || (dbNode && (dbNode.dataset.treeSchema === schema) ? dbNode : null)
+        || findExplorerTreeNode(connectionId, schema);
       if (!node || node.dataset.userCollapsed === "1" || !node.expandForSearch) continue;
       await node.expandForSearch();
       if (!needsExplorerObjectIndex(entity)) continue;
@@ -1078,6 +1094,7 @@ function syncExplorerSearchFilter() {
     state.explorerSearch.revealedConnIds = {};
     state.explorerSearch.userCollapsedConnIds = {};
     resetExplorerSearchDomState();
+    tree.querySelectorAll(".tree-node[data-folder-kind]").forEach((f) => f.syncLeavesToSearch?.());
     if (status) status.hidden = true;
     if (wasSearching) renderProfiles();
     return;
@@ -1086,7 +1103,12 @@ function syncExplorerSearchFilter() {
   const matches = collectExplorerSearchMatches(q, entity);
   state.explorerSearch.matches = matches;
   clearExplorerSearchFilterClasses();
-  paintExplorerSearchFilter(matches, entity);
+  tree.querySelectorAll(".tree-node[data-folder-kind]").forEach((f) => f.syncLeavesToSearch?.());
+  const nothingLoaded = !matches.length
+    && needsExplorerObjectIndex(entity)
+    && !explorerSearchScope()
+    && !searchAutoloadTargets().length;
+  if (!nothingLoaded) paintExplorerSearchFilter(matches, entity);
 
   if (status) {
     const scope = explorerSearchScope();
@@ -1096,9 +1118,14 @@ function syncExplorerSearchFilter() {
     } else if (!matches.length) {
       status.hidden = false;
       const empty = EXPLORER_SEARCH_META[entity]?.empty || "No matches";
-      status.textContent = scope
-        ? `No matches${scopeSuffix}. Expand this database to load objects, or clear scope to search all.`
-        : empty;
+      const label = (EXPLORER_SEARCH_META[entity]?.label || "object").toLowerCase();
+      if (scope) {
+        status.textContent = `No ${label}s match${scopeSuffix}.`;
+      } else if (needsExplorerObjectIndex(entity) && !searchAutoloadTargets().length) {
+        status.textContent = `Click a database (or use “Choose databases…”) to search its ${label}s.`;
+      } else {
+        status.textContent = empty;
+      }
     } else {
       status.hidden = false;
       status.textContent = `${matches.length} match${matches.length === 1 ? "" : "es"}${scopeSuffix}`;
@@ -1159,7 +1186,7 @@ async function applyExplorerSearchToTree() {
     return;
   }
   syncExplorerSearchFilter();
-  if (await ensureScopeObjectsLoaded()) {
+  if (await ensureSearchObjectsLoaded()) {
     const entity = explorerSearchEntity();
     const matches = collectExplorerSearchMatches(q, entity);
     if (matches.length) await expandTreeForSearchMatches(matches, entity);
@@ -1683,25 +1710,54 @@ function buildDatabaseFilterRow(connectionId, total, shown) {
   return row;
 }
 
-/** While scoped to one database, load its objects so table/view search has data to match. */
-async function ensureScopeObjectsLoaded() {
-  const scope = explorerSearchScope();
-  const entity = explorerSearchEntity();
-  if (!scope || !needsExplorerObjectIndex(entity) || !explorerSearchQuery()) return false;
-  const key = `${scope.connectionId}\0${scope.database}`;
-  if (state.explorerSearch.scopeLoadedKey === key) return false;
+/**
+ * Table/view/routine search only sees objects already loaded. Load them for:
+ *  - the selected database (scope chip), or
+ *  - with no scope: every database visible in the tree, when that is a small set
+ *    (e.g. one chosen database per connection).
+ */
+const SEARCH_AUTOLOAD_MAX_DBS = 12;
+
+function searchAutoloadTargets() {
   const tree = $("#conn-tree");
-  const dbNode = [...(tree?.querySelectorAll(".tree-node[data-tree-kind='database']") || [])]
-    .find((n) => n.dataset.treeConnectionId === scope.connectionId
-      && (n.dataset.treeDatabase === scope.database || n.dataset.treeSchema === scope.database));
-  if (!dbNode?.expandForSearch) return false;
+  if (!tree) return [];
+  const scope = explorerSearchScope();
+  const dbNodes = [...tree.querySelectorAll(".conn-node > .conn-children > .tree-node[data-tree-kind='database']")]
+    .filter((n) => isLiveProfile({ id: n.dataset.treeConnectionId })
+      && isConnectionShown(n.dataset.treeConnectionId));
+  const nameOf = (n) => n.dataset.treeDatabase || n.dataset.treeSchema || "";
+  if (scope) {
+    return dbNodes.filter((n) => n.dataset.treeConnectionId === scope.connectionId
+      && nameOf(n) === scope.database);
+  }
+  return dbNodes.length <= SEARCH_AUTOLOAD_MAX_DBS ? dbNodes : [];
+}
+
+async function ensureSearchObjectsLoaded() {
+  const entity = explorerSearchEntity();
+  if (!needsExplorerObjectIndex(entity) || !explorerSearchQuery()) return false;
+  const targets = searchAutoloadTargets();
+  if (!targets.length) return false;
+  const key = targets
+    .map((n) => `${n.dataset.treeConnectionId}\0${n.dataset.treeDatabase || n.dataset.treeSchema}`)
+    .sort()
+    .join("\u0001");
+  if (state.explorerSearch.scopeLoadedKey === key) return false;
   state.explorerSearch.scopeLoadedKey = key;
+  const status = $("#explorer-search-status");
+  if (status) {
+    status.hidden = false;
+    status.textContent = `Loading tables from ${targets.length} database${targets.length === 1 ? "" : "s"}…`;
+  }
   try {
-    await dbNode.expandForSearch();
-    const schemaNodes = [...dbNode.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']")];
-    // Bounded: a database with very many schemas is loaded as the user expands it.
-    for (const sch of schemaNodes.slice(0, 25)) {
-      if (sch.expandForSearch) await sch.expandForSearch();
+    for (const dbNode of targets) {
+      if (!dbNode.expandForSearch) continue;
+      await dbNode.expandForSearch();
+      const schemaNodes = [...dbNode.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']")];
+      // Bounded: a database with very many schemas is loaded as the user expands it.
+      for (const sch of schemaNodes.slice(0, 25)) {
+        if (sch.expandForSearch) await sch.expandForSearch();
+      }
     }
   } catch {
     state.explorerSearch.scopeLoadedKey = "";
@@ -4919,22 +4975,33 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
     else delete wrap.dataset.userCollapsed;
   };
   // While searching, only materialize matching leaves (avoids 1000s of DOM nodes).
-  let leafNames = items;
-  const searchQ = explorerSearchQuery();
-  const searchEntity = explorerSearchEntity();
-  if (
-    searchQ
-    && needsExplorerObjectIndex(searchEntity)
-    && searchLeafKind(searchEntity) === kind
-    && connectionId
-  ) {
-    const want = new Set(
-      (state.explorerSearch.matches || [])
-        .filter((m) => m.connectionId === connectionId && m.schema === schema)
-        .map((m) => m.name),
-    );
-    if (want.size) leafNames = items.filter((n) => want.has(n));
-  }
+  // Filter on the query itself — match lists are keyed by schema name, which repeats
+  // across databases (every PostgreSQL database has "public").
+  const leafFilterFor = () => {
+    const q = explorerSearchQuery();
+    const entity = explorerSearchEntity();
+    return q && needsExplorerObjectIndex(entity) && searchLeafKind(entity) === kind && connectionId
+      ? q
+      : "";
+  };
+  const buildLeaves = (filterQ) => {
+    wrap.dataset.leafFilter = filterQ;
+    kids.innerHTML = "";
+    if (!items.length) {
+      kids.innerHTML = `<div class="hint" style="padding:.35rem">(empty)</div>`;
+      return;
+    }
+    const names = filterQ
+      ? items.filter((n) => String(n).toLowerCase().includes(filterQ))
+      : items;
+    kids.appendChild(buildLeafNodes(names));
+  };
+  /** Re-materialize leaves when the search text changed since they were built. */
+  wrap.syncLeavesToSearch = () => {
+    const want = leafFilterFor();
+    if ((wrap.dataset.leafFilter || "") !== want) buildLeaves(want);
+  };
+  const buildLeafNodes = (leafNames) => {
   const frag = document.createDocumentFragment();
   for (const name of leafNames) {
     const leaf = document.createElement("div");
@@ -4997,10 +5064,9 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
     leaf.appendChild(item);
     frag.appendChild(leaf);
   }
-  kids.appendChild(frag);
-  if (!items.length) {
-    kids.innerHTML = `<div class="hint" style="padding:.35rem">(empty)</div>`;
-  }
+  return frag;
+  };
+  buildLeaves(leafFilterFor());
   wrap.append(row, kids);
   return wrap;
 }
