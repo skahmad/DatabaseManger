@@ -2369,3 +2369,43 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   .tree { max-height: 220px; }
   .form-grid { grid-template-columns: 1fr; }
 }
+
+/* ERD table picker (multi-select which tables to show) */
+.erd-tables-menu {
+  min-width: 17rem;
+  max-width: 22rem;
+  max-height: min(70vh, 30rem);
+}
+.erd-tables-menu .col-vis-list { max-height: 20rem; }
+.erd-tables-item.is-hidden span { color: var(--muted); }
+.erd-tables-item mark {
+  background: rgba(var(--accent-rgb), 0.22);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.erd-tables-related {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.45rem 0.1rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.82rem;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.erd-tables-related input { accent-color: var(--accent); }
+.erd-tables-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.erd-tables-count {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+#btn-erd-tables.active { color: var(--accent); }

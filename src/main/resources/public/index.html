@@ -346,6 +346,26 @@
                 <button type="button" class="btn ghost sm" id="btn-erd-search-prev" title="Previous match" disabled>↑</button>
                 <button type="button" class="btn ghost sm" id="btn-erd-search-next" title="Next match" disabled>↓</button>
               </div>
+              <div class="col-vis-wrap erd-tables-wrap">
+                <button type="button" class="btn ghost sm" id="btn-erd-tables" title="Choose which tables to show" aria-haspopup="dialog" aria-expanded="false">Tables</button>
+                <div id="erd-tables-menu" class="col-vis-menu erd-tables-menu" hidden role="dialog" aria-label="Choose tables to show">
+                  <input type="search" id="erd-tables-search" class="input col-vis-search" placeholder="Search tables…" autocomplete="off" spellcheck="false" aria-label="Search tables" />
+                  <div class="col-vis-actions">
+                    <button type="button" class="btn ghost sm" id="btn-erd-tables-select-matches">Select all</button>
+                    <button type="button" class="btn ghost sm" id="btn-erd-tables-clear">Clear</button>
+                  </div>
+                  <div id="erd-tables-list" class="col-vis-list"></div>
+                  <label class="erd-tables-related" title="Also show tables linked to the selected ones by a relationship">
+                    <input type="checkbox" id="chk-erd-tables-related" />
+                    <span>Include related tables</span>
+                  </label>
+                  <div class="erd-tables-footer">
+                    <span id="erd-tables-count" class="erd-tables-count">0 selected</span>
+                    <button type="button" class="btn ghost sm" id="btn-erd-tables-show-all" title="Show every table">Show all</button>
+                    <button type="button" class="btn primary sm" id="btn-erd-tables-apply" disabled>Show selected</button>
+                  </div>
+                </div>
+              </div>
               <button type="button" class="btn ghost sm" id="btn-erd-zoom-out" title="Zoom out">−</button>
               <span id="erd-zoom-label" class="erd-zoom-label">100%</span>
               <button type="button" class="btn ghost sm" id="btn-erd-zoom-in" title="Zoom in">+</button>

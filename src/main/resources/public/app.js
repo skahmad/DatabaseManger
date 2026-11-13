@@ -6122,6 +6122,7 @@ function isErdTableHighlighted(tab, name) {
 }
 
 function updateErdHighlightButtons(tab) {
+  updateErdTablesButton(tab);
   const clearHl = $("#btn-erd-clear-highlights");
   const restore = $("#btn-erd-restore");
   const hl = tab?.kind === "erd" ? erdHighlightCount(tab) : 0;
@@ -6203,6 +6204,253 @@ function restoreErdHiddenTables(tab = activeWorkspaceTab()) {
   tab.erdView = { ...(tab.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
   renderErdDiagram(data, tab);
   setStatus(`ERD · restored ${n} table${n === 1 ? "" : "s"}`);
+}
+
+/* ---------- ERD table picker: multi-select which tables to show ---------- */
+
+function erdAllTableNames(tab) {
+  return (tab?.erd?.tables || [])
+    .map((t) => String(t.name || ""))
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+}
+
+function erdTablesPickerQuery() {
+  return ($("#erd-tables-search")?.value || "").trim().toLowerCase();
+}
+
+function erdTablesPickerMatches(tab) {
+  const q = erdTablesPickerQuery();
+  const names = erdAllTableNames(tab);
+  return q ? names.filter((n) => n.toLowerCase().includes(q)) : names;
+}
+
+function erdTablesPickSet(tab) {
+  if (!tab.erdPick) tab.erdPick = {};
+  return tab.erdPick;
+}
+
+/** Selected tables plus (optionally) every table linked to them by a relationship. */
+function erdTablesToShow(tab) {
+  const picked = new Set(Object.keys(erdTablesPickSet(tab)));
+  if (!picked.size || !$("#chk-erd-tables-related")?.checked) return picked;
+  const out = new Set(picked);
+  for (const rel of getErdAllRelations(tab)) {
+    if (picked.has(rel.fromTable) && rel.toTable) out.add(rel.toTable);
+    if (picked.has(rel.toTable) && rel.fromTable) out.add(rel.fromTable);
+  }
+  return out;
+}
+
+function updateErdTablesButton(tab) {
+  const btn = $("#btn-erd-tables");
+  if (!btn) return;
+  const isErd = tab?.kind === "erd" && !!tab.erd;
+  btn.disabled = !isErd;
+  const total = isErd ? (tab.erd.tables || []).length : 0;
+  const hidden = isErd ? erdHiddenCount(tab) : 0;
+  const shown = Math.max(0, total - hidden);
+  btn.textContent = hidden > 0 ? `Tables (${shown}/${total})` : "Tables";
+  btn.classList.toggle("active", hidden > 0);
+}
+
+function updateErdTablesFooter(tab) {
+  const count = $("#erd-tables-count");
+  const apply = $("#btn-erd-tables-apply");
+  const selectBtn = $("#btn-erd-tables-select-matches");
+  const n = Object.keys(erdTablesPickSet(tab)).length;
+  const extra = erdTablesToShow(tab).size - n;
+  if (count) {
+    count.textContent = `${n} selected${extra > 0 ? ` +${extra} related` : ""}`;
+  }
+  if (apply) apply.disabled = n === 0;
+  if (selectBtn) {
+    const q = erdTablesPickerQuery();
+    const m = erdTablesPickerMatches(tab).length;
+    selectBtn.textContent = q ? `Select ${m} match${m === 1 ? "" : "es"}` : "Select all";
+    selectBtn.disabled = m === 0;
+  }
+}
+
+function renderErdTablesPicker(tab = activeWorkspaceTab()) {
+  const list = $("#erd-tables-list");
+  if (!list || !tab || tab.kind !== "erd") return;
+  list.innerHTML = "";
+  const all = erdAllTableNames(tab);
+  if (!all.length) {
+    list.innerHTML = `<div class="col-vis-empty">No tables</div>`;
+    updateErdTablesFooter(tab);
+    return;
+  }
+  const q = erdTablesPickerQuery();
+  const shown = erdTablesPickerMatches(tab);
+  if (!shown.length) {
+    list.innerHTML = `<div class="col-vis-empty">No tables match “${escapeHtml($("#erd-tables-search")?.value || "")}”</div>`;
+    updateErdTablesFooter(tab);
+    return;
+  }
+  const pick = erdTablesPickSet(tab);
+  // Large schemas: cap DOM rows; the search narrows the rest.
+  const LIMIT = 500;
+  const frag = document.createDocumentFragment();
+  for (const name of shown.slice(0, LIMIT)) {
+    const label = document.createElement("label");
+    label.className = "col-vis-item erd-tables-item";
+    if (isErdTableHidden(tab, name)) label.classList.add("is-hidden");
+    let text = escapeHtml(name);
+    if (q) {
+      const i = name.toLowerCase().indexOf(q);
+      if (i >= 0) {
+        text = escapeHtml(name.slice(0, i))
+          + `<mark>${escapeHtml(name.slice(i, i + q.length))}</mark>`
+          + escapeHtml(name.slice(i + q.length));
+      }
+    }
+    label.innerHTML = `<input type="checkbox" ${pick[name] ? "checked" : ""} />`
+      + `<span title="${escapeHtml(name)}">${text}</span>`;
+    const input = label.querySelector("input");
+    input.onchange = () => {
+      if (input.checked) pick[name] = true;
+      else delete pick[name];
+      updateErdTablesFooter(tab);
+    };
+    frag.appendChild(label);
+  }
+  if (shown.length > LIMIT) {
+    const more = document.createElement("div");
+    more.className = "col-vis-empty";
+    more.textContent = `+${shown.length - LIMIT} more — refine the search`;
+    frag.appendChild(more);
+  }
+  list.appendChild(frag);
+  updateErdTablesFooter(tab);
+}
+
+function closeErdTablesMenu() {
+  const menu = $("#erd-tables-menu");
+  if (menu) menu.hidden = true;
+  $("#btn-erd-tables")?.setAttribute("aria-expanded", "false");
+}
+
+function openErdTablesMenu() {
+  const tab = activeWorkspaceTab();
+  const menu = $("#erd-tables-menu");
+  if (!menu || !tab || tab.kind !== "erd" || !tab.erd) return;
+  // Start from what is on the diagram now (nothing ticked when every table is shown).
+  const all = erdAllTableNames(tab);
+  tab.erdPick = {};
+  if (erdHiddenCount(tab) > 0) {
+    for (const n of all) if (!isErdTableHidden(tab, n)) tab.erdPick[n] = true;
+  }
+  // Carry over the diagram's table search so its matches are ready to pick.
+  const search = $("#erd-tables-search");
+  if (search) {
+    const q = tab.erdSearchScope === "column" ? "" : (tab.erdSearchQuery || "").trim();
+    search.value = q;
+  }
+  menu.hidden = false;
+  $("#btn-erd-tables")?.setAttribute("aria-expanded", "true");
+  renderErdTablesPicker(tab);
+  setTimeout(() => search?.focus(), 0);
+}
+
+function showOnlyErdTables(tab, names) {
+  if (!tab || tab.kind !== "erd" || !tab.erd) return;
+  const keep = new Set(names);
+  if (!keep.size) return;
+  const hidden = {};
+  for (const n of erdAllTableNames(tab)) if (!keep.has(n)) hidden[n] = true;
+  tab.erdHiddenTables = hidden;
+  const hl = erdHighlightSet(tab);
+  for (const n of Object.keys(hl)) if (hidden[n]) delete hl[n];
+  if (tab.erdFocusTable && hidden[tab.erdFocusTable]) tab.erdFocusTable = null;
+  // Fresh compact layout for the chosen subset.
+  tab.erdPositions = {};
+  tab.erdView = { ...(tab.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
+  renderErdDiagram(tab.erd, tab);
+  if ((tab.erdSearchQuery || "").trim()) runErdSearch(tab, { pan: false });
+  setStatus(`ERD · showing ${keep.size} of ${erdAllTableNames(tab).length} tables`);
+}
+
+function wireErdTablesPicker() {
+  const btn = $("#btn-erd-tables");
+  const menu = $("#erd-tables-menu");
+  const search = $("#erd-tables-search");
+  if (!btn || !menu || btn.dataset.wired === "1") return;
+  btn.dataset.wired = "1";
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (menu.hidden) openErdTablesMenu();
+    else closeErdTablesMenu();
+  });
+  menu.addEventListener("click", (e) => e.stopPropagation());
+  menu.addEventListener("pointerdown", (e) => e.stopPropagation());
+
+  let timer = null;
+  search?.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => renderErdTablesPicker(), 80);
+  });
+  search?.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (search.value) {
+        search.value = "";
+        renderErdTablesPicker();
+      } else {
+        closeErdTablesMenu();
+      }
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      $("#btn-erd-tables-apply")?.click();
+    }
+  });
+
+  $("#btn-erd-tables-select-matches")?.addEventListener("click", () => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    const pick = erdTablesPickSet(tab);
+    for (const n of erdTablesPickerMatches(tab)) pick[n] = true;
+    renderErdTablesPicker(tab);
+  });
+  $("#btn-erd-tables-clear")?.addEventListener("click", () => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    // With a search active, only unselect the matches; otherwise clear everything.
+    if (erdTablesPickerQuery()) {
+      const pick = erdTablesPickSet(tab);
+      for (const n of erdTablesPickerMatches(tab)) delete pick[n];
+    } else {
+      tab.erdPick = {};
+    }
+    renderErdTablesPicker(tab);
+  });
+  $("#chk-erd-tables-related")?.addEventListener("change", () => {
+    const tab = activeWorkspaceTab();
+    if (tab?.kind === "erd") updateErdTablesFooter(tab);
+  });
+  $("#btn-erd-tables-apply")?.addEventListener("click", () => {
+    const tab = activeWorkspaceTab();
+    if (!tab || tab.kind !== "erd") return;
+    const names = erdTablesToShow(tab);
+    if (!names.size) return;
+    closeErdTablesMenu();
+    showOnlyErdTables(tab, names);
+  });
+  $("#btn-erd-tables-show-all")?.addEventListener("click", () => {
+    const tab = activeWorkspaceTab();
+    closeErdTablesMenu();
+    if (tab?.kind === "erd" && erdHiddenCount(tab) > 0) restoreErdHiddenTables(tab);
+  });
+
+  document.addEventListener("pointerdown", (e) => {
+    if (!e.target.closest(".erd-tables-wrap")) closeErdTablesMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeErdTablesMenu();
+  });
 }
 
 function showErdTableContextMenu(x, y, tab, tableName) {
@@ -6677,7 +6925,7 @@ function renderErdDiagram(data, tab) {
       !!tab.erdShowLogical,
     );
     if (hiddenCount > 0) {
-      text += ` · ${hiddenCount} removed`;
+      text += ` · showing ${Math.max(0, allTables.length - hiddenCount)}`;
     }
     subtitle.textContent = text;
   }
@@ -9260,6 +9508,7 @@ function wire() {
     applyWorkspaceTab(tab.id, { forceReload: true }).catch((err) => alert(err.message));
   });
   wireErdSearch();
+  wireErdTablesPicker();
 
   for (const sel of CTX_MENUS) {
     $(sel).onclick = (e) => {
