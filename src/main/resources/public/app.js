@@ -6363,12 +6363,18 @@ function showOnlyErdTables(tab, names) {
   tab.erdHiddenTables = hidden;
   const hl = erdHighlightSet(tab);
   for (const n of Object.keys(hl)) if (hidden[n]) delete hl[n];
-  if (tab.erdFocusTable && hidden[tab.erdFocusTable]) tab.erdFocusTable = null;
+  // Start the subset view clean: an old focus or toolbar search would dim
+  // (fade) every chosen table that is not the focus/search hit.
+  tab.erdFocusTable = null;
+  tab.erdSearchQuery = "";
+  tab.erdSearchMatches = [];
+  tab.erdSearchIndex = 0;
   // Fresh compact layout for the chosen subset.
   tab.erdPositions = {};
   tab.erdView = { ...(tab.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: true };
+  const input = $("#erd-search-input");
+  if (input) input.value = "";
   renderErdDiagram(tab.erd, tab);
-  if ((tab.erdSearchQuery || "").trim()) runErdSearch(tab, { pan: false });
   setStatus(`ERD · showing ${keep.size} of ${erdAllTableNames(tab).length} tables`);
 }
 
