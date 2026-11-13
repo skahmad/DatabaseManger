@@ -2409,3 +2409,10 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
   white-space: nowrap;
 }
 #btn-erd-tables.active { color: var(--accent); }
+
+/* ERD "+N more…" row: click to expand / collapse a table's columns */
+.erd-col-more-btn { cursor: pointer; }
+.erd-col-more-hit { fill: transparent; }
+.erd-col-more-btn:hover .erd-col-more-hit { fill: rgba(var(--accent-rgb), 0.12); }
+.erd-col-more-btn .erd-col-more { fill: var(--accent-dim, var(--accent)); }
+.erd-col-more-btn:hover .erd-col-more { fill: var(--accent); text-decoration: underline; }

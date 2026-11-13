@@ -4316,6 +4316,12 @@ async function handleContextAction(action) {
         }
         break;
       }
+      case "erd-toggle-columns": {
+        hideAllContextMenus();
+        const tab = state.workspaceTabs.find((t) => t.id === target.tabId) || activeWorkspaceTab();
+        if (tab?.kind === "erd" && target.table) toggleErdTableColumns(tab, target.table);
+        break;
+      }
       case "erd-open": {
         hideAllContextMenus();
         if (target.table) {
@@ -6459,6 +6465,29 @@ function wireErdTablesPicker() {
   });
 }
 
+/** Expand a table card to list every column, or collapse it back. */
+function toggleErdTableColumns(tab, tableName, expand = null) {
+  if (!tab || tab.kind !== "erd" || !tab.erd || !tableName) return;
+  if (!tab.erdExpandedTables) tab.erdExpandedTables = {};
+  const next = expand == null ? !tab.erdExpandedTables[tableName] : !!expand;
+  if (next) tab.erdExpandedTables[tableName] = true;
+  else delete tab.erdExpandedTables[tableName];
+  // Keep the camera and the card where they are; only the card height changes.
+  const box = tab.erdLayout?.boxes?.[tableName];
+  if (box) {
+    if (!tab.erdPositions) tab.erdPositions = {};
+    tab.erdPositions[tableName] = { x: box.x, y: box.y };
+  }
+  tab.erdView = { ...(tab.erdView || { x: 0, y: 0, scale: 1 }), _needsFit: false };
+  renderErdDiagram(tab.erd, tab);
+  setStatus(next ? `ERD · all columns of ${tableName}` : `ERD · collapsed ${tableName}`);
+}
+
+function erdTableHasMoreColumns(tab, tableName) {
+  const box = tab?.erdLayout?.boxes?.[tableName];
+  return !!(box && (box.hiddenCount > 0 || box.collapsible));
+}
+
 function showErdTableContextMenu(x, y, tab, tableName) {
   for (const sel of CTX_MENUS) {
     const menu = $(sel);
@@ -6481,6 +6510,11 @@ function showErdTableContextMenu(x, y, tab, tableName) {
   const focusBtn = menu.querySelector('[data-action="erd-focus"]');
   if (focusBtn) {
     focusBtn.textContent = tab.erdFocusTable === tableName ? "Clear focus" : "Focus";
+  }
+  const colsBtn = menu.querySelector('[data-action="erd-toggle-columns"]');
+  if (colsBtn) {
+    colsBtn.hidden = !erdTableHasMoreColumns(tab, tableName);
+    colsBtn.textContent = tab.erdExpandedTables?.[tableName] ? "Show fewer columns" : "Show all columns";
   }
   positionContextMenu(menu, x, y);
 }
@@ -6997,8 +7031,9 @@ function renderErdDiagram(data, tab) {
     for (const c of all) {
       if (c.primaryKey || required.has(String(c.name || "").toLowerCase())) pushCol(c);
     }
+    const expanded = !!tab.erdExpandedTables?.[table.name];
     for (const c of all) {
-      if (shown.length >= MAX_SHOWN_COLS) break;
+      if (!expanded && shown.length >= MAX_SHOWN_COLS) break;
       pushCol(c);
     }
     // If a required column is missing from metadata, synthesize a stub row so the port still exists.
@@ -7017,7 +7052,11 @@ function renderErdDiagram(data, tab) {
     const row = Math.floor(i / cols);
     const shownColumns = buildShownColumns(t);
     const hiddenCount = Math.max(0, (t.columns || []).length - shownColumns.length);
-    const moreRow = hiddenCount > 0 ? 1 : 0;
+    // Expanded tables keep a "Show less" row so they can collapse again.
+    const collapsible = hiddenCount === 0
+      && !!tab.erdExpandedTables?.[t.name]
+      && (t.columns || []).length > MAX_SHOWN_COLS;
+    const moreRow = hiddenCount > 0 || collapsible ? 1 : 0;
     const colCount = Math.max(1, shownColumns.length);
     const h = HEADER_H + (colCount + moreRow) * ROW_H + 8;
     const x = col * (CARD_W + GAP_X);
@@ -7037,6 +7076,7 @@ function renderErdDiagram(data, tab) {
       colCount,
       shownColumns,
       hiddenCount,
+      collapsible,
       colIndex,
     };
   });
@@ -7150,17 +7190,35 @@ function renderErdDiagram(data, tab) {
       row.textContent = label.length > 30 ? `${label.slice(0, 29)}…` : label;
       g.appendChild(row);
     });
-    if (b.hiddenCount > 0) {
-      const more = document.createElementNS(NS, "text");
-      more.setAttribute("x", String(PAD_X));
-      more.setAttribute("y", String(HEADER_H + 13 + (b.shownColumns || []).length * ROW_H));
-      more.classList.add("erd-col", "erd-col-more");
-      more.textContent = `+${b.hiddenCount} more…`;
+    if (b.hiddenCount > 0 || b.collapsible) {
+      const moreY = HEADER_H + (b.shownColumns || []).length * ROW_H;
+      const more = document.createElementNS(NS, "g");
+      more.classList.add("erd-col-more-btn");
+      const title = document.createElementNS(NS, "title");
+      title.textContent = b.hiddenCount > 0 ? "Show all columns" : "Show fewer columns";
+      more.appendChild(title);
+      // Full-width hit area so the whole row is clickable, not just the glyphs.
+      const hit = document.createElementNS(NS, "rect");
+      hit.setAttribute("x", "2");
+      hit.setAttribute("y", String(moreY + 1));
+      hit.setAttribute("width", String(b.w - 4));
+      hit.setAttribute("height", String(ROW_H));
+      hit.setAttribute("rx", "4");
+      hit.classList.add("erd-col-more-hit");
+      more.appendChild(hit);
+      const label = document.createElementNS(NS, "text");
+      label.setAttribute("x", String(PAD_X));
+      label.setAttribute("y", String(moreY + 13));
+      label.classList.add("erd-col", "erd-col-more");
+      label.textContent = b.hiddenCount > 0 ? `+${b.hiddenCount} more…` : "Show less";
+      more.appendChild(label);
       g.appendChild(more);
     }
 
     g.addEventListener("dblclick", (e) => {
       e.stopPropagation();
+      // A quick double click on "+N more" is two toggles, not "open table".
+      if (e.target?.closest?.(".erd-col-more-btn")) return;
       clearTimeout(erdTableFocusTimer);
       openTable(tab.schema, b.name, tab.connectionId, tab.database).catch((err) => alert(err.message));
     });
@@ -7236,6 +7294,7 @@ function ensureErdInteractions() {
         lastX: e.clientX,
         lastY: e.clientY,
         moved: false,
+        moreToggle: !!e.target?.closest?.(".erd-col-more-btn"),
       };
       tableEl.classList.add("erd-dragging");
       viewport.classList.add("erd-dragging-table");
@@ -7304,6 +7363,11 @@ function ensureErdInteractions() {
         redrawErdEdges(tab);
       } else {
         setErdEdgesHidden(false);
+      }
+      if (!drag.moved && tab?.kind === "erd" && drag.moreToggle) {
+        clearTimeout(erdTableFocusTimer);
+        toggleErdTableColumns(tab, drag.name);
+        return;
       }
       if (!drag.moved && tab?.kind === "erd") {
         clearTimeout(erdTableFocusTimer);
