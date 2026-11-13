@@ -684,9 +684,9 @@ function collectExplorerSearchMatches(query, entity) {
   // Database search always spans the connection list so you can switch scope.
   const scope = entity === "db" ? null : explorerSearchScope();
   const liveIds = Object.keys(state.connectedIds || {}).filter((id) => state.connectedIds[id]);
-  let ids = liveIds.length
+  let ids = (liveIds.length
     ? liveIds
-    : Object.keys(state.explorerCache || {});
+    : Object.keys(state.explorerCache || {})).filter((id) => isConnectionShown(id));
   if (scope?.connectionId) {
     ids = ids.filter((id) => id === scope.connectionId);
   }
@@ -845,8 +845,10 @@ function collectExplorerSearchMatches(query, entity) {
     }
   }
 
-  out.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
-  return out.slice(0, 200);
+  // Only search inside the databases chosen for each connection.
+  const visible = out.filter((m) => isDatabaseShown(m.connectionId, m.database || m.name));
+  visible.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return visible.slice(0, 200);
 }
 
 function clearExplorerSearchFilterClasses() {
@@ -965,7 +967,9 @@ function paintExplorerSearchFilter(matches, entity) {
     for (const node of tree.querySelectorAll(".tree-node[data-tree-kind='database']")) {
       const cid = node.dataset.treeConnectionId;
       const key = node.dataset.treeSchema;
-      const hit = nameKeys.has(`${cid}\0${key}`) || schemaKeys.has(`${cid}\0${key}`);
+      const dbKey = node.dataset.treeDatabase || "";
+      const hit = nameKeys.has(`${cid}\0${key}`) || schemaKeys.has(`${cid}\0${key}`)
+        || (!!dbKey && nameKeys.has(`${cid}\0${dbKey}`));
       node.classList.toggle("search-miss", !hit);
       node.classList.toggle("search-hit", hit);
       node.querySelector(":scope > .tree-row")?.classList.toggle("search-hit", hit);
@@ -1028,7 +1032,10 @@ function paintExplorerSearchFilter(matches, entity) {
   revealDatabasesForScopeSwitch();
 }
 
-/** While a DB scope chip is active, don't hide other databases (needed to change scope). */
+/**
+ * While a DB scope chip is active, show only that connection + database so a
+ * table/view search stays inside it. (Clear the chip with × to search everything.)
+ */
 function revealDatabasesForScopeSwitch() {
   const scope = explorerSearchScope();
   const tree = $("#conn-tree");
@@ -1036,26 +1043,18 @@ function revealDatabasesForScopeSwitch() {
 
   for (const conn of tree.querySelectorAll(".conn-node")) {
     const id = conn.dataset.profileId;
-    if (id === scope.connectionId || isLiveProfile({ id })) {
-      conn.classList.remove("search-miss");
-      if (id === scope.connectionId) conn.classList.add("search-hit");
-    }
+    const inScope = id === scope.connectionId;
+    conn.classList.toggle("search-miss", !inScope);
+    conn.classList.toggle("search-hit", inScope);
   }
 
   for (const node of tree.querySelectorAll(".tree-node[data-tree-kind='database']")) {
     const cid = node.dataset.treeConnectionId;
-    const name = node.dataset.treeSchema;
-    const isActiveScope = cid === scope.connectionId && name === scope.database;
-    if (isActiveScope) {
-      node.classList.remove("search-miss");
-      node.classList.add("search-hit");
-      continue;
-    }
-    // Other databases stay clickable; collapse their filtered children visually via miss on kids only.
-    node.classList.remove("search-miss");
-    node.classList.remove("search-hit");
-    node.classList.add("search-scope-alt");
-    node.querySelector(":scope > .tree-row")?.classList.remove("search-hit");
+    const isActiveScope = cid === scope.connectionId
+      && (node.dataset.treeDatabase === scope.database || node.dataset.treeSchema === scope.database);
+    node.classList.remove("search-scope-alt");
+    node.classList.toggle("search-miss", !isActiveScope);
+    node.classList.toggle("search-hit", isActiveScope);
   }
 }
 
@@ -1155,10 +1154,17 @@ async function revealExplorerSearchPaths() {
 async function applyExplorerSearchToTree() {
   const q = explorerSearchQuery();
   if (!q) {
+    state.explorerSearch.scopeLoadedKey = "";
     syncExplorerSearchFilter();
     return;
   }
   syncExplorerSearchFilter();
+  if (await ensureScopeObjectsLoaded()) {
+    const entity = explorerSearchEntity();
+    const matches = collectExplorerSearchMatches(q, entity);
+    if (matches.length) await expandTreeForSearchMatches(matches, entity);
+    syncExplorerSearchFilter();
+  }
   await revealExplorerSearchPaths();
 }
 
@@ -1278,6 +1284,432 @@ async function syncSessionState() {
   return session;
 }
 
+/* ── Explorer filter: which connections / databases the sidebar shows ── */
+
+const EXPLORER_FILTER_KEY = "dbpilot.explorerFilter";
+
+function explorerFilter() {
+  if (!state.explorerFilter) {
+    let saved = {};
+    try {
+      saved = JSON.parse(localStorage.getItem(EXPLORER_FILTER_KEY) || "{}") || {};
+    } catch {
+      saved = {};
+    }
+    state.explorerFilter = {
+      // null = show every connection
+      connections: Array.isArray(saved.connections) ? saved.connections : null,
+      // connectionId -> [database names]; missing = show every database
+      databases: saved.databases && typeof saved.databases === "object" ? saved.databases : {},
+      askAtStartup: saved.askAtStartup !== false,
+    };
+  }
+  return state.explorerFilter;
+}
+
+function saveExplorerFilter() {
+  try {
+    localStorage.setItem(EXPLORER_FILTER_KEY, JSON.stringify(explorerFilter()));
+  } catch {
+    /* storage unavailable — keep in memory only */
+  }
+}
+
+function isConnectionShown(connectionId) {
+  const list = explorerFilter().connections;
+  return !list || list.includes(connectionId);
+}
+
+function databaseFilterFor(connectionId) {
+  const list = explorerFilter().databases[connectionId];
+  return Array.isArray(list) && list.length ? list : null;
+}
+
+function isDatabaseShown(connectionId, name) {
+  const list = databaseFilterFor(connectionId);
+  return !list || !name || list.includes(name);
+}
+
+function visibleProfiles() {
+  const profiles = state.profiles || [];
+  const list = explorerFilter().connections;
+  if (!list) return profiles;
+  return profiles.filter((p) => list.includes(p.id));
+}
+
+/** Make sure a connection the user is opening stays in the sidebar. */
+function ensureConnectionShown(connectionId) {
+  const f = explorerFilter();
+  if (!connectionId || !f.connections || f.connections.includes(connectionId)) return;
+  f.connections = [...f.connections, connectionId];
+  saveExplorerFilter();
+  updateChooseConnectionsButton();
+}
+
+function updateChooseConnectionsButton() {
+  const btn = $("#btn-choose-connections");
+  if (!btn) return;
+  const total = (state.profiles || []).length;
+  const list = explorerFilter().connections;
+  const shown = list ? (state.profiles || []).filter((p) => list.includes(p.id)).length : total;
+  btn.hidden = total === 0;
+  btn.textContent = list ? `${shown} of ${total} ▾` : "All ▾";
+  btn.classList.toggle("active", !!list);
+  btn.title = list
+    ? `Showing ${shown} of ${total} connections — click to change`
+    : "Choose which connections to show";
+}
+
+/* Generic multi-select picker dialog. Resolves { action: "selected" | "all" | "cancel", ids, extra }. */
+let pickerState = null;
+
+function pickerMatches() {
+  if (!pickerState) return [];
+  const q = ($("#picker-search")?.value || "").trim().toLowerCase();
+  if (!q) return pickerState.items;
+  return pickerState.items.filter((it) =>
+    it.label.toLowerCase().includes(q) || String(it.meta || "").toLowerCase().includes(q));
+}
+
+function renderPickerList() {
+  const list = $("#picker-list");
+  if (!list || !pickerState) return;
+  const q = ($("#picker-search")?.value || "").trim();
+  const ql = q.toLowerCase();
+  const shown = pickerMatches();
+  list.innerHTML = "";
+  if (!pickerState.items.length) {
+    list.innerHTML = `<div class="picker-empty">${escapeHtml(pickerState.emptyText || "Nothing to choose from.")}</div>`;
+  } else if (!shown.length) {
+    list.innerHTML = `<div class="picker-empty">No matches for “${escapeHtml(q)}”</div>`;
+  } else {
+    const LIMIT = 1000;
+    const frag = document.createDocumentFragment();
+    for (const it of shown.slice(0, LIMIT)) {
+      const label = document.createElement("label");
+      label.className = "picker-item";
+      let text = escapeHtml(it.label);
+      const i = ql ? it.label.toLowerCase().indexOf(ql) : -1;
+      if (i >= 0) {
+        text = escapeHtml(it.label.slice(0, i))
+          + `<mark>${escapeHtml(it.label.slice(i, i + ql.length))}</mark>`
+          + escapeHtml(it.label.slice(i + ql.length));
+      }
+      label.innerHTML = `<input type="checkbox" ${pickerState.selected.has(it.id) ? "checked" : ""} />`
+        + `<span class="picker-item-main"><span class="picker-item-label" title="${escapeHtml(it.label)}">${text}</span>`
+        + (it.meta ? `<span class="picker-item-meta">${escapeHtml(it.meta)}</span>` : "")
+        + `</span>`
+        + (it.tag ? `<span class="picker-item-tag">${escapeHtml(it.tag)}</span>` : "");
+      const input = label.querySelector("input");
+      input.onchange = () => {
+        if (input.checked) pickerState.selected.add(it.id);
+        else pickerState.selected.delete(it.id);
+        updatePickerFooter();
+      };
+      frag.appendChild(label);
+    }
+    if (shown.length > LIMIT) {
+      const more = document.createElement("div");
+      more.className = "picker-empty";
+      more.textContent = `+${shown.length - LIMIT} more — refine the search`;
+      frag.appendChild(more);
+    }
+    list.appendChild(frag);
+  }
+  updatePickerFooter();
+}
+
+function updatePickerFooter() {
+  if (!pickerState) return;
+  const n = pickerState.selected.size;
+  const count = $("#picker-count");
+  if (count) count.textContent = `${n} of ${pickerState.items.length} selected`;
+  const ok = $("#picker-ok");
+  if (ok) ok.disabled = n === 0;
+  const sel = $("#picker-select-matches");
+  if (sel) {
+    const q = ($("#picker-search")?.value || "").trim();
+    const m = pickerMatches().length;
+    sel.textContent = q ? `Select ${m} match${m === 1 ? "" : "es"}` : "Select all";
+    sel.disabled = m === 0;
+  }
+}
+
+function finishPicker(action) {
+  if (!pickerState) return;
+  const st = pickerState;
+  pickerState = null;
+  const dlg = $("#modal-picker");
+  if (dlg?.open) dlg.close();
+  st.resolve({
+    action,
+    ids: [...st.selected],
+    extra: !!$("#picker-extra")?.checked,
+  });
+}
+
+function openPicker({
+  title, subtitle = "", items = [], selected = [], okLabel = "Show selected",
+  allLabel = "Show all", searchPlaceholder = "Search…", emptyText = "", extra = null,
+} = {}) {
+  if (pickerState) finishPicker("cancel");
+  return new Promise((resolve) => {
+    pickerState = {
+      items,
+      selected: new Set(selected.filter((id) => items.some((it) => it.id === id))),
+      emptyText,
+      resolve,
+    };
+    $("#picker-title").textContent = title || "Choose";
+    const sub = $("#picker-subtitle");
+    sub.textContent = subtitle;
+    sub.hidden = !subtitle;
+    const search = $("#picker-search");
+    search.value = "";
+    search.placeholder = searchPlaceholder;
+    $("#picker-ok").textContent = okLabel;
+    $("#picker-all").textContent = allLabel;
+    const extraWrap = $("#picker-extra-wrap");
+    extraWrap.hidden = !extra;
+    if (extra) {
+      $("#picker-extra-label").textContent = extra.label;
+      $("#picker-extra").checked = !!extra.checked;
+    }
+    renderPickerList();
+    const dlg = $("#modal-picker");
+    if (!dlg.open) dlg.showModal();
+    setTimeout(() => search.focus(), 0);
+  });
+}
+
+function wirePicker() {
+  const dlg = $("#modal-picker");
+  if (!dlg || dlg.dataset.wired === "1") return;
+  dlg.dataset.wired = "1";
+  let timer = null;
+  $("#picker-search").addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(renderPickerList, 60);
+  });
+  $("#picker-search").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      // Enter with a search: select the matches; Enter again (or with no search) applies.
+      const q = e.target.value.trim();
+      if (q && pickerMatches().some((it) => !pickerState.selected.has(it.id))) {
+        $("#picker-select-matches").click();
+      } else if (pickerState?.selected.size) {
+        finishPicker("selected");
+      }
+    }
+  });
+  $("#picker-select-matches").addEventListener("click", () => {
+    if (!pickerState) return;
+    for (const it of pickerMatches()) pickerState.selected.add(it.id);
+    renderPickerList();
+  });
+  $("#picker-clear").addEventListener("click", () => {
+    if (!pickerState) return;
+    if (($("#picker-search")?.value || "").trim()) {
+      for (const it of pickerMatches()) pickerState.selected.delete(it.id);
+    } else {
+      pickerState.selected.clear();
+    }
+    renderPickerList();
+  });
+  $("#picker-ok").addEventListener("click", () => finishPicker("selected"));
+  $("#picker-all").addEventListener("click", () => finishPicker("all"));
+  $("#picker-cancel").addEventListener("click", () => finishPicker("cancel"));
+  $("#form-picker").addEventListener("submit", (e) => e.preventDefault());
+  // Esc / backdrop close
+  dlg.addEventListener("close", () => {
+    if (pickerState) finishPicker("cancel");
+  });
+}
+
+/** Startup / toolbar dialog: pick which connections the sidebar shows. */
+async function chooseConnections({ startup = false } = {}) {
+  const profiles = state.profiles || [];
+  if (!profiles.length) {
+    if (!startup) openNewConnection();
+    return;
+  }
+  const f = explorerFilter();
+  const items = profiles.map((p) => ({
+    id: p.id,
+    label: p.name || "Untitled",
+    meta: [p.dbType ? String(p.dbType).replace(/_/g, " ").toLowerCase() : "", profileDetail(p)]
+      .filter(Boolean).join(" · "),
+    tag: isLiveProfile(p) ? "connected" : "",
+  }));
+  const res = await openPicker({
+    title: startup ? "Choose connections to work with" : "Connections to show",
+    subtitle: `${profiles.length} saved connection${profiles.length === 1 ? "" : "s"}. Only the ones you pick appear in the sidebar — you can add more any time from “Connections”.`,
+    items,
+    selected: f.connections || [],
+    okLabel: "Open selected",
+    allLabel: "Show all",
+    searchPlaceholder: "Search connections…",
+    extra: { label: "Ask me at startup", checked: f.askAtStartup },
+  });
+  f.askAtStartup = res.extra;
+  if (res.action === "cancel") {
+    saveExplorerFilter();
+    return;
+  }
+  const before = f.connections ? new Set(f.connections) : null;
+  f.connections = res.action === "all" ? null : res.ids;
+  saveExplorerFilter();
+  if (state.selectedProfileId && !isConnectionShown(state.selectedProfileId)) {
+    state.selectedProfileId = null;
+  }
+  updateChooseConnectionsButton();
+  renderProfiles();
+  if (explorerSearchQuery()) refreshExplorerSearch();
+  if (res.action !== "selected") return;
+  // Open the newly chosen connections (expand live ones, connect saved-password ones).
+  const fresh = res.ids.filter((id) => !before || !before.has(id) || startup);
+  await openChosenConnections(fresh);
+}
+
+async function openChosenConnections(ids) {
+  let prompted = false;
+  for (const id of ids) {
+    const p = (state.profiles || []).find((x) => x.id === id);
+    if (!p) continue;
+    if (isLiveProfile(p)) {
+      setExpanded(p.id, true);
+      continue;
+    }
+    const fileBased = p.fileBased || ["SQLITE", "H2_FILE"].includes(p.dbType);
+    if (fileBased || p.hasPassword) {
+      try {
+        state.pendingExpandProfileId = p.id;
+        await accessConnection(p);
+      } catch (err) {
+        showError($("#sidebar-error"), `${p.name}: ${err.message}`);
+      }
+    } else if (!prompted) {
+      // Only one password prompt at a time; the rest connect on click.
+      prompted = true;
+      state.pendingExpandProfileId = p.id;
+      await accessConnection(p).catch((err) => showError($("#sidebar-error"), err.message));
+    }
+  }
+  renderProfiles();
+}
+
+/** Per-connection: pick which databases the tree shows. */
+async function chooseDatabases(connectionId) {
+  const p = (state.profiles || []).find((x) => x.id === connectionId);
+  if (!p) return;
+  if (!isLiveProfile(p)) {
+    showError($("#sidebar-error"), "Connect first to choose databases.");
+    return;
+  }
+  let explorer;
+  try {
+    setStatus("Loading databases…");
+    explorer = await fetchExplorer(connectionId);
+  } catch (err) {
+    showError($("#sidebar-error"), err.message);
+    return;
+  }
+  const names = [...new Set((explorer.nodes || []).map((n) => n.name || "").filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  const current = databaseFilterFor(connectionId) || [];
+  const res = await openPicker({
+    title: `Databases in ${p.name || "connection"}`,
+    subtitle: `${names.length} database${names.length === 1 ? "" : "s"}. Pick the ones to show under this connection; search only looks inside them.`,
+    items: names.map((n) => ({ id: n, label: n })),
+    selected: current,
+    okLabel: "Show selected",
+    allLabel: "Show all",
+    searchPlaceholder: "Search databases…",
+    emptyText: "No databases found.",
+  });
+  if (res.action === "cancel") return;
+  setDatabaseFilter(connectionId, res.action === "all" ? null : res.ids);
+}
+
+function setDatabaseFilter(connectionId, names) {
+  const f = explorerFilter();
+  if (names && names.length) f.databases[connectionId] = names;
+  else delete f.databases[connectionId];
+  saveExplorerFilter();
+  // Drop a search scope that points at a database we just hid.
+  const scope = explorerSearchScope();
+  if (scope && scope.connectionId === connectionId && !isDatabaseShown(connectionId, scope.database)) {
+    clearExplorerSearchScope({ refresh: false });
+  }
+  setExpanded(connectionId, true);
+  const kids = connNodeEl(connectionId)?.querySelector(":scope > .conn-children");
+  if (kids) loadTreeInto(kids, connectionId).catch(() => {});
+  else renderProfiles();
+  if (explorerSearchQuery()) refreshExplorerSearch();
+  const n = names?.length || 0;
+  setStatus(n ? `Showing ${n} database${n === 1 ? "" : "s"} in ${connectionLabel(connectionId)}` : `Showing all databases in ${connectionLabel(connectionId)}`);
+}
+
+function buildDatabaseFilterRow(connectionId, total, shown) {
+  const row = document.createElement("div");
+  const filtered = !!databaseFilterFor(connectionId);
+  row.className = "db-filter-row" + (filtered ? " filtered" : "");
+  const text = document.createElement("span");
+  text.className = "db-filter-text";
+  text.textContent = filtered
+    ? `${shown} of ${total} databases`
+    : `All ${total} databases`;
+  row.appendChild(text);
+  const choose = document.createElement("button");
+  choose.type = "button";
+  choose.textContent = filtered ? "Change…" : "Choose…";
+  choose.title = "Choose which databases to show";
+  choose.onclick = (e) => {
+    e.stopPropagation();
+    chooseDatabases(connectionId).catch((err) => showError($("#sidebar-error"), err.message));
+  };
+  row.appendChild(choose);
+  if (filtered) {
+    const all = document.createElement("button");
+    all.type = "button";
+    all.textContent = "Show all";
+    all.onclick = (e) => {
+      e.stopPropagation();
+      setDatabaseFilter(connectionId, null);
+    };
+    row.appendChild(all);
+  }
+  return row;
+}
+
+/** While scoped to one database, load its objects so table/view search has data to match. */
+async function ensureScopeObjectsLoaded() {
+  const scope = explorerSearchScope();
+  const entity = explorerSearchEntity();
+  if (!scope || !needsExplorerObjectIndex(entity) || !explorerSearchQuery()) return false;
+  const key = `${scope.connectionId}\0${scope.database}`;
+  if (state.explorerSearch.scopeLoadedKey === key) return false;
+  const tree = $("#conn-tree");
+  const dbNode = [...(tree?.querySelectorAll(".tree-node[data-tree-kind='database']") || [])]
+    .find((n) => n.dataset.treeConnectionId === scope.connectionId
+      && (n.dataset.treeDatabase === scope.database || n.dataset.treeSchema === scope.database));
+  if (!dbNode?.expandForSearch) return false;
+  state.explorerSearch.scopeLoadedKey = key;
+  try {
+    await dbNode.expandForSearch();
+    const schemaNodes = [...dbNode.querySelectorAll(":scope > .tree-children > .tree-node[data-tree-kind='schema']")];
+    // Bounded: a database with very many schemas is loaded as the user expands it.
+    for (const sch of schemaNodes.slice(0, 25)) {
+      if (sch.expandForSearch) await sch.expandForSearch();
+    }
+  } catch {
+    state.explorerSearch.scopeLoadedKey = "";
+    return false;
+  }
+  return true;
+}
+
 function renderProfiles() {
   const tree = $("#conn-tree");
   if (!tree) return;
@@ -1287,7 +1719,14 @@ function renderProfiles() {
     return;
   }
 
-  const profiles = state.profiles || [];
+  updateChooseConnectionsButton();
+  const profiles = visibleProfiles();
+  if (!profiles.length) {
+    tree.innerHTML = `<div class="profile-empty explorer-filter-empty">No connections selected.`
+      + `<button type="button" class="btn ghost sm" data-choose-conn>Choose connections…</button></div>`;
+    tree.querySelector("[data-choose-conn]").onclick = () => chooseConnections().catch(console.error);
+    return;
+  }
 
   for (const p of profiles) {
     const wrap = document.createElement("div");
@@ -1443,6 +1882,7 @@ async function toggleConnectionNode(profile) {
 /** Open a saved connection — prompts for password unless already live or password is saved. */
 async function accessConnection(profile, credentials = null) {
   showError($("#sidebar-error"), "");
+  ensureConnectionShown(profile.id);
   state.selectedProfileId = profile.id;
   renderProfiles();
 
@@ -1992,7 +2432,17 @@ async function loadTreeInto(container, connectionId, { force = false } = {}) {
       container.innerHTML = `<div class="profile-empty">No databases/schemas found.</div>`;
       return;
     }
-    for (const node of nodes) {
+    const shownNodes = nodes.filter((n) => isDatabaseShown(connectionId, n.name || ""));
+    if (nodes.length > 1) {
+      container.appendChild(buildDatabaseFilterRow(connectionId, nodes.length, shownNodes.length));
+    }
+    if (!shownNodes.length) {
+      const empty = document.createElement("div");
+      empty.className = "profile-empty";
+      empty.textContent = "None of the chosen databases exist any more.";
+      container.appendChild(empty);
+    }
+    for (const node of shownNodes) {
       container.appendChild(renderExplorerNode(node, explorer.layout, connectionId));
     }
     progress?.setProgress(100);
@@ -4096,6 +4546,11 @@ async function handleContextAction(action) {
         hideAllContextMenus();
         await disconnectCurrent(target.profile?.id);
         break;
+      case "conn-choose-dbs": {
+        hideAllContextMenus();
+        if (target.profile) await chooseDatabases(target.profile.id);
+        break;
+      }
       case "conn-refresh": {
         hideAllContextMenus();
         const profile = target.profile;
@@ -9508,6 +9963,12 @@ function escapeHtml(s) {
 function wire() {
   wirePrefs();
   $("#btn-refresh-profiles").onclick = () => loadProfiles().catch(console.error);
+  wirePicker();
+  $("#btn-choose-connections")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    chooseConnections().catch((err) => showError($("#sidebar-error"), err.message));
+  });
   wireExplorerSearch();
   $("#btn-new-connection").onclick = openNewConnection;
   $("#btn-cancel-conn").onclick = () => {
@@ -10172,6 +10633,10 @@ async function boot() {
   // One paint with styles applied before revealing the UI.
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   hideAppLoader();
+  // Many saved connections: ask which ones to work with (remembered for next time).
+  if ((state.profiles || []).length > 1 && explorerFilter().askAtStartup) {
+    chooseConnections({ startup: true }).catch((e) => showError($("#sidebar-error"), e.message));
+  }
 }
 
 boot().catch((e) => {

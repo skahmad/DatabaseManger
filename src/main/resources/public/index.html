@@ -97,6 +97,7 @@
 
       <div class="explorer-head">
         <span>Connections</span>
+        <button type="button" class="explorer-choose-btn" id="btn-choose-connections" title="Choose which connections to show">All ▾</button>
       </div>
       <div class="conn-search-wrap explorer-search-wrap">
         <div class="explorer-search-field" id="explorer-search-field">
@@ -468,6 +469,7 @@
     <button type="button" class="ctx-item" data-action="conn-connect" role="menuitem">Connect…</button>
     <button type="button" class="ctx-item" data-action="conn-disconnect" role="menuitem">Disconnect</button>
     <button type="button" class="ctx-item conn-admin" data-action="conn-refresh" role="menuitem">Refresh</button>
+    <button type="button" class="ctx-item conn-admin" data-action="conn-choose-dbs" role="menuitem">Choose databases…</button>
     <button type="button" class="ctx-item" data-action="conn-edit" role="menuitem">Edit…</button>
     <hr class="ctx-sep conn-admin-sep" />
     <button type="button" class="ctx-item conn-admin" data-action="create-db" role="menuitem">Create database…</button>
@@ -476,6 +478,31 @@
     <hr class="ctx-sep" />
     <button type="button" class="ctx-item danger" data-action="conn-delete" role="menuitem">Delete…</button>
   </div>
+
+  <!-- Modal: multi-select picker (connections / databases shown in the explorer) -->
+  <dialog id="modal-picker" class="modal">
+    <form method="dialog" class="modal-card modal-card-wide picker-card" id="form-picker">
+      <h3 id="picker-title">Choose</h3>
+      <p id="picker-subtitle" class="picker-subtitle"></p>
+      <input type="search" id="picker-search" class="input" placeholder="Search…" autocomplete="off" spellcheck="false" aria-label="Search" />
+      <div class="picker-toolbar">
+        <button type="button" class="btn ghost sm" id="picker-select-matches">Select all</button>
+        <button type="button" class="btn ghost sm" id="picker-clear">Clear</button>
+        <span id="picker-count" class="picker-count">0 selected</span>
+      </div>
+      <div id="picker-list" class="picker-list" role="listbox" aria-multiselectable="true"></div>
+      <label class="check picker-extra" id="picker-extra-wrap" hidden>
+        <input type="checkbox" id="picker-extra" />
+        <span id="picker-extra-label"></span>
+      </label>
+      <div class="modal-actions picker-actions">
+        <button type="button" class="btn ghost" id="picker-all">Show all</button>
+        <span class="picker-spacer"></span>
+        <button type="button" class="btn ghost" id="picker-cancel">Cancel</button>
+        <button type="button" class="btn primary" id="picker-ok" disabled>Show selected</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Context menu: database / schema (items toggled by kind in app.js) -->
   <div id="ctx-menu-db" class="ctx-menu" hidden role="menu">
