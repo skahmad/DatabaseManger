@@ -2,6 +2,7 @@ package com.forgesystem.dbmanager.service;
 
 import com.forgesystem.dbmanager.model.ConnectionMode;
 import com.forgesystem.dbmanager.model.ConnectionProfile;
+import com.forgesystem.dbmanager.model.QueryHistoryEntry;
 import com.forgesystem.dbmanager.model.DbType;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -18,6 +19,7 @@ public class ConnectionStore {
     private static final Path STORE_DIR = Path.of(System.getProperty("user.home"), ".forge-dbmanager");
     private static final Path STORE_FILE = STORE_DIR.resolve("connections.json");
     private static final Path HISTORY_FILE = STORE_DIR.resolve("query-history.json");
+    private static final int HISTORY_LIMIT = 500;
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
@@ -76,25 +78,42 @@ public class ConnectionStore {
         }
     }
 
-    public List<String> loadHistory() {
+    /** Execution history, newest first. Unreadable or legacy files start empty. */
+    public List<QueryHistoryEntry> loadHistory() {
         ensureDir();
         if (!Files.exists(HISTORY_FILE)) {
             return new ArrayList<>();
         }
         try {
             String json = Files.readString(HISTORY_FILE);
-            Type type = new TypeToken<List<String>>() {}.getType();
-            List<String> list = gson.fromJson(json, type);
-            return list == null ? new ArrayList<>() : list;
-        } catch (IOException e) {
+            Type type = new TypeToken<List<QueryHistoryEntry>>() {}.getType();
+            List<QueryHistoryEntry> list = gson.fromJson(json, type);
+            if (list == null) {
+                return new ArrayList<>();
+            }
+            List<QueryHistoryEntry> out = new ArrayList<>();
+            for (QueryHistoryEntry entry : list) {
+                if (entry == null || entry.getSql() == null || entry.getSql().isBlank()) {
+                    continue;
+                }
+                if (entry.getId() == null || entry.getId().isBlank()) {
+                    entry.setId(java.util.UUID.randomUUID().toString());
+                }
+                out.add(entry);
+            }
+            return out;
+        } catch (IOException | RuntimeException e) {
+            // Pre-1.1 files held a bare list of SQL strings; corrupt JSON lands here too.
             return new ArrayList<>();
         }
     }
 
-    public void saveHistory(List<String> history) {
+    public void saveHistory(List<QueryHistoryEntry> history) {
         ensureDir();
         try {
-            List<String> trimmed = history.size() > 100 ? history.subList(0, 100) : history;
+            List<QueryHistoryEntry> trimmed = history.size() > HISTORY_LIMIT
+                    ? history.subList(0, HISTORY_LIMIT)
+                    : history;
             Files.writeString(HISTORY_FILE, gson.toJson(trimmed));
         } catch (IOException ignored) {
         }

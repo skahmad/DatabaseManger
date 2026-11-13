@@ -100,6 +100,14 @@ const state = {
   filterPopupColumn: null,
   /** Cached SQL context dropdown options: { [connectionId]: { databases, schemasByDb } } */
   sqlContextCache: {},
+  /**
+   * Database each connection is currently working in: { [connectionId]: database }.
+   * Sent as X-Database so admin calls that name only a schema still reach the right
+   * catalog on servers that host many databases.
+   */
+  databaseContext: {},
+  /** Execution history panel state. */
+  history: { entries: [], total: 0, query: "", scope: "all", selectedId: null, loading: false },
 };
 
 const COLUMN_FILTER_OPS = [
@@ -130,7 +138,15 @@ async function api(path, options = {}) {
   } else if (state.activeConnectionId) {
     headers["X-Connection-Id"] = state.activeConnectionId;
   }
-  const { connectionId: _cid, headers: _h, ...rest } = options;
+  // An explicit ?database= in the path always wins; otherwise fall back to the
+  // database this connection is focused on.
+  if (!/[?&]database=/.test(path)) {
+    const db = options.database !== undefined
+      ? options.database
+      : state.databaseContext[headers["X-Connection-Id"]];
+    if (db) headers["X-Database"] = db;
+  }
+  const { connectionId: _cid, headers: _h, database: _db, ...rest } = options;
   const res = await fetch(path, {
     headers,
     ...rest,
@@ -574,6 +590,12 @@ function schemasForExplorerScope(connectionId, database) {
       .map((c) => c.schema || c.name)
       .filter(Boolean);
   }
+  if (layout === "server-databases-schemas") {
+    // Schemas arrive per database on expand; use whatever has been loaded.
+    const cached = entry?.schemas?.[database];
+    if (Array.isArray(cached) && cached.length) return cached.slice();
+    return [];
+  }
   // MySQL-style / fallback: database name is the schema key for objects.
   return [dbNode?.schema || dbNode?.name || database];
 }
@@ -733,6 +755,22 @@ function collectExplorerSearchMatches(query, entity) {
               badgeClass: meta.badgeClass,
             });
           }
+        } else if (kind === "database" && layout === "server-databases-schemas") {
+          // Schemas load per database on expand — search the ones already loaded.
+          if (scope && node.name !== scope.database) continue;
+          for (const name of (entry.schemas?.[node.name || ""] || [])) {
+            if (!String(name).toLowerCase().includes(q)) continue;
+            out.push({
+              entity: "sch",
+              connectionId,
+              name,
+              schema: name,
+              database: node.name || null,
+              path: `${connName} · ${node.name}`,
+              badge: meta.badge,
+              badgeClass: meta.badgeClass,
+            });
+          }
         } else if (kind === "database" && layout !== "database-schemas") {
           // MySQL 2-layer: database acts as schema namespace too.
           const name = node.name || "";
@@ -767,8 +805,10 @@ function collectExplorerSearchMatches(query, entity) {
           if (sch) schemaToDb.set(sch, node.name || sch);
         }
       }
-      for (const [schema, bag] of Object.entries(objects)) {
-        const database = schemaToDb.get(schema) || schema;
+      for (const [cacheKey, bag] of Object.entries(objects)) {
+        const parsed = parseObjectsKey(cacheKey);
+        const schema = parsed.schema;
+        const database = parsed.database || schemaToDb.get(schema) || schema;
         if (scope) {
           if (scope.connectionId !== connectionId) continue;
           if (database !== scope.database && schema !== scope.database
@@ -1586,6 +1626,32 @@ function withConnectionId(path, connectionId) {
   return `${path}${join}connectionId=${encodeURIComponent(connectionId)}`;
 }
 
+/** withConnectionId plus an explicit database (catalog) for this one call. */
+function withContext(path, connectionId, database) {
+  const out = withConnectionId(path, connectionId);
+  if (!database) return out;
+  const join = out.includes("?") ? "&" : "?";
+  return `${out}${join}database=${encodeURIComponent(database)}`;
+}
+
+/** Remember which database a connection is working in (request fallback). */
+function setDatabaseContext(connectionId, database) {
+  if (!connectionId) return;
+  if (database) state.databaseContext[connectionId] = database;
+  else delete state.databaseContext[connectionId];
+}
+
+/** Object-list cache key: schema names repeat across databases, so key by both. */
+function objectsKey(database, schema) {
+  return `${database || ""}\u0000${schema == null ? "" : schema}`;
+}
+
+function parseObjectsKey(key) {
+  const idx = String(key).indexOf("\u0000");
+  if (idx < 0) return { database: "", schema: String(key) };
+  return { database: String(key).slice(0, idx), schema: String(key).slice(idx + 1) };
+}
+
 /**
  * Show an inline progress bar under a tree node row (connection / DB / schema / table).
  * Returns { setLabel, setProgress, end }.
@@ -1659,12 +1725,13 @@ function findConnectionTreeNode(profileId) {
 }
 
 function explorerCacheEntry(connectionId) {
-  if (!connectionId) return { explorer: null, objects: {}, details: {} };
+  if (!connectionId) return { explorer: null, objects: {}, details: {}, schemas: {} };
   if (!state.explorerCache[connectionId]) {
-    state.explorerCache[connectionId] = { explorer: null, objects: {}, details: {} };
+    state.explorerCache[connectionId] = { explorer: null, objects: {}, details: {}, schemas: {} };
   }
   const entry = state.explorerCache[connectionId];
   if (!entry.details) entry.details = {};
+  if (!entry.schemas) entry.schemas = {};
   return entry;
 }
 
@@ -1677,11 +1744,18 @@ function invalidateExplorerCache(connectionId) {
   delete state.explorerCache[connectionId];
 }
 
-function invalidateSchemaObjectsCache(connectionId, schema) {
+function invalidateSchemaObjectsCache(connectionId, schema, database = null) {
   if (!connectionId || schema == null || schema === "") return;
   const entry = state.explorerCache[connectionId];
   if (!entry) return;
-  delete entry.objects[schema];
+  if (database) {
+    delete entry.objects[objectsKey(database, schema)];
+  } else {
+    // Same schema name may be cached under several databases — drop them all.
+    for (const key of Object.keys(entry.objects)) {
+      if (parseObjectsKey(key).schema === schema) delete entry.objects[key];
+    }
+  }
   invalidateDetailsCache(connectionId, schema);
 }
 
@@ -1735,6 +1809,10 @@ function buildDetailsFromExplorerCache(connectionId, focus = {}) {
     const nodes = entry.explorer.nodes || [];
     const layout = entry.explorer.layout || "";
     const items = [];
+    if (layout === "server-databases-schemas") {
+      // Schema counts are per database and come from the server — never guess them here.
+      return null;
+    }
     if (layout === "database-schemas") {
       const databases = nodes.filter((n) => (n.kind || "database") === "database");
       items.push({ label: "Databases", value: databases.length });
@@ -1762,7 +1840,9 @@ function buildDetailsFromExplorerCache(connectionId, focus = {}) {
   if (scope === "schema" || scope === "database") {
     const schema = focus.schema || focus.database;
     if (!schema) return null;
-    const bag = entry.objects?.[schema];
+    const bag = entry.objects?.[objectsKey(focus.database, schema)]
+      || entry.objects?.[objectsKey(schema, schema)]
+      || entry.objects?.[objectsKey("", schema)];
     if (!bag) return null;
     const isSchema = scope === "schema";
     return {
@@ -1788,13 +1868,31 @@ async function fetchExplorer(connectionId, { force = false } = {}) {
   const explorer = await api(withConnectionId("/api/explorer", connectionId));
   entry.explorer = explorer;
   // Drop stale nested object lists when the database/schema set is refreshed.
-  if (force) entry.objects = {};
+  if (force) {
+    entry.objects = {};
+    entry.schemas = {};
+  }
   return explorer;
 }
 
-async function fetchSchemaObjects(connectionId, schema, { force = false, onProgress } = {}) {
+/**
+ * Schemas of one database on the server, cached per database.
+ * Each database has its own connection server-side, so this is safe to run for
+ * several databases in parallel.
+ */
+async function fetchSchemaList(connectionId, database, { force = false } = {}) {
   const entry = explorerCacheEntry(connectionId);
-  if (!force && entry.objects[schema]) return entry.objects[schema];
+  const key = database || "";
+  if (!force && entry.schemas[key]) return entry.schemas[key];
+  const schemas = await api(withContext("/api/schemas", connectionId, database));
+  entry.schemas[key] = Array.isArray(schemas) ? schemas : [];
+  return entry.schemas[key];
+}
+
+async function fetchSchemaObjects(connectionId, schema, { force = false, onProgress, database = null } = {}) {
+  const entry = explorerCacheEntry(connectionId);
+  const cacheKey = objectsKey(database, schema);
+  if (!force && entry.objects[cacheKey]) return entry.objects[cacheKey];
   const base = `/api/databases/${encodeURIComponent(schema)}`;
   const stages = [
     ["Loading tables…", "tables"],
@@ -1809,25 +1907,25 @@ async function fetchSchemaObjects(connectionId, schema, { force = false, onProgr
   };
   onProgress?.("Loading tables…", 8);
   const [tables, views, procs, funcs] = await Promise.all([
-    api(withConnectionId(`${base}/tables`, connectionId)).then((r) => {
+    api(withContext(`${base}/tables`, connectionId, database)).then((r) => {
       bump("Loading views…");
       return r;
     }),
-    api(withConnectionId(`${base}/views`, connectionId)).then((r) => {
+    api(withContext(`${base}/views`, connectionId, database)).then((r) => {
       bump("Loading procedures…");
       return r;
     }),
-    api(withConnectionId(`${base}/procedures`, connectionId)).then((r) => {
+    api(withContext(`${base}/procedures`, connectionId, database)).then((r) => {
       bump("Loading functions…");
       return r;
     }),
-    api(withConnectionId(`${base}/functions`, connectionId)).then((r) => {
+    api(withContext(`${base}/functions`, connectionId, database)).then((r) => {
       bump("Finishing…");
       return r;
     }),
   ]);
   const data = { tables, views, procs, funcs };
-  entry.objects[schema] = data;
+  entry.objects[cacheKey] = data;
   onProgress?.("Done", 100);
   return data;
 }
@@ -1933,10 +2031,15 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
   const databaseName = kind === "database"
     ? (node.name || null)
     : (parentDatabase || null);
-  const schemaKey = node.schema || node.name || "";
+  // PostgreSQL / SQL Server server view: a database node whose schemas load on expand.
+  const serverSchemas = kind === "database"
+    && layout === "server-databases-schemas"
+    && node.hasSchemas === true;
+  const schemaKey = serverSchemas ? "" : (node.schema || node.name || "");
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
   wrap.dataset.treeKind = kind;
+  if (databaseName) wrap.dataset.treeDatabase = databaseName;
   wrap.dataset.treeSchema = schemaKey;
   if (connectionId) wrap.dataset.treeConnectionId = connectionId;
 
@@ -1956,6 +2059,7 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     e.stopPropagation();
     const rect = more.getBoundingClientRect();
     state.activeConnectionId = connectionId;
+    if (kind === "database") setDatabaseContext(connectionId, node.database || node.name || null);
     showDbContextMenu(rect.left, rect.bottom + 4, node.schema || node.name, kind, databaseName);
   };
   row.appendChild(more);
@@ -1968,14 +2072,19 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
 
   async function fillChildren({ force = false } = {}) {
     const schema = node.schema || node.name;
+    const dbForObjects = databaseName || profileDatabaseName(connectionId);
+    const hasSchemaList = serverSchemas
+      && Array.isArray(explorerCacheEntry(connectionId).schemas[node.name || ""]);
     const needsNetwork = force
+      || (serverSchemas && !hasSchemaList)
       || (childSchemas && layout === "database-schemas" && force)
-      || (!childSchemas && !(explorerCacheEntry(connectionId).objects[schema]));
+      || (!childSchemas && !serverSchemas
+        && !(explorerCacheEntry(connectionId).objects[objectsKey(dbForObjects, schema)]));
     const loadingLabel = force
-      ? (childSchemas
+      ? ((childSchemas || serverSchemas)
         ? "Refreshing schemas…"
         : (kind === "schema" ? "Refreshing schema objects…" : "Refreshing database objects…"))
-      : (childSchemas
+      : ((childSchemas || serverSchemas)
         ? "Loading schemas…"
         : (kind === "schema" ? "Loading schema objects…" : "Loading database objects…"));
     const progress = needsNetwork
@@ -1983,6 +2092,30 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
       : null;
     if (needsNetwork) kids.innerHTML = "";
     try {
+      if (serverSchemas) {
+        // Schemas live in the database's own connection, opened on demand. A database
+        // the user cannot open fails here alone rather than breaking the whole tree.
+        progress?.setProgress(25);
+        progress?.setLabel(force ? "Refreshing schemas…" : "Loading schemas…");
+        const schemas = await fetchSchemaList(connectionId, node.name, { force });
+        progress?.setProgress(85);
+        kids.innerHTML = "";
+        if (!schemas.length) {
+          kids.innerHTML = `<div class="profile-empty">No schemas.</div>`;
+        }
+        for (const name of schemas) {
+          kids.appendChild(renderExplorerNode(
+            { name, kind: "schema", schema: name, database: node.name },
+            "schema-objects",
+            connectionId,
+            node.name,
+          ));
+        }
+        progress?.setProgress(100);
+        loaded = true;
+        if (explorerSearchQuery()) syncExplorerSearchFilter();
+        return;
+      }
       if (childSchemas && layout === "database-schemas" && force) {
         // Re-fetch explorer so schema children under this database stay current.
         progress?.setProgress(20);
@@ -2009,11 +2142,11 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
         if (explorerSearchQuery()) syncExplorerSearchFilter();
         return;
       }
-      const dbForObjects = databaseName || profileDatabaseName(connectionId);
       progress?.setProgress(15);
       progress?.setLabel("Loading tables…");
       const objects = await fetchSchemaObjects(connectionId, schema, {
         force,
+        database: dbForObjects,
         onProgress: (stage, pct) => {
           progress?.setLabel(stage);
           progress?.setProgress(pct);
@@ -2080,23 +2213,28 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
       }).catch(() => {});
     }
     if (kind === "database") {
+      // Everything this connection does next happens inside the database just clicked.
+      setDatabaseContext(connectionId, node.database || node.name || null);
       setExplorerSearchScope({
         connectionId,
         database: node.name || node.schema || "",
       }, { refresh: true });
+    } else if (kind === "schema") {
+      setDatabaseContext(connectionId, databaseName || null);
     }
-    if (kind === "schema" || (kind === "database" && layout !== "database-schemas")) {
+    const databaseHasSchemas = layout === "database-schemas" || serverSchemas;
+    if (kind === "database" && databaseHasSchemas) {
+      await focusHomeDetails({
+        scope: "database",
+        database: node.name,
+        schema: serverSchemas ? null : (node.schema || node.name),
+        connectionId,
+      });
+    } else if (kind === "schema" || kind === "database") {
       await focusHomeDetails({
         scope: "schema",
         schema: node.schema || node.name,
         database: databaseName || profileDatabaseName(connectionId),
-        connectionId,
-      });
-    } else if (kind === "database" && layout === "database-schemas") {
-      await focusHomeDetails({
-        scope: "database",
-        database: node.name,
-        schema: node.schema || node.name,
         connectionId,
       });
     }
@@ -2108,13 +2246,6 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     else delete wrap.dataset.userCollapsed;
     if (kids.hidden || loaded) return;
     // Use cache when available — only the first expand (or Refresh) hits the API.
-    const schema = node.schema || node.name;
-    const cachedObjects = !childSchemas && schema
-      ? explorerCacheEntry(connectionId).objects[schema]
-      : null;
-    if (!childSchemas && !cachedObjects) {
-      // show loading inside fillChildren
-    }
     await fillChildren({ force: false });
   };
 
@@ -4413,8 +4544,10 @@ function folder(label, badge, schema, items, kind, connectionId, database = null
   return wrap;
 }
 
-function tableTabId(schema, table, connectionId) {
-  return `table:${connectionId || state.activeConnectionId || ""}:${schema}.${table}`;
+function tableTabId(schema, table, connectionId, database = null) {
+  // Same schema.table can exist in several databases of one server — keep tabs distinct.
+  const db = database ? `${database}.` : "";
+  return `table:${connectionId || state.activeConnectionId || ""}:${db}${schema}.${table}`;
 }
 
 function activeProfile() {
@@ -4853,6 +4986,8 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
   }
   const tab = state.workspaceTabs.find((t) => t.id === tabId);
   if (!tab) return;
+  // Switching tabs switches the database the connection is working in.
+  setDatabaseContext(tab.connectionId || state.activeConnectionId, tab.database || tab.queryDatabase || null);
   const epoch = ++state.workspaceApplyEpoch;
 
   if (tab.kind === "context" || tab.kind === "home") {
@@ -5167,7 +5302,7 @@ async function fetchTableRowsPage(tab, page) {
   const offset = Math.max(0, (Math.max(1, page) - 1) * pageSize);
   const cid = tab.connectionId || state.activeConnectionId;
   const base = `/api/databases/${encodeURIComponent(tab.schema)}/tables/${encodeURIComponent(tab.table)}`;
-  return api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid));
+  return api(withContext(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid, tab.database));
 }
 
 async function loadTablePage(page) {
@@ -5241,18 +5376,19 @@ async function loadTableIntoActiveTab(tab, { rowsOnly = false } = {}) {
   let ddlText = rowsOnly && tab.ddl ? tab.ddl : null;
   let rows;
 
+  const tabDb = tab.database || null;
   if (rowsOnly && cols) {
-    rows = await api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid));
+    rows = await api(withContext(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid, tabDb));
   } else {
     const [fetchedCols, fetchedRows] = await Promise.all([
-      api(withConnectionId(`${base}/columns`, cid)),
-      api(withConnectionId(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid)),
+      api(withContext(`${base}/columns`, cid, tabDb)),
+      api(withContext(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid, tabDb)),
     ]);
     cols = fetchedCols;
     rows = fetchedRows;
     ddlText = "DDL unavailable";
     try {
-      const ddl = await api(withConnectionId(`${base}/ddl`, cid));
+      const ddl = await api(withContext(`${base}/ddl`, cid, tabDb));
       ddlText = ddl.ddl || "";
     } catch {
       /* ignore */
@@ -5359,7 +5495,6 @@ function closeWorkspaceTab(tabId) {
 async function openTable(schema, table, connectionId, database = null) {
   if (connectionId) state.activeConnectionId = connectionId;
   const cid = connectionId || state.activeConnectionId;
-  const id = tableTabId(schema, table, cid);
   const profile = profileById(cid);
   // MySQL 2-layer: the explorer "schema" is the database name.
   const dbName = database
@@ -5367,6 +5502,8 @@ async function openTable(schema, table, connectionId, database = null) {
     || state.detailFocus?.database
     || profileDatabaseName(cid)
     || "";
+  const id = tableTabId(schema, table, cid, dbName);
+  setDatabaseContext(cid, dbName);
   snapshotActiveWorkspaceTab();
   // Opening a table replaces the DB/SCH context tab.
   removeContextTabs();
@@ -5542,9 +5679,10 @@ async function loadErdIntoActiveTab(tab) {
         body: JSON.stringify({ id: tab.connectionId }),
       }).catch(() => {});
     }
-    const path = withConnectionId(
+    const path = withContext(
       `/api/databases/${encodeURIComponent(tab.schema)}/erd`,
       tab.connectionId,
+      tab.database,
     );
     const data = await api(path, { connectionId: tab.connectionId });
     const live = state.workspaceTabs.find((t) => t.id === tab.id);
@@ -7410,7 +7548,7 @@ async function refreshDetails({ force = false } = {}) {
   if (empty) empty.hidden = true;
   updateDetailsActionButtons();
   try {
-    const data = await api(withConnectionId(`/api/details?${params}`, cid));
+    const data = await api(withContext(`/api/details?${params}`, cid, focus.database));
     if (cid) setCachedDetails(cid, focus, data);
     paint(data);
   } catch (e) {

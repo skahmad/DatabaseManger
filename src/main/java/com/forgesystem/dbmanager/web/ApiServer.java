@@ -4,6 +4,7 @@ import com.forgesystem.dbmanager.model.ColumnInfo;
 import com.forgesystem.dbmanager.model.ConnectionMode;
 import com.forgesystem.dbmanager.model.ConnectionProfile;
 import com.forgesystem.dbmanager.model.DbType;
+import com.forgesystem.dbmanager.model.QueryHistoryEntry;
 import com.forgesystem.dbmanager.model.QueryResult;
 import com.forgesystem.dbmanager.model.RowFilter;
 import com.forgesystem.dbmanager.service.CloneMigrateService;
@@ -12,6 +13,7 @@ import com.forgesystem.dbmanager.service.ConnectionStore;
 import com.forgesystem.dbmanager.service.DatabaseService;
 import com.forgesystem.dbmanager.service.DatabaseService.ColumnDefinition;
 import com.forgesystem.dbmanager.service.ImportExportService;
+import com.forgesystem.dbmanager.service.QueryHistoryService;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
@@ -34,6 +36,7 @@ public class ApiServer {
     private final ImportExportService importExportService = new ImportExportService(databaseService);
     private final CloneMigrateService cloneMigrateService = new CloneMigrateService(connectionService, databaseService);
     private final ConnectionStore connectionStore = new ConnectionStore();
+    private final QueryHistoryService historyService = new QueryHistoryService(connectionStore);
     private final List<ConnectionProfile> profiles = new ArrayList<>(connectionStore.load());
     private Javalin app;
 
@@ -128,6 +131,11 @@ public class ApiServer {
             config.routes.post("/api/databases/{schema}/tables/{table}/import", this::importTable);
             config.routes.post("/api/import/sql", this::importSql);
 
+            // Execution history
+            config.routes.get("/api/history", this::listHistory);
+            config.routes.delete("/api/history", this::clearHistory);
+            config.routes.delete("/api/history/{id}", this::deleteHistoryEntry);
+
             config.routes.get("/api/db-types", ctx -> {
                 List<Map<String, Object>> types = new ArrayList<>();
                 for (DbType t : DbType.values()) {
@@ -151,6 +159,8 @@ public class ApiServer {
     }
 
     public void stop() {
+        historyService.shutdown();
+        connectionService.disconnectAll();
         if (app != null) {
             app.stop();
             app = null;
@@ -607,8 +617,74 @@ public class ApiServer {
         } catch (Exception ignored) {
             // Best-effort context switch; still attempt the script.
         }
-        QueryResult result = databaseService.executeScript(sql);
-        ctx.json(toResultJson(result));
+
+        ConnectionProfile profile = connectionService.getProfile();
+        String effectiveDatabase = connectionService.currentDatabase();
+        long startedAt = System.currentTimeMillis();
+        long t0 = System.nanoTime();
+        try {
+            QueryResult result = databaseService.executeScript(sql);
+            historyService.recordSuccess(profile, effectiveDatabase, schema, sql, result,
+                    startedAt, elapsedMs(t0));
+            ctx.json(toResultJson(result));
+        } catch (Exception e) {
+            historyService.recordFailure(profile, effectiveDatabase, schema, sql,
+                    e.getMessage() == null ? e.toString() : e.getMessage(),
+                    startedAt, elapsedMs(t0));
+            throw e;
+        }
+    }
+
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
+    }
+
+    /** History is readable with no live connection — it outlives the session. */
+    private void listHistory(Context ctx) {
+        String connectionId = ctx.queryParam("connectionId");
+        String search = ctx.queryParam("q");
+        int limit = ctx.queryParamAsClass("limit", Integer.class).getOrDefault(200);
+        int offset = ctx.queryParamAsClass("offset", Integer.class).getOrDefault(0);
+        List<Map<String, Object>> entries = new ArrayList<>();
+        for (QueryHistoryEntry entry : historyService.list(connectionId, search, limit, offset)) {
+            entries.add(historyJson(entry));
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("entries", entries);
+        out.put("total", historyService.count(connectionId, search));
+        out.put("limit", limit);
+        out.put("offset", Math.max(0, offset));
+        ctx.json(out);
+    }
+
+    private void clearHistory(Context ctx) {
+        int removed = historyService.clear(ctx.queryParam("connectionId"));
+        ctx.json(Map.of("ok", true, "removed", removed));
+    }
+
+    private void deleteHistoryEntry(Context ctx) {
+        boolean removed = historyService.delete(ctx.pathParam("id"));
+        ctx.json(Map.of("ok", removed));
+    }
+
+    private Map<String, Object> historyJson(QueryHistoryEntry entry) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", entry.getId());
+        m.put("connectionId", nullToEmpty(entry.getConnectionId()));
+        m.put("connectionName", nullToEmpty(entry.getConnectionName()));
+        m.put("engine", nullToEmpty(entry.getEngine()));
+        m.put("database", nullToEmpty(entry.getDatabase()));
+        m.put("schema", nullToEmpty(entry.getSchema()));
+        m.put("sql", nullToEmpty(entry.getSql()));
+        m.put("preview", entry.getPreview());
+        m.put("startedAt", entry.getStartedAt());
+        m.put("durationMs", entry.getDurationMs());
+        m.put("success", entry.isSuccess());
+        m.put("rowCount", entry.getRowCount());
+        m.put("affectedRows", entry.getAffectedRows());
+        m.put("update", entry.isUpdate());
+        m.put("error", nullToEmpty(entry.getError()));
+        return m;
     }
 
     private void insertRow(Context ctx) throws Exception {
@@ -892,10 +968,15 @@ public class ApiServer {
 
     private void requireConnected(Context ctx) {
         String connectionId = null;
+        String database = null;
         if (ctx != null) {
             connectionId = ctx.queryParam("connectionId");
             if (connectionId == null || connectionId.isBlank()) {
                 connectionId = ctx.header("X-Connection-Id");
+            }
+            database = ctx.queryParam("database");
+            if (database == null || database.isBlank()) {
+                database = ctx.header("X-Database");
             }
         }
         if (connectionId != null && !connectionId.isBlank()) {
@@ -905,11 +986,13 @@ public class ApiServer {
                 throw new IllegalStateException("Connection is not open: " + connectionId);
             }
             connectionService.bindRequestSession(connectionId);
-            return;
-        }
-        if (!connectionService.isConnected()) {
+        } else if (!connectionService.isConnected()) {
             throw new IllegalStateException("Not connected to a database");
         }
+        // Route this request to the requested database's own connection. Opening it is
+        // deferred until something actually reads from it, so naming a database the
+        // user cannot access costs nothing until they expand it.
+        connectionService.bindRequestDatabase(database);
     }
 
     private void upsertProfile(ConnectionProfile profile) {

@@ -15,14 +15,33 @@ import java.util.Properties;
 
 /**
  * Manages multiple concurrent JDBC sessions keyed by connection profile id.
- * Request handlers may bind a session id via {@link #bindRequestSession(String)} so
- * parallel API calls (e.g. loading two explorer trees) do not race on {@code activeId}.
+ *
+ * <p>Each session owns one <em>primary</em> connection (the database named on the
+ * profile, or the server default when the profile leaves it blank) plus a lazily
+ * opened pool of <em>catalog</em> connections — one per additional database the
+ * user browses. This is what makes server-wide browsing possible on engines where
+ * a connection is permanently bound to a single database: PostgreSQL cannot switch
+ * catalogs at all ({@code setCatalog} is a no-op in pgjdbc), so the only correct
+ * way to read another database is a second physical connection.
+ *
+ * <p>Request handlers bind a session id via {@link #bindRequestSession(String)} and
+ * a catalog via {@link #bindRequestDatabase(String)} so parallel API calls (two
+ * explorer trees, two databases) neither race on {@code activeId} nor on each
+ * other's current catalog.
  */
 public class ConnectionService {
+    /**
+     * Extra catalog connections kept open per session. The primary connection is
+     * always retained; beyond this cap the least recently used catalog is closed.
+     */
+    private static final int MAX_CATALOG_CONNECTIONS = 8;
+
     private final Map<String, DbSession> sessions = new LinkedHashMap<>();
     private String activeId;
     /** Per-request override — does not change the UI "active" session. */
     private final ThreadLocal<String> requestSessionId = new ThreadLocal<>();
+    /** Per-request catalog override — selects which database connection is returned. */
+    private final ThreadLocal<String> requestDatabase = new ThreadLocal<>();
 
     public void bindRequestSession(String profileId) {
         if (profileId == null || profileId.isBlank()) {
@@ -32,8 +51,37 @@ public class ConnectionService {
         }
     }
 
+    /**
+     * Route {@link #getConnection()} for this request to a specific database.
+     * Ignored by engines that cannot host more than one database per server.
+     */
+    public void bindRequestDatabase(String database) {
+        if (database == null || database.isBlank()) {
+            requestDatabase.remove();
+        } else {
+            requestDatabase.set(database.trim());
+        }
+    }
+
+    /** Database bound to the current request, or {@code null} for the profile default. */
+    public String getRequestDatabase() {
+        return requestDatabase.get();
+    }
+
     public void clearRequestSession() {
         requestSessionId.remove();
+        requestDatabase.remove();
+    }
+
+    /** True when one server hosts several databases reachable with the same credentials. */
+    public static boolean supportsMultipleCatalogs(DbType type) {
+        if (type == null) {
+            return false;
+        }
+        return switch (type) {
+            case MYSQL, MARIADB, POSTGRESQL, SQLSERVER -> true;
+            case SQLITE, H2, H2_FILE -> false;
+        };
     }
 
     public synchronized void connect(ConnectionProfile profile) throws SQLException {
@@ -45,13 +93,18 @@ public class ConnectionService {
         // Replace only this profile's prior session — keep other connections open.
         disconnect(profile.getId());
 
-        OpenedConnection opened = openJdbc(profile);
+        SshTunnelService tunnel = null;
         try {
-            DbSession session = new DbSession(profile.copy(), opened.connection, opened.tunnel);
+            tunnel = openTunnelIfNeeded(profile);
+            Connection connection = openConnection(profile, profile.getDatabase(), tunnel);
+            DbSession session = new DbSession(profile.copy(), tunnel, normalizeCatalog(profile.getDatabase()));
+            session.adoptPrimary(connection);
             sessions.put(profile.getId(), session);
             activeId = profile.getId();
-        } catch (RuntimeException e) {
-            opened.closeQuietly();
+        } catch (SQLException | RuntimeException e) {
+            if (tunnel != null) {
+                tunnel.close();
+            }
             throw e;
         }
     }
@@ -62,14 +115,14 @@ public class ConnectionService {
      */
     public void testConnection(ConnectionProfile profile) throws SQLException {
         normalizeProfile(profile);
-        OpenedConnection opened = openJdbc(profile);
-        try (Connection connection = opened.connection) {
+        SshTunnelService tunnel = openTunnelIfNeeded(profile);
+        try (Connection connection = openConnection(profile, profile.getDatabase(), tunnel)) {
             try (var st = connection.createStatement()) {
                 st.execute("SELECT 1");
             }
         } finally {
-            if (opened.tunnel != null) {
-                opened.tunnel.close();
+            if (tunnel != null) {
+                tunnel.close();
             }
         }
     }
@@ -81,14 +134,28 @@ public class ConnectionService {
         } else if (profile.getDbType() == DbType.POSTGRESQL
                 || profile.getDbType() == DbType.H2
                 || profile.getDbType() == DbType.H2_FILE) {
-            // PostgreSQL / H2 always use database → schemas → tables
+            // PostgreSQL / H2 always use database -> schemas -> tables
             profile.setConnectionMode(ConnectionMode.THREE_LAYER);
         } else if (profile.getConnectionMode() == null) {
             profile.setConnectionMode(ConnectionMode.defaultFor(profile.getDbType()));
         }
     }
 
-    private OpenedConnection openJdbc(ConnectionProfile profile) throws SQLException {
+    private SshTunnelService openTunnelIfNeeded(ConnectionProfile profile) throws SQLException {
+        if (!profile.usesSshTunnel()) {
+            return null;
+        }
+        SshTunnelService tunnel = new SshTunnelService();
+        tunnel.open(profile);
+        return tunnel;
+    }
+
+    /**
+     * Opens one JDBC connection for {@code database} (blank = the server default).
+     * The tunnel, when present, is shared by every connection of the session.
+     */
+    private Connection openConnection(ConnectionProfile profile, String database, SshTunnelService tunnel)
+            throws SQLException {
         if (profile.getDbType() == null) {
             throw new SQLException("Database type is required");
         }
@@ -98,15 +165,18 @@ public class ConnectionService {
             throw new SQLException("JDBC driver not found: " + profile.getDbType().getDriverClass(), e);
         }
 
-        SshTunnelService tunnel = null;
-        String jdbcUrl;
-        if (profile.usesSshTunnel()) {
-            tunnel = new SshTunnelService();
-            int localPort = tunnel.open(profile);
-            jdbcUrl = profile.getJdbcUrl("127.0.0.1", localPort);
-        } else {
-            jdbcUrl = profile.getJdbcUrl();
+        ConnectionProfile target = profile;
+        if (!profile.getDbType().isFileBased()
+                && database != null
+                && !database.isBlank()
+                && !database.equals(profile.getDatabase())) {
+            target = profile.copy();
+            target.setDatabase(database);
         }
+
+        String jdbcUrl = (tunnel != null && tunnel.isOpen())
+                ? target.getJdbcUrl("127.0.0.1", tunnel.getLocalPort())
+                : target.getJdbcUrl();
 
         Properties props = new Properties();
         if (profile.getUsername() != null && !profile.getUsername().isBlank()) {
@@ -115,7 +185,7 @@ public class ConnectionService {
         if (profile.getPassword() != null) {
             props.setProperty("password", profile.getPassword());
         }
-        if (profile.getDbType() != null && profile.getDbType().isMysqlFamily()) {
+        if (profile.getDbType().isMysqlFamily()) {
             // MariaDB Java Client properties (used for both MySQL and MariaDB servers).
             props.setProperty("allowPublicKeyRetrieval", "true");
             props.setProperty("sslMode", "disable");
@@ -129,11 +199,8 @@ public class ConnectionService {
         try {
             Connection connection = DriverManager.getConnection(jdbcUrl, props);
             connection.setAutoCommit(true);
-            return new OpenedConnection(connection, tunnel);
+            return connection;
         } catch (SQLException e) {
-            if (tunnel != null) {
-                tunnel.close();
-            }
             String msg = e.getMessage() == null ? "" : e.getMessage();
             if (msg.toLowerCase().contains("query_cache_size")) {
                 throw new SQLException(
@@ -143,28 +210,6 @@ public class ConnectionService {
                         e);
             }
             throw e;
-        }
-    }
-
-    private static final class OpenedConnection {
-        private final Connection connection;
-        private final SshTunnelService tunnel;
-
-        private OpenedConnection(Connection connection, SshTunnelService tunnel) {
-            this.connection = connection;
-            this.tunnel = tunnel;
-        }
-
-        private void closeQuietly() {
-            if (connection != null) {
-                try {
-                    connection.close();
-                } catch (SQLException ignored) {
-                }
-            }
-            if (tunnel != null) {
-                tunnel.close();
-            }
         }
     }
 
@@ -221,20 +266,45 @@ public class ConnectionService {
         return session != null && session.sshTunnel != null && session.sshTunnel.isOpen();
     }
 
+    /** Connection for the current request's session and catalog. */
     public synchronized Connection getConnection() throws SQLException {
         DbSession session = resolveSession();
         if (session == null || !session.isOpen()) {
             throw new SQLException("Not connected to a database");
         }
-        return session.connection;
+        return session.connectionFor(requestDatabase.get());
     }
 
     public synchronized Connection getConnection(String profileId) throws SQLException {
+        return getConnection(profileId, null);
+    }
+
+    /** Connection to a specific database of a specific session, opened on demand. */
+    public synchronized Connection getConnection(String profileId, String database) throws SQLException {
         DbSession session = sessions.get(profileId);
         if (session == null || !session.isOpen()) {
             throw new SQLException("Not connected: " + profileId);
         }
-        return session.connection;
+        return session.connectionFor(database);
+    }
+
+    /** The database the current request is pinned to, or the profile's own database. */
+    public synchronized String currentDatabase() {
+        DbSession session = resolveSession();
+        if (session == null) {
+            return null;
+        }
+        String bound = requestDatabase.get();
+        if (bound != null && !bound.isBlank() && supportsMultipleCatalogs(session.profile.getDbType())) {
+            return bound;
+        }
+        return session.profile.getDatabase();
+    }
+
+    /** Databases of this session that currently hold an open connection. */
+    public synchronized List<String> openCatalogs() {
+        DbSession session = resolveSession();
+        return session == null ? List.of() : session.openCatalogNames();
     }
 
     public synchronized ConnectionProfile getProfile() {
@@ -257,12 +327,18 @@ public class ConnectionService {
         return out;
     }
 
+    /**
+     * Switch the working database/schema of the current connection.
+     * On multi-catalog engines the caller normally binds a catalog instead — this
+     * remains for schema-level switches and for callers that drive one connection
+     * through several databases in sequence (clone / migrate).
+     */
     public synchronized void useDatabase(String databaseOrSchema) throws SQLException {
         DbSession session = resolveSession();
         if (session == null) {
             throw new SQLException("Not connected to a database");
         }
-        Connection conn = session.connection;
+        Connection conn = session.connectionFor(requestDatabase.get());
         DbType type = session.profile.getDbType();
         switch (type) {
             case MYSQL, MARIADB -> {
@@ -282,42 +358,42 @@ public class ConnectionService {
 
     /**
      * Apply optional database + schema context before running ad-hoc SQL.
-     * <ul>
-     *   <li>MySQL / SQL Server: {@code database} switches catalog ({@code USE}).</li>
-     *   <li>PostgreSQL: {@code database} switches catalog; {@code schema} sets {@code search_path}.</li>
-     *   <li>When only database is set on 3-layer engines, catalog is switched and search_path is left alone.</li>
-     * </ul>
+     *
+     * <p>The database is applied by <em>selecting the connection bound to it</em>,
+     * not by asking the driver to switch catalog: {@code Connection.setCatalog} is
+     * silently ignored by pgjdbc, which previously let a query run against the
+     * wrong database while the UI reported the switch as successful.
      */
     public synchronized void applyQueryContext(String database, String schema) throws SQLException {
         DbSession session = resolveSession();
         if (session == null) {
             throw new SQLException("Not connected to a database");
         }
-        Connection conn = session.connection;
         DbType type = session.profile.getDbType();
         String db = blankToNull(database);
         String sch = blankToNull(schema);
 
+        if (db != null && supportsMultipleCatalogs(type)) {
+            bindRequestDatabase(db);
+        }
+        Connection conn = session.connectionFor(requestDatabase.get());
+
         switch (type) {
             case MYSQL, MARIADB -> {
+                // On MySQL a schema *is* a database; keep the session default aligned
+                // so unqualified names resolve the way the user expects.
                 String target = db != null ? db : sch;
                 if (target != null) {
-                    useDatabase(target);
+                    conn.createStatement().execute("USE `" + target.replace("`", "``") + "`");
                 }
             }
             case SQLSERVER -> {
-                if (db != null) {
-                    useDatabase(db);
-                }
-                // Schema is typically qualified in SQL; default schema cannot be safely changed per query.
+                // Catalog comes from the per-database connection; schema is qualified in SQL.
             }
             case POSTGRESQL -> {
-                if (db != null) {
-                    switchCatalog(conn, db);
-                    session.profile.setDatabase(db);
-                }
                 if (sch != null) {
-                    useDatabase(sch);
+                    conn.createStatement().execute(
+                            "SET search_path TO \"" + sch.replace("\"", "\"\"") + "\"");
                 }
             }
             case H2, H2_FILE -> {
@@ -330,27 +406,16 @@ public class ConnectionService {
         }
     }
 
-    /** Switch PostgreSQL / SQL Server catalog when supported by the driver. */
-    private static void switchCatalog(Connection conn, String catalog) throws SQLException {
-        if (catalog == null || catalog.isBlank()) {
-            return;
-        }
-        try {
-            String current = conn.getCatalog();
-            if (catalog.equals(current)) {
-                return;
-            }
-        } catch (SQLException ignored) {
-        }
-        conn.setCatalog(catalog);
-    }
-
     private static String blankToNull(String value) {
         if (value == null) {
             return null;
         }
         String trimmed = value.trim();
         return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    private static String normalizeCatalog(String database) {
+        return database == null ? "" : database.trim();
     }
 
     /** Prefer request-bound session (parallel-safe); otherwise the UI active session. */
@@ -379,15 +444,117 @@ public class ConnectionService {
         return session;
     }
 
-    private static final class DbSession {
+    /**
+     * One live connection profile: the primary connection plus any additional
+     * per-database connections opened while browsing the server.
+     */
+    private final class DbSession {
         private final ConnectionProfile profile;
-        private final Connection connection;
         private final SshTunnelService sshTunnel;
+        /** Catalog key of the primary connection ("" when the profile named no database). */
+        private final String primaryKey;
+        /** Catalog name -> connection. Access order, so eviction drops the coldest. */
+        private final Map<String, CatalogConnection> catalogs =
+                new LinkedHashMap<>(16, 0.75f, true);
 
-        private DbSession(ConnectionProfile profile, Connection connection, SshTunnelService sshTunnel) {
+        private DbSession(ConnectionProfile profile, SshTunnelService sshTunnel, String primaryKey) {
             this.profile = profile;
-            this.connection = connection;
             this.sshTunnel = sshTunnel;
+            this.primaryKey = primaryKey;
+        }
+
+        private void adoptPrimary(Connection connection) {
+            catalogs.put(primaryKey, new CatalogConnection(connection));
+        }
+
+        private boolean isOpen() {
+            CatalogConnection primary = catalogs.get(primaryKey);
+            return primary != null && primary.isOpen();
+        }
+
+        private Connection requirePrimary() throws SQLException {
+            CatalogConnection primary = catalogs.get(primaryKey);
+            if (primary == null || !primary.isOpen()) {
+                throw new SQLException("Not connected to a database");
+            }
+            return primary.connection;
+        }
+
+        /**
+         * Connection for {@code database}, opening one if this session has not
+         * reached that catalog yet. Falls back to the primary connection for
+         * single-database engines and for the profile's own database.
+         */
+        private Connection connectionFor(String database) throws SQLException {
+            String key = normalizeCatalog(database);
+            if (key.isEmpty()
+                    || key.equals(primaryKey)
+                    || !supportsMultipleCatalogs(profile.getDbType())) {
+                return requirePrimary();
+            }
+
+            CatalogConnection existing = catalogs.get(key);
+            if (existing != null) {
+                if (existing.isOpen()) {
+                    return existing.connection;
+                }
+                catalogs.remove(key);
+            }
+
+            // Keep the pool bounded: close the least recently used non-primary catalog.
+            evictColdCatalogs();
+
+            Connection opened = openConnection(profile, key, sshTunnel);
+            catalogs.put(key, new CatalogConnection(opened));
+            return opened;
+        }
+
+        private void evictColdCatalogs() {
+            while (catalogs.size() > MAX_CATALOG_CONNECTIONS) {
+                String coldest = null;
+                for (String key : catalogs.keySet()) {
+                    if (!key.equals(primaryKey)) {
+                        coldest = key;
+                        break;
+                    }
+                }
+                if (coldest == null) {
+                    return;
+                }
+                CatalogConnection evicted = catalogs.remove(coldest);
+                if (evicted != null) {
+                    evicted.close();
+                }
+            }
+        }
+
+        private List<String> openCatalogNames() {
+            List<String> names = new ArrayList<>();
+            for (Map.Entry<String, CatalogConnection> e : catalogs.entrySet()) {
+                if (!e.getKey().isEmpty() && e.getValue().isOpen()) {
+                    names.add(e.getKey());
+                }
+            }
+            return names;
+        }
+
+        private void close() {
+            for (CatalogConnection c : new ArrayList<>(catalogs.values())) {
+                c.close();
+            }
+            catalogs.clear();
+            if (sshTunnel != null) {
+                sshTunnel.close();
+            }
+        }
+    }
+
+    /** A single JDBC connection bound to one database. */
+    private static final class CatalogConnection {
+        private final Connection connection;
+
+        private CatalogConnection(Connection connection) {
+            this.connection = connection;
         }
 
         private boolean isOpen() {
@@ -404,9 +571,6 @@ public class ConnectionService {
                     connection.close();
                 } catch (SQLException ignored) {
                 }
-            }
-            if (sshTunnel != null) {
-                sshTunnel.close();
             }
         }
     }

@@ -74,34 +74,25 @@ public class DatabaseService {
     }
 
     /**
-     * List schemas, optionally after switching to {@code database} (PostgreSQL catalog).
-     * Restores the previous catalog afterward when a database override was applied.
+     * List the schemas of {@code database}, which may be any database on the server.
+     *
+     * <p>The catalog is selected by borrowing that database's own connection for the
+     * duration of the call. Asking the driver to switch catalog is not an option:
+     * pgjdbc ignores {@code setCatalog} silently, so the previous implementation
+     * listed the connected database's schemas under every database node.
      */
     public List<String> listSchemas(String database) throws SQLException {
-        Connection conn = connectionService.getConnection();
         DbType type = connectionService.getProfile().getDbType();
-        String previousCatalog = null;
-        boolean switched = false;
-        if (database != null && !database.isBlank()
-                && (type == DbType.POSTGRESQL || type == DbType.SQLSERVER)) {
-            try {
-                previousCatalog = conn.getCatalog();
-            } catch (SQLException ignored) {
-            }
-            if (previousCatalog == null || !database.equals(previousCatalog)) {
-                conn.setCatalog(database);
-                switched = true;
-            }
+        if (database == null || database.isBlank()
+                || !ConnectionService.supportsMultipleCatalogs(type)) {
+            return listSchemas();
         }
+        String previous = connectionService.getRequestDatabase();
+        connectionService.bindRequestDatabase(database);
         try {
             return listSchemas();
         } finally {
-            if (switched && previousCatalog != null && !previousCatalog.isBlank()) {
-                try {
-                    conn.setCatalog(previousCatalog);
-                } catch (SQLException ignored) {
-                }
-            }
+            connectionService.bindRequestDatabase(previous);
         }
     }
 
@@ -203,9 +194,45 @@ public class DatabaseService {
             return out;
         }
 
-        // PostgreSQL (and H2): always database → schemas → tables
-        if (type == DbType.POSTGRESQL || type == DbType.H2 || type == DbType.H2_FILE
-                || (threeLayer && type == DbType.SQLSERVER)) {
+        // PostgreSQL / SQL Server: the whole server — databases → schemas → tables.
+        // Schemas are loaded per database on expand, so opening the tree costs one
+        // round-trip regardless of how many databases the server hosts.
+        if (type == DbType.POSTGRESQL || (threeLayer && type == DbType.SQLSERVER)) {
+            String current = (catalog == null || catalog.isBlank()) ? null : catalog;
+            out.put("layout", "server-databases-schemas");
+            out.put("currentDatabase", current);
+            out.put("connectionMode", ConnectionMode.THREE_LAYER.name());
+            out.put("hierarchy", "server-databases-schemas-tables");
+
+            List<Map<String, Object>> nodes = new ArrayList<>();
+            for (String db : listDatabases()) {
+                Map<String, Object> node = new LinkedHashMap<>();
+                node.put("name", db);
+                node.put("kind", "database");
+                node.put("database", db);
+                node.put("schema", null);
+                node.put("hasSchemas", true);
+                node.put("current", db.equals(current));
+                nodes.add(node);
+            }
+            if (nodes.isEmpty() && current != null) {
+                // Server catalog is unreadable (restricted role) — still show the one
+                // database this connection is attached to rather than an empty tree.
+                Map<String, Object> node = new LinkedHashMap<>();
+                node.put("name", current);
+                node.put("kind", "database");
+                node.put("database", current);
+                node.put("schema", null);
+                node.put("hasSchemas", true);
+                node.put("current", true);
+                nodes.add(node);
+            }
+            out.put("nodes", nodes);
+            return out;
+        }
+
+        // H2: one database → schemas → tables (a connection is bound to a single store).
+        if (type == DbType.H2 || type == DbType.H2_FILE) {
             String dbName = (catalog == null || catalog.isBlank()) ? "database" : catalog;
             out.put("layout", "database-schemas");
             out.put("currentDatabase", dbName);
@@ -217,12 +244,14 @@ public class DatabaseService {
                 node.put("name", schema);
                 node.put("kind", "schema");
                 node.put("schema", schema);
+                node.put("database", dbName);
                 schemas.add(node);
             }
             Map<String, Object> dbNode = new LinkedHashMap<>();
             dbNode.put("name", dbName);
             dbNode.put("kind", "database");
             dbNode.put("schema", dbName);
+            dbNode.put("database", dbName);
             dbNode.put("children", schemas);
             out.put("nodes", List.of(dbNode));
             return out;
@@ -237,6 +266,8 @@ public class DatabaseService {
             node.put("name", db);
             node.put("kind", "database");
             node.put("schema", db);
+            node.put("database", db);
+            node.put("current", db.equals(catalog));
             nodes.add(node);
         }
         out.put("nodes", nodes);
@@ -1939,17 +1970,25 @@ public class DatabaseService {
     }
 
     private String resolveCatalog(String schema) {
-        DbType type = connectionService.getProfile().getDbType();
+        ConnectionProfile profile = connectionService.getProfile();
+        DbType type = profile.getDbType();
         return switch (type) {
-            case MYSQL, MARIADB, SQLSERVER -> schema;
+            case MYSQL, MARIADB -> schema;
+            // 3-layer SQL Server: {schema} is a schema inside the bound database,
+            // so the catalog comes from the connection, not from the tree node.
+            case SQLSERVER -> effectiveHierarchy(profile) == ConnectionMode.THREE_LAYER
+                    ? connectionService.currentDatabase()
+                    : schema;
             default -> null;
         };
     }
 
     private String resolveSchemaPattern(String schema) {
-        DbType type = connectionService.getProfile().getDbType();
+        ConnectionProfile profile = connectionService.getProfile();
+        DbType type = profile.getDbType();
         return switch (type) {
             case POSTGRESQL, H2, H2_FILE -> schema == null ? "PUBLIC" : schema;
+            case SQLSERVER -> effectiveHierarchy(profile) == ConnectionMode.THREE_LAYER ? schema : null;
             case SQLITE -> null;
             default -> null;
         };
