@@ -149,6 +149,11 @@ async function api(path, options = {}) {
     if (db) headers["X-Database"] = db;
   }
   const { connectionId: _cid, headers: _h, database: _db, ...rest } = options;
+  const method = String(rest.method || "GET").toUpperCase();
+  if (method !== "GET" && !path.startsWith("/api/session/active")) {
+    // Writes (DDL, imports, ad-hoc SQL) can change table structure — drop cached columns/DDL.
+    state.tableMetaCache = {};
+  }
   const res = await fetch(path, {
     headers,
     ...rest,
@@ -2296,6 +2301,21 @@ function findConnectionTreeNode(profileId) {
   return document.querySelector(`.conn-node[data-profile-id="${CSS.escape(profileId)}"]`);
 }
 
+/**
+ * Share one in-flight request between callers asking for the same thing at the same
+ * time (tree render + details panel + search all load the same lists).
+ */
+const inflightRequests = new Map();
+function dedupeRequest(key, run) {
+  const pending = inflightRequests.get(key);
+  if (pending) return pending;
+  const p = Promise.resolve()
+    .then(run)
+    .finally(() => inflightRequests.delete(key));
+  inflightRequests.set(key, p);
+  return p;
+}
+
 function explorerCacheEntry(connectionId) {
   if (!connectionId) return { explorer: null, objects: {}, details: {}, schemas: {} };
   if (!state.explorerCache[connectionId]) {
@@ -2416,7 +2436,7 @@ function buildDetailsFromExplorerCache(connectionId, focus = {}) {
       || entry.objects?.[objectsKey(schema, schema)]
       || entry.objects?.[objectsKey("", schema)];
     if (!bag) return null;
-    const isSchema = scope === "schema";
+    const isSchema = scope === "schema" && isThreeLayerProfile(profile);
     return {
       scope,
       title: schema,
@@ -2437,7 +2457,8 @@ function buildDetailsFromExplorerCache(connectionId, focus = {}) {
 async function fetchExplorer(connectionId, { force = false } = {}) {
   const entry = explorerCacheEntry(connectionId);
   if (!force && entry.explorer) return entry.explorer;
-  const explorer = await api(withConnectionId("/api/explorer", connectionId));
+  const explorer = await dedupeRequest(`explorer\0${connectionId}\0${force ? 1 : 0}`,
+    () => api(withConnectionId("/api/explorer", connectionId)));
   entry.explorer = explorer;
   // Drop stale nested object lists when the database/schema set is refreshed.
   if (force) {
@@ -2456,7 +2477,8 @@ async function fetchSchemaList(connectionId, database, { force = false } = {}) {
   const entry = explorerCacheEntry(connectionId);
   const key = database || "";
   if (!force && entry.schemas[key]) return entry.schemas[key];
-  const schemas = await api(withContext("/api/schemas", connectionId, database));
+  const schemas = await dedupeRequest(`schemas\0${connectionId}\0${key}\0${force ? 1 : 0}`,
+    () => api(withContext("/api/schemas", connectionId, database)));
   entry.schemas[key] = Array.isArray(schemas) ? schemas : [];
   return entry.schemas[key];
 }
@@ -2465,38 +2487,17 @@ async function fetchSchemaObjects(connectionId, schema, { force = false, onProgr
   const entry = explorerCacheEntry(connectionId);
   const cacheKey = objectsKey(database, schema);
   if (!force && entry.objects[cacheKey]) return entry.objects[cacheKey];
-  const base = `/api/databases/${encodeURIComponent(schema)}`;
-  const stages = [
-    ["Loading tables…", "tables"],
-    ["Loading views…", "views"],
-    ["Loading procedures…", "procs"],
-    ["Loading functions…", "funcs"],
-  ];
-  let done = 0;
-  const bump = (label) => {
-    done += 1;
-    onProgress?.(label, Math.round((done / stages.length) * 100));
-  };
-  onProgress?.("Loading tables…", 8);
-  const [tables, views, procs, funcs] = await Promise.all([
-    api(withContext(`${base}/tables`, connectionId, database)).then((r) => {
-      bump("Loading views…");
-      return r;
-    }),
-    api(withContext(`${base}/views`, connectionId, database)).then((r) => {
-      bump("Loading procedures…");
-      return r;
-    }),
-    api(withContext(`${base}/procedures`, connectionId, database)).then((r) => {
-      bump("Loading functions…");
-      return r;
-    }),
-    api(withContext(`${base}/functions`, connectionId, database)).then((r) => {
-      bump("Finishing…");
-      return r;
-    }),
-  ]);
-  const data = { tables, views, procs, funcs };
+  onProgress?.("Loading objects…", 15);
+  // One request (2 queries server-side) for tables, views, procedures and functions.
+  const data = await dedupeRequest(`objects\0${connectionId}\0${cacheKey}\0${force ? 1 : 0}`, async () => {
+    const r = await api(withContext(`/api/databases/${encodeURIComponent(schema)}/objects`, connectionId, database));
+    return {
+      tables: Array.isArray(r?.tables) ? r.tables : [],
+      views: Array.isArray(r?.views) ? r.views : [],
+      procs: Array.isArray(r?.procs) ? r.procs : [],
+      funcs: Array.isArray(r?.funcs) ? r.funcs : [],
+    };
+  });
   entry.objects[cacheKey] = data;
   onProgress?.("Done", 100);
   return data;
@@ -3743,11 +3744,13 @@ async function ensureSqlMeta({ force = false } = {}) {
   };
 
   try {
-    const base = withConnectionId(`/api/databases/${encodeURIComponent(schema)}`, cid);
-    const [tables, views] = await Promise.all([
-      api(`${base}/tables`).catch(() => []),
-      api(`${base}/views`).catch(() => []),
-    ]);
+    // Same cached list the explorer tree uses — no extra tables/views round-trips.
+    const profile = profileById(cid);
+    const database = (state.databaseContext && state.databaseContext[cid])
+      || (isThreeLayerProfile(profile) ? null : schema);
+    const objects = await fetchSchemaObjects(cid, schema, { database }).catch(() => ({}));
+    const tables = objects.tables || [];
+    const views = objects.views || [];
     if (sqlMetaCacheKey() !== key) return state.sqlMeta;
     state.sqlMeta.tables = Array.isArray(tables) ? tables : [];
     state.sqlMeta.views = Array.isArray(views) ? views : [];
@@ -5794,6 +5797,8 @@ async function applyWorkspaceTab(tabId, { forceReload = false } = {}) {
     return;
   }
 
+  // forceReload here only means "this tab holds no data yet". Writes clear the
+  // metadata cache in api(), and the Refresh button passes refresh: true itself.
   await loadTableIntoActiveTab(tab);
   refreshSqlContextUi().catch(() => {});
 }
@@ -5909,12 +5914,33 @@ function tablePageSql(table, page, pageSize) {
   return `SELECT * FROM ${quoteIdent(table)}${where} LIMIT ${pageSize}`;
 }
 
+/**
+ * Rows request for a table tab. When the total for the current filters is already
+ * known (paging), ask the server to skip SELECT COUNT(*) and reuse the known total.
+ */
+async function fetchTableRows(tab, { pageSize, offset, recount = false }) {
+  const cid = tab.connectionId || state.activeConnectionId;
+  const base = `/api/databases/${encodeURIComponent(tab.schema)}/tables/${encodeURIComponent(tab.table)}`;
+  const filterQ = tableRowsFilterQuery();
+  const known = Number(tab.result?.totalRows);
+  const reuse = !recount && tab.countKey === filterQ && Number.isFinite(known);
+  const rows = await api(withContext(
+    `${base}/rows?limit=${pageSize}&offset=${offset}${filterQ}${reuse ? "&count=0" : ""}`,
+    cid,
+    tab.database,
+  ));
+  if (reuse) {
+    if (rows && rows.totalRows == null) rows.totalRows = known;
+  } else {
+    tab.countKey = filterQ;
+  }
+  return rows;
+}
+
 async function fetchTableRowsPage(tab, page) {
   const pageSize = dataPageSize();
   const offset = Math.max(0, (Math.max(1, page) - 1) * pageSize);
-  const cid = tab.connectionId || state.activeConnectionId;
-  const base = `/api/databases/${encodeURIComponent(tab.schema)}/tables/${encodeURIComponent(tab.table)}`;
-  return api(withContext(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid, tab.database));
+  return fetchTableRows(tab, { pageSize, offset });
 }
 
 async function loadTablePage(page) {
@@ -5973,7 +5999,11 @@ async function changeDataPage(delta) {
   renderData(result);
 }
 
-async function loadTableIntoActiveTab(tab, { rowsOnly = false } = {}) {
+function tableMetaKey(tab) {
+  return [tab.connectionId || state.activeConnectionId || "", tab.database || "", tab.schema || "", tab.table || ""].join("\0");
+}
+
+async function loadTableIntoActiveTab(tab, { rowsOnly = false, refresh = false } = {}) {
   const schema = tab.schema;
   const table = tab.table;
   const cid = tab.connectionId || state.activeConnectionId;
@@ -5989,12 +6019,20 @@ async function loadTableIntoActiveTab(tab, { rowsOnly = false } = {}) {
   let rows;
 
   const tabDb = tab.database || null;
-  if (rowsOnly && cols) {
-    rows = await api(withContext(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid, tabDb));
+  if (!state.tableMetaCache) state.tableMetaCache = {};
+  const metaKey = tableMetaKey(tab);
+  const cachedMeta = !refresh ? state.tableMetaCache[metaKey] : null;
+  if (!cols && cachedMeta) {
+    // Re-opening a table: columns + DDL are unchanged unless something was written.
+    cols = cachedMeta.columns;
+    ddlText = cachedMeta.ddl;
+  }
+  if (cols) {
+    rows = await fetchTableRows(tab, { pageSize, offset, recount: refresh || !rowsOnly });
   } else {
     const [fetchedCols, fetchedRows] = await Promise.all([
       api(withContext(`${base}/columns`, cid, tabDb)),
-      api(withContext(`${base}/rows?limit=${pageSize}&offset=${offset}${tableRowsFilterQuery()}`, cid, tabDb)),
+      fetchTableRows(tab, { pageSize, offset, recount: true }),
     ]);
     cols = fetchedCols;
     rows = fetchedRows;
@@ -6005,6 +6043,7 @@ async function loadTableIntoActiveTab(tab, { rowsOnly = false } = {}) {
     } catch {
       /* ignore */
     }
+    state.tableMetaCache[metaKey] = { columns: cols, ddl: ddlText };
   }
 
   const sql = tablePageSql(table, page, pageSize);
@@ -6054,7 +6093,7 @@ async function refreshTableData() {
   if (btn) btn.disabled = true;
   try {
     setStatus(`Refreshing ${tab.table}…`);
-    await loadTableIntoActiveTab(tab, { rowsOnly: false });
+    await loadTableIntoActiveTab(tab, { rowsOnly: false, refresh: true });
     setStatus(`Refreshed ${tab.table}`);
   } catch (err) {
     setStatus(err.message || "Failed to refresh table data");
@@ -8125,6 +8164,14 @@ async function loadSqlDatabaseOptions({ force = false } = {}) {
   const entry = state.sqlContextCache[cid] || (state.sqlContextCache[cid] = { databases: null, schemasByDb: {} });
   if (!force && Array.isArray(entry.databases)) return entry.databases;
   try {
+    // Server layouts list the same databases in the explorer tree — reuse it.
+    const explorer = await fetchExplorer(cid).catch(() => null);
+    if (!force && explorer && ["server-databases", "server-databases-schemas"].includes(explorer.layout)) {
+      entry.databases = (explorer.nodes || [])
+        .filter((n) => (n.kind || "database") === "database" && n.name)
+        .map((n) => n.name);
+      return entry.databases;
+    }
     const databases = await api(withConnectionId("/api/databases", cid));
     entry.databases = Array.isArray(databases) ? databases : [];
     return entry.databases;
@@ -8447,10 +8494,20 @@ async function refreshDetails({ force = false } = {}) {
       paint(cached);
       return;
     }
-    const fromExplorer = buildDetailsFromExplorerCache(cid, focus);
+    let fromExplorer = buildDetailsFromExplorerCache(cid, focus);
+    if (!fromExplorer) {
+      // Load the list the explorer tree needs anyway (shared, deduped request) and
+      // derive the counts from it, rather than asking the server to list everything twice.
+      try {
+        await preloadDetailsSource(cid, focus);
+        fromExplorer = buildDetailsFromExplorerCache(cid, focus);
+      } catch {
+        fromExplorer = null;
+      }
+    }
     if (fromExplorer) {
       setCachedDetails(cid, focus, fromExplorer);
-      paint(fromExplorer);
+      if ((state.detailFocus || {}) === focus || sameDetailFocus(state.detailFocus, focus)) paint(fromExplorer);
       return;
     }
   }
@@ -8485,6 +8542,28 @@ async function refreshDetails({ force = false } = {}) {
     }
     updateDetailsActionButtons();
   }
+}
+
+function sameDetailFocus(a = {}, b = {}) {
+  return (a.scope || "") === (b.scope || "") && (a.schema || "") === (b.schema || "")
+    && (a.table || "") === (b.table || "") && (a.database || "") === (b.database || "")
+    && (a.connectionId || "") === (b.connectionId || "");
+}
+
+/** Fetch whatever buildDetailsFromExplorerCache needs for this focus (cached + deduped). */
+async function preloadDetailsSource(cid, focus = {}) {
+  const scope = focus.scope || "connection";
+  if (scope === "connection") {
+    await fetchExplorer(cid);
+    return;
+  }
+  if (scope !== "schema" && scope !== "database") return;
+  const profile = profileById(cid);
+  // PostgreSQL / H2 / 3-layer SQL Server database: counts span every schema — server aggregates.
+  if (scope === "database" && isThreeLayerProfile(profile)) return;
+  const schema = focus.schema || focus.database;
+  if (!schema) return;
+  await fetchSchemaObjects(cid, schema, { database: focus.database || null });
 }
 
 function renderDetailsItems(items) {
@@ -10604,11 +10683,12 @@ function wire() {
   updateSqlFileChip();
   $("#data-search").oninput = () => {
     clearTimeout(state._dataSearchTimer);
+    // Each keystroke on a table is a server query (rows + count) — wait for a pause.
     state._dataSearchTimer = setTimeout(() => {
       state.page = 1;
       updateFilterIndicators();
       applyGridFilters();
-    }, 120);
+    }, 350);
   };
   $("#btn-columns").onclick = (e) => {
     e.stopPropagation();

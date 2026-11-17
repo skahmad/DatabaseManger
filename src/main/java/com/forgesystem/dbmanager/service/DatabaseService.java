@@ -352,15 +352,30 @@ public class DatabaseService {
                 || type == DbType.SQLSERVER)) {
             List<String> schemas = listSchemas();
             items.add(stat("Schemas", schemas.size()));
-            int tables = 0;
-            int views = 0;
-            int procs = 0;
-            int funcs = 0;
-            for (String schema : schemas) {
-                tables += safeSize(() -> listTables(schema));
-                views += safeSize(() -> listViews(schema));
-                procs += safeSize(() -> listProcedures(schema));
-                funcs += safeSize(() -> listFunctions(schema));
+            long tables = 0;
+            long views = 0;
+            long procs = 0;
+            long funcs = 0;
+            if (type == DbType.POSTGRESQL) {
+                // Two aggregate queries for the whole database instead of 4 per schema.
+                long[] counts = postgresObjectCounts();
+                tables = counts[0];
+                views = counts[1];
+                procs = counts[2];
+                funcs = counts[3];
+            } else {
+                for (String schema : schemas) {
+                    Map<String, List<String>> objects;
+                    try {
+                        objects = listSchemaObjects(schema);
+                    } catch (SQLException e) {
+                        continue;
+                    }
+                    tables += sizeOf(objects, "tables");
+                    views += sizeOf(objects, "views");
+                    procs += sizeOf(objects, "procs");
+                    funcs += sizeOf(objects, "funcs");
+                }
             }
             items.add(stat("Tables", tables));
             items.add(stat("Views", views));
@@ -371,6 +386,44 @@ public class DatabaseService {
             return schemaDetails(name);
         }
         out.put("items", items);
+        return out;
+    }
+
+    /** {tables, views, procedures, functions} across the user schemas of the bound database. */
+    private long[] postgresObjectCounts() {
+        long[] out = new long[4];
+        String userSchemas = "NOT LIKE 'pg\\_%' ESCAPE '\\' AND {col} <> 'information_schema'";
+        try {
+            Connection conn = connectionService.getConnection();
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT table_type, COUNT(*) FROM information_schema.tables "
+                                 + "WHERE table_schema " + userSchemas.replace("{col}", "table_schema")
+                                 + " AND table_type IN ('BASE TABLE', 'VIEW') GROUP BY table_type")) {
+                while (rs.next()) {
+                    if ("VIEW".equalsIgnoreCase(rs.getString(1))) {
+                        out[1] = rs.getLong(2);
+                    } else {
+                        out[0] = rs.getLong(2);
+                    }
+                }
+            }
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT p.prokind, COUNT(*) FROM pg_proc p "
+                                 + "JOIN pg_namespace n ON p.pronamespace = n.oid "
+                                 + "WHERE n.nspname " + userSchemas.replace("{col}", "n.nspname")
+                                 + " AND p.prokind IN ('p', 'f') GROUP BY p.prokind")) {
+                while (rs.next()) {
+                    if ("p".equals(rs.getString(1))) {
+                        out[2] = rs.getLong(2);
+                    } else {
+                        out[3] = rs.getLong(2);
+                    }
+                }
+            }
+        } catch (SQLException ignored) {
+        }
         return out;
     }
 
@@ -387,11 +440,17 @@ public class DatabaseService {
             default -> "Database";
         });
         out.put("engine", type.getDisplayName());
+        Map<String, List<String>> objects;
+        try {
+            objects = listSchemaObjects(schema);
+        } catch (SQLException e) {
+            objects = Map.of();
+        }
         List<Map<String, Object>> items = new ArrayList<>();
-        items.add(stat("Tables", safeSize(() -> listTables(schema))));
-        items.add(stat("Views", safeSize(() -> listViews(schema))));
-        items.add(stat("Procedures", safeSize(() -> listProcedures(schema))));
-        items.add(stat("Functions", safeSize(() -> listFunctions(schema))));
+        items.add(stat("Tables", sizeOf(objects, "tables")));
+        items.add(stat("Views", sizeOf(objects, "views")));
+        items.add(stat("Procedures", sizeOf(objects, "procs")));
+        items.add(stat("Functions", sizeOf(objects, "funcs")));
         out.put("items", items);
         return out;
     }
@@ -517,23 +576,15 @@ public class DatabaseService {
         props.put("userName", meta.getUserName());
 
         try {
-            props.put("tableCount", listTables(name).size());
+            Map<String, List<String>> objects = listSchemaObjects(name);
+            props.put("tableCount", sizeOf(objects, "tables"));
+            props.put("viewCount", sizeOf(objects, "views"));
+            props.put("procedureCount", sizeOf(objects, "procs"));
+            props.put("functionCount", sizeOf(objects, "funcs"));
         } catch (SQLException e) {
             props.put("tableCount", null);
-        }
-        try {
-            props.put("viewCount", listViews(name).size());
-        } catch (SQLException e) {
             props.put("viewCount", null);
-        }
-        try {
-            props.put("procedureCount", listProcedures(name).size());
-        } catch (SQLException e) {
             props.put("procedureCount", null);
-        }
-        try {
-            props.put("functionCount", listFunctions(name).size());
-        } catch (SQLException e) {
             props.put("functionCount", null);
         }
 
@@ -650,6 +701,105 @@ public class DatabaseService {
         } catch (SQLException ignored) {
             // older H2 variants may differ
         }
+    }
+
+    /**
+     * Tables, views, procedures and functions of one database/schema in as few
+     * round-trips as the engine allows (2 on MySQL/MariaDB and PostgreSQL, instead
+     * of one query per object kind). Used by the explorer tree and the details panel.
+     */
+    public Map<String, List<String>> listSchemaObjects(String schema) throws SQLException {
+        DbType type = connectionService.getProfile().getDbType();
+        List<String> tables = new ArrayList<>();
+        List<String> views = new ArrayList<>();
+        List<String> procs = new ArrayList<>();
+        List<String> funcs = new ArrayList<>();
+        Connection conn = connectionService.getConnection();
+        if (type.isMysqlFamily()) {
+            String sql = "SHOW FULL TABLES FROM `" + schema.replace("`", "``") + "`";
+            try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+                while (rs.next()) {
+                    String kind = rs.getString(2);
+                    if ("BASE TABLE".equalsIgnoreCase(kind)) {
+                        tables.add(rs.getString(1));
+                    } else if ("VIEW".equalsIgnoreCase(kind)) {
+                        views.add(rs.getString(1));
+                    }
+                }
+            }
+            Collections.sort(tables);
+            Collections.sort(views);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES "
+                            + "WHERE ROUTINE_SCHEMA = ? ORDER BY 1")) {
+                ps.setString(1, schema);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String kind = rs.getString(2);
+                        if ("PROCEDURE".equalsIgnoreCase(kind)) {
+                            procs.add(rs.getString(1));
+                        } else if ("FUNCTION".equalsIgnoreCase(kind)) {
+                            funcs.add(rs.getString(1));
+                        }
+                    }
+                }
+            } catch (SQLException ignored) {
+                // Routines are optional (missing privilege) — still show tables/views.
+            }
+        } else if (type == DbType.POSTGRESQL) {
+            String schemaName = (schema == null || schema.isBlank()) ? "public" : schema;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT table_name, table_type FROM information_schema.tables "
+                            + "WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW') "
+                            + "ORDER BY 1")) {
+                ps.setString(1, schemaName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if ("VIEW".equalsIgnoreCase(rs.getString(2))) {
+                            views.add(rs.getString(1));
+                        } else {
+                            tables.add(rs.getString(1));
+                        }
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT p.proname, p.prokind FROM pg_proc p "
+                            + "JOIN pg_namespace n ON p.pronamespace = n.oid "
+                            + "WHERE n.nspname = ? AND p.prokind IN ('p', 'f') ORDER BY 1")) {
+                ps.setString(1, schemaName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if ("p".equals(rs.getString(2))) {
+                            procs.add(rs.getString(1));
+                        } else {
+                            funcs.add(rs.getString(1));
+                        }
+                    }
+                }
+            } catch (SQLException ignored) {
+                // Optional, as for listFunctions.
+            }
+        } else {
+            tables = listTables(schema);
+            views = listViews(schema);
+            try {
+                procs = listProcedures(schema);
+            } catch (SQLException ignored) {
+            }
+            funcs = listFunctions(schema);
+        }
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        out.put("tables", tables);
+        out.put("views", views);
+        out.put("procs", procs);
+        out.put("funcs", funcs);
+        return out;
+    }
+
+    private static int sizeOf(Map<String, List<String>> objects, String key) {
+        List<String> list = objects == null ? null : objects.get(key);
+        return list == null ? 0 : list.size();
     }
 
     public List<String> listTables(String schema) throws SQLException {
@@ -1410,7 +1560,8 @@ public class DatabaseService {
 
     private record FilterSql(String where, List<Object> params) {}
 
-    private List<String> resolveSearchColumns(String schema, String table, String search,
+    /** Columns a row search matches against; resolve once per request and pass to both calls. */
+    public List<String> resolveSearchColumns(String schema, String table, String search,
                                               List<String> searchColumns) {
         if (search == null || search.isBlank()) {
             return List.of();
@@ -1555,9 +1706,14 @@ public class DatabaseService {
     public QueryResult executeScript(String script) throws SQLException {
         List<String> statements = SqlUtils.splitStatements(script);
         QueryResult last = null;
-        for (String sql : statements) {
-            if (sql.isBlank()) continue;
-            last = execute(sql);
+        try {
+            for (String sql : statements) {
+                if (sql.isBlank()) continue;
+                last = execute(sql);
+            }
+        } finally {
+            // User SQL may switch database/schema (USE, SET search_path) — re-apply next time.
+            connectionService.forgetContext();
         }
         if (last == null) {
             return QueryResult.update(0, 0);

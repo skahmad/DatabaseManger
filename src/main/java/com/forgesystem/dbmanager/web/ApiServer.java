@@ -13,6 +13,7 @@ import com.forgesystem.dbmanager.service.ConnectionStore;
 import com.forgesystem.dbmanager.service.DatabaseService;
 import com.forgesystem.dbmanager.service.DatabaseService.ColumnDefinition;
 import com.forgesystem.dbmanager.service.ImportExportService;
+import com.forgesystem.dbmanager.util.QueryLog;
 import com.forgesystem.dbmanager.service.QueryHistoryService;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -61,8 +62,21 @@ public class ApiServer {
                 ctx.json(Map.of("error", e.getMessage() == null ? e.toString() : e.getMessage()));
             });
 
+            // Count the database queries each API request runs (printed by QueryLog).
+            config.routes.before(ctx -> {
+                ctx.attribute("dbpilot.t0", System.nanoTime());
+                QueryLog.beginRequest();
+            });
+
             // Clear per-request session binding after every call (parallel explorer loads).
-            config.routes.after(ctx -> connectionService.clearRequestSession());
+            config.routes.after(ctx -> {
+                connectionService.clearRequestSession();
+                Long t0 = ctx.attribute("dbpilot.t0");
+                long ms = t0 == null ? 0 : (System.nanoTime() - t0) / 1_000_000L;
+                String query = ctx.queryString();
+                QueryLog.endRequest(ctx.method().name(), ctx.path() + (query == null ? "" : "?" + query),
+                        ctx.statusCode(), ms);
+            });
 
             // Health
             config.routes.get("/api/health", ctx -> ctx.json(Map.of("ok", true, "app", "DB Pilot")));
@@ -89,6 +103,7 @@ public class ApiServer {
             config.routes.get("/api/details", this::details);
             config.routes.get("/api/databases/{schema}/properties", this::databaseProperties);
             config.routes.get("/api/databases/{schema}/erd", this::erd);
+            config.routes.get("/api/databases/{schema}/objects", this::objects);
             config.routes.get("/api/databases/{schema}/tables", this::tables);
             config.routes.get("/api/databases/{schema}/views", this::views);
             config.routes.get("/api/databases/{schema}/procedures", this::procedures);
@@ -514,6 +529,12 @@ public class ApiServer {
         ctx.json(databaseService.getErd(ctx.pathParam("schema")));
     }
 
+    /** Tables, views, procedures and functions in one request (explorer tree + details). */
+    private void objects(Context ctx) throws Exception {
+        requireConnected(ctx);
+        ctx.json(databaseService.listSchemaObjects(ctx.pathParam("schema")));
+    }
+
     private void tables(Context ctx) throws Exception {
         requireConnected(ctx);
         ctx.json(databaseService.listTables(ctx.pathParam("schema")));
@@ -567,15 +588,21 @@ public class ApiServer {
         int offset = ctx.queryParamAsClass("offset", Integer.class).getOrDefault(0);
         List<RowFilter> filters = parseRowFilters(ctx.queryParam("filters"));
         String search = ctx.queryParam("search");
-        List<String> searchColumns = parseColumnList(ctx.queryParam("columns"));
+        // count=0: the client already knows the total for these filters (paging) — skip COUNT(*).
+        boolean withCount = !"0".equals(ctx.queryParam("count"));
         try {
             connectionService.useDatabase(schema);
         } catch (Exception ignored) {
         }
+        // Resolve once: with a search and no column list this reads table metadata.
+        List<String> searchColumns = databaseService.resolveSearchColumns(
+                schema, table, search, parseColumnList(ctx.queryParam("columns")));
         QueryResult result = databaseService.previewTable(
                 schema, table, limit, offset, filters, search, searchColumns);
         Map<String, Object> json = toResultJson(result);
-        json.put("totalRows", databaseService.countTableRows(schema, table, filters, search, searchColumns));
+        if (withCount) {
+            json.put("totalRows", databaseService.countTableRows(schema, table, filters, search, searchColumns));
+        }
         json.put("offset", Math.max(0, offset));
         json.put("limit", Math.max(1, limit));
         ctx.json(json);

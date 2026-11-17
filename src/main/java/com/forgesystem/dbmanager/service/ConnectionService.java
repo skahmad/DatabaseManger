@@ -3,15 +3,18 @@ package com.forgesystem.dbmanager.service;
 import com.forgesystem.dbmanager.model.ConnectionMode;
 import com.forgesystem.dbmanager.model.ConnectionProfile;
 import com.forgesystem.dbmanager.model.DbType;
+import com.forgesystem.dbmanager.util.QueryLog;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.WeakHashMap;
 
 /**
  * Manages multiple concurrent JDBC sessions keyed by connection profile id.
@@ -37,6 +40,11 @@ public class ConnectionService {
     private static final int MAX_CATALOG_CONNECTIONS = 8;
 
     private final Map<String, DbSession> sessions = new LinkedHashMap<>();
+    /**
+     * Last context statement (USE / SET search_path / SET SCHEMA) applied to each
+     * connection, so repeated requests for the same database do not re-run it.
+     */
+    private final Map<Connection, String> appliedContext = new WeakHashMap<>();
     private String activeId;
     /** Per-request override — does not change the UI "active" session. */
     private final ThreadLocal<String> requestSessionId = new ThreadLocal<>();
@@ -199,7 +207,14 @@ public class ConnectionService {
         try {
             Connection connection = DriverManager.getConnection(jdbcUrl, props);
             connection.setAutoCommit(true);
-            return connection;
+            // Logs every statement / metadata lookup on this connection to the console.
+            String dbLabel = target.getDatabase() == null || target.getDatabase().isBlank() ? "-" : target.getDatabase();
+            if (profile.getDbType().isFileBased()) {
+                dbLabel = dbLabel.substring(Math.max(dbLabel.lastIndexOf('/'), dbLabel.lastIndexOf('\\')) + 1);
+            }
+            String label = (profile.getName() == null || profile.getName().isBlank() ? "" : profile.getName() + "/")
+                    + dbLabel;
+            return QueryLog.wrap(connection, label);
         } catch (SQLException e) {
             String msg = e.getMessage() == null ? "" : e.getMessage();
             if (msg.toLowerCase().contains("query_cache_size")) {
@@ -342,13 +357,13 @@ public class ConnectionService {
         DbType type = session.profile.getDbType();
         switch (type) {
             case MYSQL, MARIADB -> {
-                conn.createStatement().execute("USE `" + databaseOrSchema.replace("`", "``") + "`");
+                applyContext(conn, "USE `" + databaseOrSchema.replace("`", "``") + "`");
                 session.profile.setDatabase(databaseOrSchema);
             }
-            case POSTGRESQL -> conn.createStatement().execute(
+            case POSTGRESQL -> applyContext(conn,
                     "SET search_path TO \"" + databaseOrSchema.replace("\"", "\"\"") + "\"");
             case SQLSERVER -> {
-                conn.createStatement().execute("USE [" + databaseOrSchema.replace("]", "]]") + "]");
+                applyContext(conn, "USE [" + databaseOrSchema.replace("]", "]]") + "]");
                 session.profile.setDatabase(databaseOrSchema);
             }
             case H2, H2_FILE -> { /* schema handled via metadata */ }
@@ -384,7 +399,7 @@ public class ConnectionService {
                 // so unqualified names resolve the way the user expects.
                 String target = db != null ? db : sch;
                 if (target != null) {
-                    conn.createStatement().execute("USE `" + target.replace("`", "``") + "`");
+                    applyContext(conn, "USE `" + target.replace("`", "``") + "`");
                 }
             }
             case SQLSERVER -> {
@@ -392,17 +407,42 @@ public class ConnectionService {
             }
             case POSTGRESQL -> {
                 if (sch != null) {
-                    conn.createStatement().execute(
-                            "SET search_path TO \"" + sch.replace("\"", "\"\"") + "\"");
+                    applyContext(conn, "SET search_path TO \"" + sch.replace("\"", "\"\"") + "\"");
                 }
             }
             case H2, H2_FILE -> {
                 if (sch != null) {
-                    conn.createStatement().execute(
-                            "SET SCHEMA \"" + sch.replace("\"", "\"\"") + "\"");
+                    applyContext(conn, "SET SCHEMA \"" + sch.replace("\"", "\"\"") + "\"");
                 }
             }
             case SQLITE -> { /* single file database */ }
+        }
+    }
+
+    /** Run a context statement unless this connection already has exactly that context. */
+    private void applyContext(Connection conn, String statement) throws SQLException {
+        if (statement.equals(appliedContext.get(conn))) {
+            return;
+        }
+        appliedContext.remove(conn);
+        try (Statement st = conn.createStatement()) {
+            st.execute(statement);
+        }
+        appliedContext.put(conn, statement);
+    }
+
+    /**
+     * Forget the remembered context of the current request's connection. Call after
+     * running user SQL, which may itself contain USE / SET search_path.
+     */
+    public synchronized void forgetContext() {
+        DbSession session = resolveSession();
+        if (session == null || !session.isOpen()) {
+            return;
+        }
+        try {
+            appliedContext.remove(session.connectionFor(requestDatabase.get()));
+        } catch (SQLException ignored) {
         }
     }
 
