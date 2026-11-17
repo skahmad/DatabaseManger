@@ -58,6 +58,8 @@ const state = {
      * { connectionId, database } — null means search all DBs/connections.
      */
     scope: null,
+    /** Scope key whose database node should be expanded once it renders. */
+    scopeOpenPending: "",
   },
   detailFocus: { scope: "connection", schema: null, table: null, database: null },
   currentTab: "details",
@@ -428,7 +430,9 @@ function wireExplorerSearch() {
   $("#btn-clear-explorer-scope")?.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    clearExplorerSearchScope({ refresh: true });
+    clearExplorerSearchScope({ refresh: false });
+    // Back to database search so another database can be picked.
+    setExplorerSearchEntity("db", { refresh: true });
     input.focus();
   });
 
@@ -541,6 +545,7 @@ function syncExplorerSearchScopeUi() {
   const bar = $("#explorer-search-scope");
   const label = $("#explorer-scope-label");
   const scope = explorerSearchScope();
+  applyExplorerScopeView();
   if (!bar) return;
   if (!scope) {
     bar.hidden = true;
@@ -549,6 +554,70 @@ function syncExplorerSearchScopeUi() {
   }
   bar.hidden = false;
   if (label) label.textContent = scope.database;
+}
+
+/**
+ * While a database is selected, the tree shows only that database (whatever the
+ * search entity or query). Exception: a database search with text spans every
+ * database so the user can pick a different one.
+ */
+function applyExplorerScopeView() {
+  const tree = $("#conn-tree");
+  if (!tree) return;
+  const scope = explorerSearchScope();
+  const lifted = explorerSearchEntity() === "db" && !!explorerSearchQuery();
+  tree.querySelectorAll(".scope-miss").forEach((el) => el.classList.remove("scope-miss"));
+  if (!scope || lifted) {
+    tree.classList.remove("is-scoped");
+    return;
+  }
+  tree.classList.add("is-scoped");
+  for (const conn of tree.querySelectorAll(".conn-node")) {
+    conn.classList.toggle("scope-miss", conn.dataset.profileId !== scope.connectionId);
+  }
+  for (const node of tree.querySelectorAll(".conn-node > .conn-children > .tree-node[data-tree-kind='database']")) {
+    const inScope = node.dataset.treeConnectionId === scope.connectionId
+      && (node.dataset.treeDatabase === scope.database || node.dataset.treeSchema === scope.database);
+    node.classList.toggle("scope-miss", !inScope);
+  }
+  openPendingScopedDatabase();
+}
+
+/** Expand the just-selected database once its tree node exists. */
+function openPendingScopedDatabase() {
+  const pending = state.explorerSearch.scopeOpenPending;
+  if (!pending) return;
+  if (pending !== explorerSearchScopeKey()) {
+    state.explorerSearch.scopeOpenPending = "";
+    return;
+  }
+  const scope = explorerSearchScope();
+  const conn = connNodeEl(scope.connectionId);
+  const dbNode = conn && [...conn.querySelectorAll(":scope > .conn-children > .tree-node[data-tree-kind='database']")]
+    .find((n) => n.dataset.treeDatabase === scope.database || n.dataset.treeSchema === scope.database);
+  if (!dbNode) return; // tree still loading — retried after it renders
+  state.explorerSearch.scopeOpenPending = "";
+  if (dbNode.dataset.userCollapsed === "1" || !dbNode.expandForSearch) return;
+  const kids = dbNode.querySelector(":scope > .tree-children");
+  if (kids && !kids.hidden) return;
+  dbNode.expandForSearch().catch(() => {});
+}
+
+/**
+ * User picked a database (tree click or DB search result): scope everything to it,
+ * expand it, and switch the search filter to tables. The user can change the filter after.
+ */
+function selectExplorerDatabase(connectionId, database) {
+  if (!connectionId || !database) return;
+  setExpanded(connectionId, true);
+  setExplorerSearchScope({ connectionId, database }, { refresh: false });
+  state.explorerSearch.scopeOpenPending = explorerSearchScopeKey();
+  if (explorerSearchEntity() === "db") {
+    setExplorerSearchEntity("tbl", { refresh: true });
+  } else {
+    refreshExplorerSearch();
+  }
+  applyExplorerScopeView();
 }
 
 function setExplorerSearchScope({ connectionId, database } = {}, { refresh = true } = {}) {
@@ -1096,7 +1165,12 @@ function syncExplorerSearchFilter() {
     resetExplorerSearchDomState();
     tree.querySelectorAll(".tree-node[data-folder-kind]").forEach((f) => f.syncLeavesToSearch?.());
     if (status) status.hidden = true;
-    if (wasSearching) renderProfiles();
+    if (wasSearching) {
+      // Re-render restores the normal tree; keep the selected database open.
+      if (explorerSearchScope()) state.explorerSearch.scopeOpenPending = explorerSearchScopeKey();
+      renderProfiles();
+    }
+    applyExplorerScopeView();
     return;
   }
 
@@ -1109,9 +1183,11 @@ function syncExplorerSearchFilter() {
     && !explorerSearchScope()
     && !searchAutoloadTargets().length;
   if (!nothingLoaded) paintExplorerSearchFilter(matches, entity);
+  applyExplorerScopeView();
 
   if (status) {
-    const scope = explorerSearchScope();
+    // Database search spans every database, so it is not "in <db>".
+    const scope = entity === "db" ? null : explorerSearchScope();
     const scopeSuffix = scope ? ` in ${scope.database}` : "";
     if (state.explorerSearch.scanning) {
       status.hidden = false;
@@ -1231,17 +1307,17 @@ async function openExplorerSearchMatch(match) {
   }).catch(() => {});
 
   if (match.entity === "db") {
-    setExplorerSearchScope({
-      connectionId: match.connectionId,
-      database: match.database || match.name,
-    }, { refresh: false });
+    selectExplorerDatabase(match.connectionId, match.database || match.name);
     await focusHomeDetails({
       scope: "database",
       database: match.database || match.name,
       schema: match.schema || match.name,
       connectionId: match.connectionId,
     });
-    renderProfiles();
+    if (!connNodeEl(match.connectionId)?.querySelector(":scope > .conn-children:not([hidden])")) {
+      renderProfiles();
+    }
+    applyExplorerScopeView();
     setStatus(`Opened database ${match.name}`);
     return;
   }
@@ -2506,6 +2582,7 @@ async function loadTreeInto(container, connectionId, { force = false } = {}) {
       container.hidden = true;
       return;
     }
+    applyExplorerScopeView();
     if (explorerSearchQuery()) {
       const entity = explorerSearchEntity();
       const matches = collectExplorerSearchMatches(explorerSearchQuery(), entity)
@@ -2711,6 +2788,7 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
 
   row.onclick = async (e) => {
     if (e.target.closest(".tree-more")) return;
+    let newlySelected = false;
     if (connectionId) {
       state.activeConnectionId = connectionId;
       await api("/api/session/active", {
@@ -2721,10 +2799,10 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
     if (kind === "database") {
       // Everything this connection does next happens inside the database just clicked.
       setDatabaseContext(connectionId, node.database || node.name || null);
-      setExplorerSearchScope({
-        connectionId,
-        database: node.name || node.schema || "",
-      }, { refresh: true });
+      const scopeBefore = explorerSearchScopeKey();
+      // Scopes search to this DB, switches the filter to tables and opens the DB.
+      selectExplorerDatabase(connectionId, node.name || node.schema || "");
+      newlySelected = scopeBefore !== explorerSearchScopeKey();
     } else if (kind === "schema") {
       setDatabaseContext(connectionId, databaseName || null);
     }
@@ -2745,6 +2823,13 @@ function renderExplorerNode(node, layout, connectionId, parentDatabase = null) {
       });
     }
 
+    if (newlySelected) {
+      // Selecting a database opens it rather than toggling. The tree may also have been
+      // re-rendered by the filter switch, in which case the new node opens itself.
+      if (!wrap.isConnected) return;
+      delete wrap.dataset.userCollapsed;
+      if (!kids.hidden) return;
+    }
     kids.hidden = !kids.hidden;
     // Manual toggle owns expand state for this search session.
     delete wrap.dataset.searchOpened;

@@ -2462,6 +2462,9 @@ tbody tr:hover { background: rgba(var(--accent-rgb), 0.04); }
 }
 .db-filter-row button:hover { background: rgba(var(--accent-rgb), 0.14); }
 .conn-tree.is-searching .db-filter-row { display: none; }
+/* A selected database (scope chip) hides every other connection and database. */
+.conn-tree.is-scoped .tree-node.scope-miss { display: none !important; }
+.conn-tree.is-scoped .db-filter-row { display: none; }
 .explorer-filter-empty { display: grid; gap: 0.5rem; justify-items: start; }
 
 .picker-card { max-height: min(86vh, 44rem); overflow: hidden; }
