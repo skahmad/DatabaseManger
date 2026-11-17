@@ -1,5 +1,7 @@
 5b5db783c37d0ee660e8aba4ee6366b4586a7df47645fbf33fb6a5a30601e950  forge-database-manager-1.0.0-windows-x86_64-standalone.zip
 
 # Split parts (reassemble with ./reassemble.sh or reassemble.bat):
-43e7dc5330b5cb2d9b4b844abf7ffcc82053a150082850e5368069ba3c65e8a8  forge-database-manager-1.0.0-windows-x86_64-standalone.part-00
-5980fb7c68fc7c4424a4307b655889a5b941117442673c4e8b30cf3e5f33a7c1  forge-database-manager-1.0.0-windows-x86_64-standalone.part-01
+8e23b2275f94e69107ffe66ae7b23401b09b5c890b268e769dd22e5c4d744657  forge-database-manager-1.0.0-windows-x86_64-standalone.part-00
+0b8f516cd4c14416761701a37648b3b6f3c28db4a36ae81dd968a8c6f1eb2eb7  forge-database-manager-1.0.0-windows-x86_64-standalone.part-01
+7a8f04cb53cca9f312f2eefec2be813ab10cddcf6438a75af50fab80a11fda3c  forge-database-manager-1.0.0-windows-x86_64-standalone.part-02
+9eed296635dd86a0ad154f037bad6bae14be5a6e5c792abd2cacc3fc29a7e3e0  forge-database-manager-1.0.0-windows-x86_64-standalone.part-03

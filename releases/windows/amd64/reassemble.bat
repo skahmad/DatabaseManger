@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 set "OUT=forge-database-manager-1.0.0-windows-x86_64-standalone.zip"
 echo Assembling %OUT% ...
-copy /b forge-database-manager-1.0.0-windows-x86_64-standalone.part-00 + forge-database-manager-1.0.0-windows-x86_64-standalone.part-01 "%OUT%" >nul
+copy /b forge-database-manager-1.0.0-windows-x86_64-standalone.part-00 + forge-database-manager-1.0.0-windows-x86_64-standalone.part-01 + forge-database-manager-1.0.0-windows-x86_64-standalone.part-02 + forge-database-manager-1.0.0-windows-x86_64-standalone.part-03 "%OUT%" >nul
 if errorlevel 1 (
   echo Failed to assemble parts.
   pause
